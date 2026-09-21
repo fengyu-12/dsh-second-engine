@@ -341,6 +341,24 @@ function backupConfig() {
   } catch { /* 备份失败不阻断切换（best effort） */ }
 }
 
+// 提取原 config.toml 中全部 [mcp_servers.*] 段（段体直到下一个段头或文件尾）。
+// 插件模板不生成这些段；切换提供方时原样保留，避免用户经 codex mcp add 挂载的
+// 外部 MCP（如 exa）在重写中丢失。原文件不存在或读取失败时返回空数组。
+function extractMcpServerBlocks() {
+  try {
+    const raw = readFileSync(CONFIG_PATH, 'utf8')
+    const blocks = []
+    const re = /^\[mcp_servers\.[^\]\n]+\][^\n]*$/gm
+    let m
+    while ((m = re.exec(raw)) !== null) {
+      const next = raw.indexOf('\n[', m.index)
+      const end = next === -1 ? raw.length : next + 1
+      blocks.push(raw.slice(m.index, end).replace(/\n*$/, ''))
+    }
+    return blocks
+  } catch { /* 原文件不存在：无可保留 */ return [] }
+}
+
 // ── 翻译桥生命周期 ──
 // 进程内只保留一座桥：wireApi==='completions' 的提供方每次激活都会重建
 // （旧桥先 close，避免端口/回调残留在旧提供方上）。
@@ -420,6 +438,9 @@ async function writeCodexConfig(provider) {
     `wire_api = ${tomlString(WIRE_API)}`,
     '',
   )
+  // 保留用户自挂的 [mcp_servers.*] 段（同 sandbox_mode 保留逻辑：模板外的用户配置不在切换时丢失）
+  const mcpBlocks = extractMcpServerBlocks()
+  if (mcpBlocks.length > 0) lines.push(...mcpBlocks, '')
   writeFileSync(CONFIG_PATH, lines.join('\n'), 'utf8')
   chmodSync(CONFIG_PATH, 0o600)
   return envKey
