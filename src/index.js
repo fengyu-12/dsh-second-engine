@@ -12,10 +12,16 @@
 //   POST   /second-engine/api/model             更新该提供方 model（active 时重写 config.toml）
 //   POST   /second-engine/api/key               兼容旧面板：给预设提供方写 key
 //   POST   /second-engine/api/cleanup           按 mtime 清理旧会话 *.jsonl
+//   POST   /second-engine/api/task              下发异步工单（后台 codex exec，完成弹 App 通知）
+//   GET    /second-engine/api/task?id=          单条工单全量（含 output）
+//   GET    /second-engine/api/tasks             最近 10 条工单摘要（不含 output）
+//   POST   /second-engine/api/task/cancel       取消运行中的工单（SIGTERM）
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import http from 'node:http'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
@@ -33,7 +39,8 @@ const CONFIG_BACKUP_PATH = join(CODEX_DIR, 'config.toml.bak-se')
 
 // 首次初始化写入的三家预设（apiKey 空，待设置页填写）。
 const PRESET_PROVIDERS = [
-  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'responses', model: 'deepseek-flash' },
+  // DeepSeek 官方文档实证的上下文/输出上限，写 config.toml 顶层（见 writeCodexConfig）。
+  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'responses', model: 'deepseek-flash', contextWindow: 1048576, maxOutput: 393216 },
   { id: 'zhipu', name: '智谱', baseUrl: 'https://open.bigmodel.cn/api/v1', wireApi: 'responses', model: 'glm-4.6' },
   { id: 'yun', name: '云知声', baseUrl: 'https://maas-api.unisound.com/v1', wireApi: 'completions', model: 'u2-flash' },
 ]
@@ -44,6 +51,17 @@ const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
 const WIRE_API = 'responses'
 const SUPPORTED_WIRE_APIS = new Set(['responses', 'completions'])
 const ID_PATTERN = /^[a-z][a-z0-9_-]*$/
+
+// ── 异步工单 ──
+// 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
+// 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
+const tasks = new Map()
+const DEFAULT_TASK_WORKDIR = '/root/proj'
+const TASK_LIST_LIMIT = 10
+const TASK_KEEP_LIMIT = 50
+const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
+const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
+const NOTIFY_TIMEOUT_MS = 3000
 
 // 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
 const DEFAULT_KEEP_DAYS = 7
@@ -133,7 +151,7 @@ function presetProviders() {
 
 // 归一化单条 provider：缺字段补默认值，调用方拿到的形状始终稳定。
 function normalizeProvider(raw) {
-  return {
+  const provider = {
     id: typeof raw?.id === 'string' ? raw.id : '',
     name: typeof raw?.name === 'string' ? raw.name : '',
     baseUrl: typeof raw?.baseUrl === 'string' ? raw.baseUrl : '',
@@ -141,6 +159,10 @@ function normalizeProvider(raw) {
     model: typeof raw?.model === 'string' ? raw.model : '',
     apiKey: typeof raw?.apiKey === 'string' ? raw.apiKey : '',
   }
+  // 可选模型元数据（预设提供方才有）：存在才带上，写入 config.toml 顶层。
+  if (Number.isFinite(raw?.contextWindow)) provider.contextWindow = Math.floor(raw.contextWindow)
+  if (Number.isFinite(raw?.maxOutput)) provider.maxOutput = Math.floor(raw.maxOutput)
+  return provider
 }
 
 function saveKeyring(doc) {
@@ -177,7 +199,14 @@ function loadKeyring() {
 
   const providers = doc.providers.map(normalizeProvider).filter((p) => p.id !== '')
   for (const preset of PRESET_PROVIDERS) {
-    if (!providers.some((p) => p.id === preset.id)) providers.push({ ...preset, apiKey: '' })
+    const existing = providers.find((p) => p.id === preset.id)
+    if (existing === undefined) {
+      providers.push({ ...preset, apiKey: '' })
+      continue
+    }
+    // 升级回填：旧 keyring 里的预设条目没有模型元数据，用代码内实证值补齐（只补缺，不覆盖）。
+    if (preset.contextWindow !== undefined && existing.contextWindow === undefined) existing.contextWindow = preset.contextWindow
+    if (preset.maxOutput !== undefined && existing.maxOutput === undefined) existing.maxOutput = preset.maxOutput
   }
   const active = providers.some((p) => p.id === doc.active) ? doc.active : DEFAULT_ACTIVE
   return { providers, active }
@@ -287,6 +316,15 @@ async function writeCodexConfig(provider) {
     `model_provider = ${tomlString(provider.id)}`,
     `model = ${tomlString(provider.model)}`,
     `sandbox_mode = ${tomlString(sandboxMode)}`,
+  ]
+  // 模型元数据（预设提供方实证值）：Codex 顶层 model_context_window / model_max_output_tokens。
+  if (Number.isFinite(provider.contextWindow)) {
+    lines.push(`model_context_window = ${Math.floor(provider.contextWindow)}`)
+    if (Number.isFinite(provider.maxOutput)) {
+      lines.push(`model_max_output_tokens = ${Math.floor(provider.maxOutput)}`)
+    }
+  }
+  lines.push(
     '',
     `[model_providers.${tableKey}]`,
     `name = ${tomlString(provider.name)}`,
@@ -294,7 +332,7 @@ async function writeCodexConfig(provider) {
     `env_key = ${tomlString(envKey)}`,
     `wire_api = ${tomlString(WIRE_API)}`,
     '',
-  ]
+  )
   writeFileSync(CONFIG_PATH, lines.join('\n'), 'utf8')
   chmodSync(CONFIG_PATH, 0o600)
   return envKey
@@ -644,6 +682,185 @@ async function handleCleanup(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
+// ── /task、/tasks、/task/cancel：异步工单 ──
+
+// 只要序列化安全的那部分（child/outPath 绝不出进程）。
+function taskView(task) {
+  return {
+    id: task.id,
+    status: task.status,
+    exitCode: task.exitCode,
+    startedAt: task.startedAt,
+    endedAt: task.endedAt,
+    workdir: task.workdir,
+    output: typeof task.output === 'string' ? task.output : '',
+  }
+}
+
+// 摘要：不含 output（列表只给状态，全文按需点开再取）。
+function taskSummary(task) {
+  const view = taskView(task)
+  delete view.output
+  return view
+}
+
+// 任务表封顶，避免长时间运行后无限增长；只淘汰已结束的最旧条目。
+function pruneTasks() {
+  if (tasks.size <= TASK_KEEP_LIMIT) return
+  const finished = [...tasks.values()]
+    .filter((t) => t.endedAt !== null && t.endedAt !== undefined)
+    .sort((a, b) => a.endedAt - b.endedAt)
+  for (const victim of finished) {
+    if (tasks.size <= TASK_KEEP_LIMIT) break
+    tasks.delete(victim.id)
+  }
+}
+
+// 首次落定即返回 true（后续重复调用是 no-op），保证通知只发一次。
+function finalizeTask(task, exitCode, status) {
+  if (task.endedAt !== null && task.endedAt !== undefined) return false
+  task.exitCode = exitCode
+  task.status = status
+  try { task.output = readFileSync(task.outPath, 'utf8') } catch { task.output = '' }
+  try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成，忽略 */ }
+  task.endedAt = Date.now()
+  return true
+}
+
+// 完成通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
+function notifyTask(task) {
+  try {
+    let token = ''
+    try { token = readFileSync(NOTIFY_TOKEN_PATH, 'utf8').trim() } catch { return }
+    if (token === '') return
+    const url = `${NOTIFY_URL}?token=${encodeURIComponent(token)}`
+      + `&title=${encodeURIComponent('第二引擎')}`
+      + `&text=${encodeURIComponent(`任务 ${task.id.slice(-6)} ${task.status} (exit ${task.exitCode})`)}`
+    const req = http.get(url, (resp) => { resp.resume() })
+    req.setTimeout(NOTIFY_TIMEOUT_MS, () => { try { req.destroy() } catch { /* best effort */ } })
+    req.on('error', () => { /* 桥没开或拒绝连接：静默 */ })
+  } catch { /* best effort */ }
+}
+
+function queryParam(url, key) {
+  try {
+    return new URL(url, 'http://127.0.0.1').searchParams.get(key) || ''
+  } catch { return '' }
+}
+
+// POST /task：body { prompt, workdir?, ephemeral? }。立刻返回 { ok, id }，任务后台跑。
+async function handleTaskCreate(req, res) {
+  try {
+    const body = await readBody(req)
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+    if (prompt === '') return send(res, { ok: false, error: 'prompt 不能为空' }, 400)
+    const workdir = typeof body.workdir === 'string' && body.workdir.trim() !== ''
+      ? body.workdir.trim()
+      : DEFAULT_TASK_WORKDIR
+    if (!existsSync(workdir)) {
+      return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
+    }
+    const doc = loadKeyring()
+    const active = doc.providers.find((p) => p.id === doc.active)
+    if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
+
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0')
+    const outPath = join(CODEX_DIR, `task-${id}.out`)
+    const args = [
+      'exec',
+      '--skip-git-repo-check',
+      ...(body.ephemeral === true ? ['--ephemeral'] : []),
+      '-o', outPath,
+      prompt,
+    ]
+    // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。
+    const envKey = `${active.id.toUpperCase()}_API_KEY`
+    const child = spawn('codex', args, {
+      cwd: workdir,
+      env: { ...process.env, [envKey]: active.apiKey },
+    })
+    const task = {
+      id,
+      status: 'running',
+      exitCode: null,
+      output: '',
+      startedAt: Date.now(),
+      endedAt: null,
+      workdir,
+      child,
+      outPath,
+      cancelled: false,
+    }
+    tasks.set(id, task)
+    pruneTasks()
+
+    child.on('exit', (code) => {
+      // 被取消的任务固定 error/-1；其余按真实退出码判定。
+      const cancelled = task.cancelled === true
+      const exitCode = cancelled ? -1 : (Number.isInteger(code) ? code : -1)
+      const status = cancelled ? 'error' : (exitCode === 0 ? 'done' : 'error')
+      // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
+      if (finalizeTask(task, exitCode, status) && !cancelled) void notifyTask(task)
+    })
+    // spawn 失败（如二进制缺失）不触发 exit，这里兜底收尾。
+    child.on('error', () => {
+      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+    })
+
+    send(res, { ok: true, id })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// GET /task?id=：单条全量（含 output）。
+async function handleTaskGet(req, res) {
+  try {
+    const id = queryParam(req.url, 'id')
+    if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
+    const task = tasks.get(id)
+    if (task === undefined) return send(res, { ok: false, error: `未找到任务 '${id}'` }, 404)
+    send(res, { ok: true, task: taskView(task) })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// GET /tasks：最近 10 条摘要（新→旧，不含 output）。
+async function handleTaskList(_req, res) {
+  try {
+    const list = [...tasks.values()]
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, TASK_LIST_LIMIT)
+      .map(taskSummary)
+    send(res, { ok: true, tasks: list })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// POST /task/cancel：body { id }。SIGTERM 后按约定标 error/-1（exit 回调不再重复收尾）。
+async function handleTaskCancel(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
+    const task = tasks.get(id)
+    if (task === undefined) return send(res, { ok: false, error: `未找到任务 '${id}'` }, 404)
+    if (task.status !== 'running') {
+      return send(res, { ok: false, error: `任务已结束（${task.status}），无需取消` }, 400)
+    }
+    // 立刻落定状态（用户看到反馈不必等子进程真的退出）；
+    // output 留给 exit 回调收尾，那样能拿到进程退出前的完整输出。
+    task.cancelled = true
+    task.status = 'error'
+    task.exitCode = -1
+    try { task.child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+    send(res, { ok: true, id, status: task.status, exitCode: task.exitCode })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// /api/task 同 path 两个方法：POST 下发 / GET 查询，其余 405。
+async function handleTaskRoot(req, res) {
+  if (req.method === 'POST') return handleTaskCreate(req, res)
+  if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') return handleTaskGet(req, res)
+  return send(res, { ok: false, error: 'method not allowed' }, 405)
+}
+
 export function apply(ctx) {
   // 桥清理：插件卸载/热重载时关掉本地桥，避免 server 句柄与端口残留。
   // 宿主用 cordis fiber：ctx.effect 回调返回的函数即卸载时的 disposer（同 guard 写法）；
@@ -667,6 +884,9 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/model', handler: handleProviderModel },
       { kind: 'exact', path: '/second-engine/api/key', handler: handleKey },
       { kind: 'exact', path: '/second-engine/api/cleanup', handler: handleCleanup },
+      { kind: 'exact', path: '/second-engine/api/task', handler: handleTaskRoot },
+      { kind: 'exact', path: '/second-engine/api/tasks', handler: handleTaskList },
+      { kind: 'exact', path: '/second-engine/api/task/cancel', handler: handleTaskCancel },
     ]
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
