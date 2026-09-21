@@ -4,10 +4,13 @@
 //   GET  /second-engine/api/status   引擎/密钥/会话占用概览
 //   POST /second-engine/api/key      写入 keyring.json（0600）
 //   POST /second-engine/api/cleanup  按 mtime 清理旧会话 *.jsonl
+// 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
+// llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import z from '@deepseek-ai/schemastery'
 
 export const name = 'second-engine'
 
@@ -18,6 +21,22 @@ const KEYRING_PATH = join(CODEX_DIR, 'keyring.json')
 const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
 
 const PROVIDERS = new Set(['deepseek', 'zhipu'])
+
+// 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
+const DEFAULT_KEEP_DAYS = 7
+const MIN_KEEP_DAYS = 1
+const MAX_KEEP_DAYS = 365
+
+// 本插件的 settings 命名空间 scope，设置服务可用时才有值。
+let secondEngineSettingsScope = null
+// 进程内缓存的 keepDays 默认值（由 settings watch 镜像），供 /api/cleanup 兜底。
+let keepDaysDefault = DEFAULT_KEEP_DAYS
+
+// 本插件没有独立配置文件（settings 文档就是持久真值），因此 base 用默认值；
+// 将来若引入 config.json，只需改这一个函数。
+function readConfig() {
+  return { keepDays: DEFAULT_KEEP_DAYS }
+}
 
 // ── node:http 小工具（同 guard 写法）──
 const errMsg = (e) => (e && e.message) ? e.message : String(e)
@@ -140,12 +159,17 @@ function cleanupSessions(dir, cutoff, stats) {
 async function handleCleanup(req, res) {
   try {
     const body = await readBody(req)
-    const keepDays = Number(body.keepDays)
+    // 请求未带 keepDays 时用 settings 命名空间镜像来的默认值（客户端总会带上）。
+    const keepDays = body.keepDays === undefined ? keepDaysDefault : Number(body.keepDays)
     if (!Number.isFinite(keepDays) || keepDays < 0) {
       return send(res, { ok: false, error: 'keepDays 必须是非负数字' }, 400)
     }
     const stats = { removed: 0, freedBytes: 0 }
     cleanupSessions(SESSIONS_DIR, Date.now() - keepDays * 24 * 60 * 60 * 1000, stats)
+    // 把本次使用的保留天数回写到命名空间，使设置页卡片与本页一致（best effort）。
+    if (secondEngineSettingsScope !== null) {
+      try { void secondEngineSettingsScope.update({ keepDays: Math.floor(keepDays) }).catch(() => {}) } catch { /* settings 不可用时忽略 */ }
+    }
     send(res, { ok: true, removed: stats.removed, freedBytes: stats.freedBytes })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -161,5 +185,45 @@ export function apply(ctx) {
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
     }
+  })
+
+  // 设置 > 插件 > 插件配置 的 namespace：宿主 settings 服务只派发「served 的
+  // namespace」与「settings.plugin.item 里按 key 占位的卡」的交集，所以这里
+  // 必须注册 'second-engine'，否则浏览器端不渲染本插件面板。
+  // 全程 best-effort：settings/llm 不可用时插件照常只提供三条 HTTP API。
+  ctx.inject(['settings'], (sctx) => {
+    try {
+      const cfg = readConfig()
+      const scope = sctx.settings.register('second-engine', z.object({
+        keepDays: z.number().min(MIN_KEEP_DAYS).max(MAX_KEEP_DAYS).default(cfg.keepDays),
+      }), { base: { keepDays: cfg.keepDays } })
+      secondEngineSettingsScope = scope
+      // 用 base 播种一次，宿主文档与默认值对齐。
+      void scope.update({ keepDays: cfg.keepDays }).catch(() => {})
+      // 宿主文档才是持久真值：把当前值镜像进进程内默认值，供 cleanup 兜底。
+      scope.watch(() => {
+        try {
+          const v = scope.get()
+          if (v && Number.isFinite(v.keepDays)) keepDaysDefault = Math.floor(v.keepDays)
+        } catch { /* best effort */ }
+      })
+      // 目录条目：设置页据此把本插件列进可配置 provider，缺它浏览器端不渲染。
+      // 注意 settingsNs/settingsPath 是必填（只传 provider/displayName 会抛
+      // TypeError 被 catch 吞掉，等于没注册），与 dsh-llm 的 LlmConfigurableProvider 对齐。
+      const llm = ctx.get('llm')
+      if (llm !== undefined) {
+        try {
+          llm.registerConfigurableProviders([{
+            provider: 'second-engine',
+            displayName: '第二引擎（second-engine）',
+            settingsNs: 'second-engine',
+            settingsPath: [],
+          }])
+        } catch { /* best effort */ }
+      }
+    } catch {
+      // settings 不可用：插件照常提供 HTTP API。
+    }
+    sctx.effect(() => () => { secondEngineSettingsScope = null }, 'second-engine: settings scope teardown')
   })
 }

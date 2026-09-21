@@ -38,5 +38,8 @@
       ],
       "immediately": true
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
   }
 }
