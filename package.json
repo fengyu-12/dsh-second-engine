@@ -10,7 +10,10 @@
   },
   "files": [
     "src",
-    "lib"
+    "lib",
+    "skills",
+    "cordis.patch.yml",
+    "README.md"
   ],
   "engines": {
     "node": ">=18"
