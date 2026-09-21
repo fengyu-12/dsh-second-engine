@@ -205,6 +205,32 @@ function normalizeReviewRounds(value) {
   return REVIEW_ROUNDS_CHOICES.includes(n) ? n : REVIEW_DEFAULT_ROUNDS
 }
 
+// ── Codex 协作协议（AGENTS.md 自动写入）──
+// 让 Codex 拥有「卡点求助本能」：连续失败/绕圈时主动调 /api/consult。幂等：带标记则跳过。
+const AGENTS_MARK = '<!-- dsh-second-engine:v1 -->'
+const AGENTS_SECTION = `${AGENTS_MARK}
+# Codex 全局协作协议（by dsh-second-engine）
+
+你是「第二引擎」，与主 AI（DSH）互为伙伴。卡点自救协议：
+- 同一路径/命令连续失败 3 次以上、或在绕圈、或缺信息/权限无法自行获取时，必须主动求助而非硬试：
+  curl -s -X POST http://127.0.0.1:3080/second-engine/api/consult -H 'Content-Type: application/json' \\
+    -d '{"from":"codex","task":"<当前任务一句话>","stuckContext":"<试过什么、错在哪、需要什么>"}'
+  提交后正常结束会话（输出已有成果），主 AI 会带建议回来。
+- 若 HTTP 不通，在最终输出末尾追加一行：[CONSULT-NEEDED] <卡点描述>。
+- 只在指定工作副本内写文件；最终决策权在主 AI 与用户。
+`
+function ensureAgentsProtocol() {
+  try {
+    const path = join(CODEX_DIR, 'AGENTS.md')
+    let existing = ''
+    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
+    if (existing.includes(AGENTS_MARK)) return
+    const merged = existing.endsWith('\n') || existing === '' ? existing + AGENTS_SECTION : existing + '\n\n' + AGENTS_SECTION
+    writeFileSync(path, merged, 'utf8')
+    chmodSync(path, 0o600)
+  } catch { /* best effort：写入失败不阻断插件启动 */ }
+}
+
 // 读取并归一化 keyring：
 //   - 文件缺失/不可解析 → 首次初始化：写入两家预设（apiKey 空）
 //   - 旧格式 { provider: 'deepseek'|'zhipu', key } → 迁移为对应预设的 apiKey
@@ -1281,6 +1307,9 @@ export function apply(ctx) {
   } catch {
     try { process.on('exit', closeBridge) } catch { /* best effort */ }
   }
+
+  // Codex 协作协议：确保 ~/.codex/AGENTS.md 带有卡点求助段（幂等）。
+  ensureAgentsProtocol()
 
   // 设置页 API：webServer 后挂载时也能注册；无 webServer 的 profile 自然不注册。
   ctx.inject(['webServer'], (wctx) => {
