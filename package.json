@@ -25,5 +25,18 @@
     "cordis",
     "plugin",
     "codex"
-  ]
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "immediately": true
+    }
+  }
 }
