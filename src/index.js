@@ -18,6 +18,10 @@
 //   POST   /second-engine/api/task/cancel       取消运行中的工单（SIGTERM）
 //   POST   /second-engine/api/review            双向互审：对产出做多轮批判性复核（kind:'review'）
 //   POST   /second-engine/api/review/cancel     熔断取消复核任务（SIGTERM）
+//   GET    /second-engine/api/config            读插件配置（复核轮数 reviewRounds）
+//   POST   /second-engine/api/config            写插件配置 { reviewRounds: 1|3|5 }
+//   POST   /second-engine/api/consult           Codex 卡点求助入队（内存 20 条 + 弹 App 通知）
+//   GET    /second-engine/api/consults          求助列表（不脱敏，给主 AI 收卷）
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
@@ -61,6 +65,13 @@ const tasks = new Map()
 const DEFAULT_TASK_WORKDIR = '/root/proj'
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
+
+// ── Codex 卡点求助（consult）──
+// 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
+// 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
+const consults = []
+const CONSULT_KEEP_LIMIT = 20
+
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
 const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
 const NOTIFY_TIMEOUT_MS = 3000
@@ -70,6 +81,8 @@ const NOTIFY_TIMEOUT_MS = 3000
 const REVIEW_DEFAULT_ROUNDS = 3
 const REVIEW_MIN_ROUNDS = 1
 const REVIEW_MAX_ROUNDS = 5
+// 设置页可选轮数（GET/POST /api/config 的白名单，仅这三档）。
+const REVIEW_ROUNDS_CHOICES = [1, 3, 5]
 const REVIEW_TEMPLATE = '你是独立复核引擎。批判性审查以下产出：找自洽却错误的推理、漏掉的边界条件、更优备选。输出 JSON: {issues:[{severity,point,suggestion}], verdict}'
 // 看门狗：每 30s 探一次 -o 输出文件 mtime，超 300s 无变化即标疑似停滞并通知。
 const WATCHDOG_INTERVAL_MS = 30000
@@ -157,7 +170,8 @@ function maskKey(key) {
 }
 
 // ── keyring（多提供方）──
-// 形状：{ providers: [{ id, name, baseUrl, wireApi, apiKey, model }], active: '<id>' }
+// 形状：{ providers: [{ id, name, baseUrl, wireApi, apiKey, model }], active: '<id>', reviewRounds }
+// reviewRounds 是本插件唯一落盘的配置项（复核轮数 1|3|5），随 keyring 一起读写。
 
 function presetProviders() {
   return PRESET_PROVIDERS.map((p) => ({ ...p, apiKey: '' }))
@@ -185,10 +199,17 @@ function saveKeyring(doc) {
   chmodSync(KEYRING_PATH, 0o600)
 }
 
+// 复核轮数：只认 1/3/5，其余（含缺失、非法、字符串数字以外的垃圾值）一律回落默认 3。
+function normalizeReviewRounds(value) {
+  const n = Number(value)
+  return REVIEW_ROUNDS_CHOICES.includes(n) ? n : REVIEW_DEFAULT_ROUNDS
+}
+
 // 读取并归一化 keyring：
 //   - 文件缺失/不可解析 → 首次初始化：写入两家预设（apiKey 空）
 //   - 旧格式 { provider: 'deepseek'|'zhipu', key } → 迁移为对应预设的 apiKey
 //   - 新格式 → 归一化，并保证两家预设始终在列
+//   - 三种路径都带上 reviewRounds：handler 里 saveKeyring(loadKeyring()) 才不会把它写丢。
 function loadKeyring() {
   let doc = null
   try {
@@ -196,7 +217,7 @@ function loadKeyring() {
   } catch { doc = null }
 
   if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    const fresh = { providers: presetProviders(), active: DEFAULT_ACTIVE }
+    const fresh = { providers: presetProviders(), active: DEFAULT_ACTIVE, reviewRounds: REVIEW_DEFAULT_ROUNDS }
     try { saveKeyring(fresh) } catch { /* 只读降级：内存里照常可用 */ }
     return fresh
   }
@@ -206,7 +227,7 @@ function loadKeyring() {
     const providers = presetProviders()
     const target = providers.find((p) => p.id === id)
     if (typeof doc.key === 'string') target.apiKey = doc.key.trim()
-    const migrated = { providers, active: id }
+    const migrated = { providers, active: id, reviewRounds: normalizeReviewRounds(doc.reviewRounds) }
     try { saveKeyring(migrated) } catch { /* 迁移落盘失败不阻断读取 */ }
     return migrated
   }
@@ -223,7 +244,7 @@ function loadKeyring() {
     if (preset.maxOutput !== undefined && existing.maxOutput === undefined) existing.maxOutput = preset.maxOutput
   }
   const active = providers.some((p) => p.id === doc.active) ? doc.active : DEFAULT_ACTIVE
-  return { providers, active }
+  return { providers, active, reviewRounds: normalizeReviewRounds(doc.reviewRounds) }
 }
 
 // 对外视图：apiKey 只暴露 { configured, preview }，绝不回显明文。
@@ -465,14 +486,15 @@ async function handleProviderActive(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-// POST /providers/delete：预设不可删；删除 active 时回落到第一家预设并同步 config.toml。
+// POST /providers/delete：核心默认（deepseek/zhipu）不可删；云知声与自定义项可删。删除 active 时回落并同步 config.toml。
+const PROTECTED_IDS = new Set(['deepseek', 'zhipu'])
 async function handleProviderDelete(req, res) {
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
     if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
-    if (PRESET_IDS.has(id)) {
-      return send(res, { ok: false, error: `预设提供方 '${id}' 不允许删除` }, 400)
+    if (PROTECTED_IDS.has(id)) {
+      return send(res, { ok: false, error: `核心默认提供方 '${id}' 不允许删除（云知声与自定义项均可删）` }, 400)
     }
     const doc = loadKeyring()
     const index = doc.providers.findIndex((p) => p.id === id)
@@ -1113,12 +1135,13 @@ async function handleReviewCreate(req, res) {
     const body = await readBody(req)
     const content = typeof body.content === 'string' ? body.content.trim() : ''
     if (content === '') return send(res, { ok: false, error: 'content 不能为空' }, 400)
-    const requested = body.rounds === undefined || body.rounds === null ? REVIEW_DEFAULT_ROUNDS : Number(body.rounds)
+    const doc = loadKeyring()
+    // 缺省轮数取配置（keyring 顶层 reviewRounds）；显式传 body.rounds 仍可覆盖。
+    const requested = body.rounds === undefined || body.rounds === null ? doc.reviewRounds : Number(body.rounds)
     if (!Number.isFinite(requested) || Math.floor(requested) < REVIEW_MIN_ROUNDS) {
       return send(res, { ok: false, error: `rounds 必须是 ${REVIEW_MIN_ROUNDS}..${REVIEW_MAX_ROUNDS} 的整数` }, 400)
     }
     const maxRounds = Math.min(REVIEW_MAX_ROUNDS, Math.floor(requested))
-    const doc = loadKeyring()
     const active = doc.providers.find((p) => p.id === doc.active)
     if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
     // 复核不接用户 workdir：默认工单目录不在时退回 ~/.codex（codex exec 需要一个存在的 cwd）。
@@ -1184,6 +1207,71 @@ async function handleTaskRoot(req, res) {
   return send(res, { ok: false, error: 'method not allowed' }, 405)
 }
 
+// ── /config：插件配置（当前只有复核轮数）──
+// 真值在 keyring 顶层 reviewRounds：loadKeyring 归一化、saveKeyring 落盘 0600。
+async function handleConfigGet(_req, res) {
+  try {
+    const doc = loadKeyring()
+    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function handleConfigSet(req, res) {
+  try {
+    const body = await readBody(req)
+    const rounds = Number(body.reviewRounds)
+    if (!REVIEW_ROUNDS_CHOICES.includes(rounds)) {
+      return send(res, { ok: false, error: `reviewRounds 只支持 ${REVIEW_ROUNDS_CHOICES.join(' / ')}` }, 400)
+    }
+    const doc = loadKeyring()
+    doc.reviewRounds = rounds
+    saveKeyring(doc)
+    send(res, { ok: true, reviewRounds: rounds })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// /api/config 同 path 两个方法：GET 回显 / POST 保存，其余 405。
+async function handleConfigRoot(req, res) {
+  if (req.method === 'POST') return handleConfigSet(req, res)
+  if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') return handleConfigGet(req, res)
+  return send(res, { ok: false, error: 'method not allowed' }, 405)
+}
+
+// ── /consult、/consults：Codex 卡点求助信道 ──
+// 供第二引擎（Codex）在卡住时把上下文交给主 AI；内存队列，不落盘。
+async function handleConsultCreate(req, res) {
+  try {
+    const body = await readBody(req)
+    const from = typeof body.from === 'string' && body.from.trim() !== '' ? body.from.trim() : 'codex'
+    const task = typeof body.task === 'string' ? body.task.trim() : ''
+    const stuckContext = typeof body.stuckContext === 'string' ? body.stuckContext.trim() : ''
+    if (task === '') return send(res, { ok: false, error: 'task 不能为空' }, 400)
+    if (stuckContext === '') return send(res, { ok: false, error: 'stuckContext 不能为空' }, 400)
+
+    const entry = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0'),
+      from,
+      task,
+      stuckContext,
+      at: Date.now(),
+    }
+    consults.push(entry)
+    // 上限 20：超了从最旧一条开始丢（求助是短时效信号，留新不留旧）。
+    while (consults.length > CONSULT_KEEP_LIMIT) consults.shift()
+
+    // 通知按现有 NOTIFY_URL 方式发：text 用 task 摘要，正文走 /consults 取。
+    notify(clipText(task.replace(/\s+/g, ' '), 120), 'Codex 求助')
+    send(res, { ok: true, id: entry.id, at: entry.at, count: consults.length })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// GET /consults：全量列表（含 stuckContext，不脱敏），给主 AI 收卷用。
+async function handleConsultsList(_req, res) {
+  try {
+    send(res, { ok: true, count: consults.length, limit: CONSULT_KEEP_LIMIT, consults: consults.slice() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
 export function apply(ctx) {
   // 桥清理：插件卸载/热重载时关掉本地桥，避免 server 句柄与端口残留。
   // 宿主用 cordis fiber：ctx.effect 回调返回的函数即卸载时的 disposer（同 guard 写法）；
@@ -1212,6 +1300,9 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/task/cancel', handler: handleTaskCancel },
       { kind: 'exact', path: '/second-engine/api/review', handler: handleReviewCreate },
       { kind: 'exact', path: '/second-engine/api/review/cancel', handler: handleReviewCancel },
+      { kind: 'exact', path: '/second-engine/api/config', handler: handleConfigRoot },
+      { kind: 'exact', path: '/second-engine/api/consult', handler: handleConsultCreate },
+      { kind: 'exact', path: '/second-engine/api/consults', handler: handleConsultsList },
     ]
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
