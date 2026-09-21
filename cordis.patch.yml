@@ -1,2 +1,6 @@
-# second-engine patch layer: 路由经 ctx.inject(webServer) 动态注册，无静态 patch 条目。
-[]
+# dsh-second-engine bundle patch
+- insert:
+    - id: second-engine
+      name: dsh-second-engine
+      config:
+        keepDays: 7
