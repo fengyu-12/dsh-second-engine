@@ -233,7 +233,8 @@ function normalizeReviewRounds(value) {
 
 // ── Codex 协作协议（AGENTS.md 自动写入）──
 // 让 Codex 拥有「卡点求助本能」：连续失败/绕圈时主动调 /api/consult。幂等：带标记则跳过。
-const AGENTS_MARK = '<!-- dsh-second-engine:v1 -->'
+const AGENTS_MARK = '<!-- dsh-second-engine:v2 -->'
+const AGENTS_V1_MARK = '<!-- dsh-second-engine:v1 -->'
 const AGENTS_SECTION = `${AGENTS_MARK}
 # Codex 全局协作协议（by dsh-second-engine）
 
@@ -244,6 +245,13 @@ const AGENTS_SECTION = `${AGENTS_MARK}
   提交后正常结束会话（输出已有成果），主 AI 会带建议回来。
 - 若 HTTP 不通，在最终输出末尾追加一行：[CONSULT-NEEDED] <卡点描述>。
 - 只在指定工作副本内写文件；最终决策权在主 AI 与用户。
+
+## 联网搜索策略（三档降级制）
+
+按顺序降级，不得跳级、不得把编造内容伪装成搜索结果：
+1. 原生优先：优先尝试原生 web_search；
+2. Exa 备胎：原生不可用（工具不存在）、被限流或返回失败时，用 MCP 工具 web_search_exa（搜索）/ web_fetch_exa（抓正文）。服务地址 https://mcp.exa.ai/mcp —— 匿名可免费用（有隐性限额，偶发 rate limit 重试即可）；若开始要求认证，到 Exa 官网 exa.ai 注册免费 key 再挂；
+3. 全无则自己写：连 Exa 都没有（无 MCP/无网络）时，凭已有知识直接完成任务，明确标注"未经联网核实，时效性信息可能过时"，不得中断任务。
 `
 function ensureAgentsProtocol() {
   try {
@@ -251,6 +259,18 @@ function ensureAgentsProtocol() {
     let existing = ''
     try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
     if (existing.includes(AGENTS_MARK)) return
+    if (existing.includes(AGENTS_V1_MARK)) {
+      // v1 → v2 原位升级：v1 段以固定句收尾，切掉换新段
+      const start = existing.indexOf(AGENTS_V1_MARK)
+      const endMark = '- 只在指定工作副本内写文件；最终决策权在主 AI 与用户。'
+      const end = existing.indexOf(endMark, start)
+      const merged = end === -1
+        ? existing.slice(0, start) + AGENTS_SECTION
+        : existing.slice(0, start) + AGENTS_SECTION + existing.slice(end + endMark.length)
+      writeFileSync(path, merged, 'utf8')
+      chmodSync(path, 0o600)
+      return
+    }
     const merged = existing.endsWith('\n') || existing === '' ? existing + AGENTS_SECTION : existing + '\n\n' + AGENTS_SECTION
     writeFileSync(path, merged, 'utf8')
     chmodSync(path, 0o600)
