@@ -29,7 +29,19 @@
 ## 前置要求
 
 - DeepSeek Harness（新版 App + Web）
-- [OpenAI Codex CLI](https://github.com/openai/codex/releases) ≥ 0.155.1（aarch64 musl 静态二进制在 proot 下可直接运行；GitHub 直连慢可用 gh-proxy 类镜像）
+- [OpenAI Codex CLI](https://github.com/openai/codex/releases) ≥ 0.155.1
+
+### 安装 Codex CLI（Android proot / aarch64 Linux）
+
+到 [Releases 页](https://github.com/openai/codex/releases) 下载 **aarch64-unknown-linux-musl** 资产（musl 静态二进制在 proot 下可直接运行），解压后放进 PATH：
+
+```bash
+curl -LO https://github.com/openai/codex/releases/latest/download/<资产文件名>
+tar -xzf <资产文件名> && install -m755 codex /usr/local/bin/codex
+codex --version   # 验证
+```
+
+> GitHub 直连慢/失败：在下载 URL 前加镜像前缀（如 `https://ghproxy.net/https://github.com/...`）。资产文件名以 Releases 页实际列表为准。
 
 ## 安装
 
