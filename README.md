@@ -84,6 +84,16 @@ pnpm install
 | 智谱 | `https://open.bigmodel.cn/api/v1` | responses | GLM Coding 端点 |
 | 云知声 | `https://maas-api.unisound.com/v1` | chat（经本地桥） | 多模型聚合 MaaS |
 
+### 会话与磁盘（谁落盘，落哪里）
+
+| 来源 | 会话记录 |
+|---|---|
+| 面板/浮动球下发工单 | **默认不落盘**（ephemeral，审计靠 git diff）；勾选「保留会话」才落盘 |
+| 终端 TUI / `codex exec`（命令行） | 落盘 `~/.codex/sessions/年/月/日/`（约 33KB/次，可 `codex resume`）|
+| 共同 | `~/.codex/*.sqlite` 状态库（官方管理，插件不清理）|
+
+服务层每 6 小时自动兜底清理（保留 7 天 / 总量超 200MB 从最旧删）；面板「会话清理」可手动按天清理。
+
 ## 已知限制
 
 - **沙箱**：proot 环境无 Landlock / bubblewrap，Codex 需 `danger-full-access` 运行——安全防线在流程层（工作副本隔离 + diff 审查 + git 仲裁），**不要把主工作区直接交给 Codex**；
