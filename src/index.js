@@ -7,6 +7,7 @@
 //   POST   /second-engine/api/providers/key     设置指定提供方 apiKey（keyring 0600）
 //   POST   /second-engine/api/providers/active  切换激活并生成 config.toml（先备份）
 //   POST   /second-engine/api/providers/delete  删除自定义提供方（预设不可删）
+//   POST   /second-engine/api/providers/update  编辑提供方（apiKey 省略=不改；active 改地址/模型时重写 config.toml）
 //   POST   /second-engine/api/models            拉取该提供方 /models 模型清单（缺省 active）
 //   POST   /second-engine/api/model             更新该提供方 model（active 时重写 config.toml）
 //   POST   /second-engine/api/key               兼容旧面板：给预设提供方写 key
@@ -384,8 +385,64 @@ async function handleProviderDelete(req, res) {
         configRegenerated = true
       }
     }
-    saveKeyring(doc)
-    send(res, { ok: true, active: doc.active, configRegenerated })
+  saveKeyring(doc)
+  send(res, { ok: true, active: doc.active, configRegenerated })
+} catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// POST /providers/update：编辑既有提供方。apiKey 省略 = 不改，其余字段只更新出现的。
+// 该提供方为 active 且 baseUrl/model 有变化时重写 config.toml（这两个值写在里面）。
+async function handleProviderUpdate(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
+    const doc = loadKeyring()
+    const target = doc.providers.find((p) => p.id === id)
+    if (target === undefined) return send(res, { ok: false, error: `未找到提供方 '${id}'` }, 404)
+
+    // 先把请求里出现过的字段全部校验完再落盘，避免校验失败后半更新。
+    const patch = {}
+    if (body.name !== undefined) {
+      const name = typeof body.name === 'string' ? body.name.trim() : ''
+      if (name === '') return send(res, { ok: false, error: 'name 不能为空' }, 400)
+      patch.name = name
+    }
+    if (body.baseUrl !== undefined) {
+      const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : ''
+      if (!/^https?:\/\//i.test(baseUrl)) {
+        return send(res, { ok: false, error: 'baseUrl 必须以 http:// 或 https:// 开头' }, 400)
+      }
+      patch.baseUrl = baseUrl
+    }
+    if (body.model !== undefined) {
+      const model = typeof body.model === 'string' ? body.model.trim() : ''
+      if (model === '') return send(res, { ok: false, error: 'model 不能为空' }, 400)
+      patch.model = model
+    }
+    // apiKey 省略 = 保持原值；显式传空串属于误用（不修改就不该带这个字段）。
+    if (body.apiKey !== undefined) {
+      const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
+      if (apiKey === '') return send(res, { ok: false, error: 'apiKey 不能为空（不修改请省略该字段）' }, 400)
+      patch.apiKey = apiKey
+    }
+
+    // updated 只列真正发生变化的字段；空数组 = 提交值与现值完全一致，不落盘。
+    const updated = []
+    for (const key of Object.keys(patch)) {
+      if (target[key] !== patch[key]) {
+        target[key] = patch[key]
+        updated.push(key)
+      }
+    }
+    if (updated.length > 0) saveKeyring(doc)
+
+    let configRegenerated = false
+    if (doc.active === id && (updated.includes('baseUrl') || updated.includes('model'))) {
+      writeCodexConfig(target)
+      configRegenerated = true
+    }
+    send(res, { ok: true, id, updated, configRegenerated })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -545,6 +602,7 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/providers/key', handler: handleProviderKey },
       { kind: 'exact', path: '/second-engine/api/providers/active', handler: handleProviderActive },
       { kind: 'exact', path: '/second-engine/api/providers/delete', handler: handleProviderDelete },
+      { kind: 'exact', path: '/second-engine/api/providers/update', handler: handleProviderUpdate },
       { kind: 'exact', path: '/second-engine/api/models', handler: handleModels },
       { kind: 'exact', path: '/second-engine/api/model', handler: handleProviderModel },
       { kind: 'exact', path: '/second-engine/api/key', handler: handleKey },
