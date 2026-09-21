@@ -16,6 +16,8 @@
 //   GET    /second-engine/api/task?id=          单条工单全量（含 output）
 //   GET    /second-engine/api/tasks             最近 10 条工单摘要（不含 output）
 //   POST   /second-engine/api/task/cancel       取消运行中的工单（SIGTERM）
+//   POST   /second-engine/api/review            双向互审：对产出做多轮批判性复核（kind:'review'）
+//   POST   /second-engine/api/review/cancel     熔断取消复核任务（SIGTERM）
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
@@ -62,6 +64,18 @@ const TASK_KEEP_LIMIT = 50
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
 const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
 const NOTIFY_TIMEOUT_MS = 3000
+
+// ── 双向互审（review）──
+// 每轮以固定模板要求独立复核引擎输出 JSON；轮数默认 3、上限 5。
+const REVIEW_DEFAULT_ROUNDS = 3
+const REVIEW_MIN_ROUNDS = 1
+const REVIEW_MAX_ROUNDS = 5
+const REVIEW_TEMPLATE = '你是独立复核引擎。批判性审查以下产出：找自洽却错误的推理、漏掉的边界条件、更优备选。输出 JSON: {issues:[{severity,point,suggestion}], verdict}'
+// 看门狗：每 30s 探一次 -o 输出文件 mtime，超 300s 无变化即标疑似停滞并通知。
+const WATCHDOG_INTERVAL_MS = 30000
+const WATCHDOG_STALL_MS = 300000
+// 解析失败时回显的原始输出上限，避免把超长文本灌进任务表。
+const REVIEW_RAW_CLIP = 2000
 
 // 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
 const DEFAULT_KEEP_DAYS = 7
@@ -684,10 +698,11 @@ async function handleCleanup(req, res) {
 
 // ── /task、/tasks、/task/cancel：异步工单 ──
 
-// 只要序列化安全的那部分（child/outPath 绝不出进程）。
+// 只要序列化安全的那部分（child/outPath/watchdog 绝不出进程）。
 function taskView(task) {
-  return {
+  const view = {
     id: task.id,
+    kind: task.kind === 'review' ? 'review' : 'task',
     status: task.status,
     exitCode: task.exitCode,
     startedAt: task.startedAt,
@@ -695,6 +710,16 @@ function taskView(task) {
     workdir: task.workdir,
     output: typeof task.output === 'string' ? task.output : '',
   }
+  if (view.kind === 'review') {
+    // 互审进度：第 N/上限轮 + 每轮 {issues,verdict} 全量（issues 体量小，列表也带上，展开即见）。
+    view.round = Number.isInteger(task.round) ? task.round : 0
+    view.maxRounds = Number.isInteger(task.maxRounds) ? task.maxRounds : REVIEW_DEFAULT_ROUNDS
+    view.verdict = typeof task.verdict === 'string' ? task.verdict : ''
+    view.rounds = Array.isArray(task.rounds) ? task.rounds : []
+  }
+  if (task.stuckSuspect === true) view.stuckSuspect = true
+  if (typeof task.error === 'string' && task.error !== '') view.error = task.error
+  return view
 }
 
 // 摘要：不含 output（列表只给状态，全文按需点开再取）。
@@ -716,9 +741,48 @@ function pruneTasks() {
   }
 }
 
+// 看门狗：任务结束即清 interval（finalizeTask / finalizeReview 都会调用）。
+function stopWatchdog(task) {
+  if (task.watchdog === null || task.watchdog === undefined) return
+  try { clearInterval(task.watchdog) } catch { /* best effort */ }
+  task.watchdog = null
+}
+
+// -o 输出文件 mtime（毫秒）；文件还没生成时返回 null。
+function outFileMtimeMs(outPath) {
+  try { return statSync(outPath).mtimeMs } catch { return null }
+}
+
+// spawn 后启动：每 30s 看一次 -o 文件 mtime，超 300s 无变化 → stuckSuspect + 通知一次。
+// 复核每轮换新的 outPath，检查时按 task.outPath 动态取值，故 interval 可跨越整个任务生命周期。
+function startWatchdog(task) {
+  if (task.watchdog !== null && task.watchdog !== undefined) return
+  task.activityAt = Date.now()
+  task.watchdog = setInterval(() => {
+    try {
+      if (task.endedAt !== null && task.endedAt !== undefined) { stopWatchdog(task); return }
+      const mtime = task.outPath ? outFileMtimeMs(task.outPath) : null
+      if (mtime !== null && mtime > task.activityAt) {
+        task.activityAt = mtime
+        task.stuckSuspect = false
+        return
+      }
+      if (task.stuckSuspect === true) return
+      if (Date.now() - task.activityAt >= WATCHDOG_STALL_MS) {
+        task.stuckSuspect = true
+        const label = task.kind === 'review' ? '复核' : '工单'
+        notify(`${label} ${task.id.slice(-6)} 疑似停滞（>300s 无输出更新）`)
+      }
+    } catch { /* best effort：看门狗自身绝不抛错 */ }
+  }, WATCHDOG_INTERVAL_MS)
+  // 不因看门狗把宿主进程吊住。
+  if (typeof task.watchdog.unref === 'function') task.watchdog.unref()
+}
+
 // 首次落定即返回 true（后续重复调用是 no-op），保证通知只发一次。
 function finalizeTask(task, exitCode, status) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
+  stopWatchdog(task)
   task.exitCode = exitCode
   task.status = status
   try { task.output = readFileSync(task.outPath, 'utf8') } catch { task.output = '' }
@@ -727,19 +791,36 @@ function finalizeTask(task, exitCode, status) {
   return true
 }
 
-// 完成通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
-function notifyTask(task) {
+// 完成/停滞通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
+function notify(text, title = '第二引擎') {
   try {
     let token = ''
     try { token = readFileSync(NOTIFY_TOKEN_PATH, 'utf8').trim() } catch { return }
     if (token === '') return
     const url = `${NOTIFY_URL}?token=${encodeURIComponent(token)}`
-      + `&title=${encodeURIComponent('第二引擎')}`
-      + `&text=${encodeURIComponent(`任务 ${task.id.slice(-6)} ${task.status} (exit ${task.exitCode})`)}`
+      + `&title=${encodeURIComponent(title)}`
+      + `&text=${encodeURIComponent(text)}`
     const req = http.get(url, (resp) => { resp.resume() })
     req.setTimeout(NOTIFY_TIMEOUT_MS, () => { try { req.destroy() } catch { /* best effort */ } })
     req.on('error', () => { /* 桥没开或拒绝连接：静默 */ })
   } catch { /* best effort */ }
+}
+
+function notifyTask(task) {
+  const label = task.kind === 'review' ? '复核' : '任务'
+  const exit = Number.isInteger(task.exitCode) ? ` (exit ${task.exitCode})` : ''
+  notify(`${label} ${task.id.slice(-6)} ${task.status}${exit}`)
+}
+
+// 复核任务收尾：清看门狗、落 verdict/status，只落定一次。
+function finalizeReview(task, status, verdict, error) {
+  if (task.endedAt !== null && task.endedAt !== undefined) return false
+  stopWatchdog(task)
+  task.status = status
+  task.verdict = verdict
+  task.error = typeof error === 'string' ? error : ''
+  task.endedAt = Date.now()
+  return true
 }
 
 function queryParam(url, key) {
@@ -783,6 +864,7 @@ async function handleTaskCreate(req, res) {
     })
     const task = {
       id,
+      kind: 'task',
       status: 'running',
       exitCode: null,
       output: '',
@@ -795,6 +877,7 @@ async function handleTaskCreate(req, res) {
     }
     tasks.set(id, task)
     pruneTasks()
+    startWatchdog(task)
 
     child.on('exit', (code) => {
       // 被取消的任务固定 error/-1；其余按真实退出码判定。
@@ -856,6 +939,244 @@ async function handleTaskCancel(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
+// ── /review、/review/cancel：双向互审 ──
+// 两引擎相互批判性复核：每轮把同一份 content 交给独立复核引擎，只累加 issues 对照，
+// 不做自动改写（v1 语义）；issues 清空即收敛，轮数到顶即打包交用户裁决。
+
+const clipText = (text, limit = REVIEW_RAW_CLIP) => {
+  const str = String(text === undefined || text === null ? '' : text)
+  return str.length > limit ? `${str.slice(0, limit)}…` : str
+}
+
+// 宽松解析：从自由文本里截取「首个配平的 {...} 块」（跳过字符串内的花括号与转义）。
+function extractFirstJsonObject(text) {
+  const s = String(text === undefined || text === null ? '' : text)
+  const start = s.indexOf('{')
+  if (start < 0) return null
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < s.length; i += 1) {
+    const ch = s[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') { inString = true; continue }
+    if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return s.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+const asText = (value) => {
+  if (typeof value === 'string') return value
+  if (value === undefined || value === null) return ''
+  try { return String(value) } catch { return '' }
+}
+
+// 归一化单条 issue：severity/point/suggestion 一律收敛成字符串，形状稳定。
+function normalizeIssue(raw) {
+  const item = raw !== null && typeof raw === 'object' ? raw : {}
+  return {
+    severity: asText(item.severity).trim(),
+    point: asText(item.point).trim(),
+    suggestion: asText(item.suggestion).trim(),
+  }
+}
+
+// 解析复核输出 → { ok:true, issues, verdict } 或 { ok:false, raw }。
+// issues 必须是数组（缺键视为解析失败：宁可报错也不误判「已收敛」）。
+function parseReviewJson(text) {
+  const block = extractFirstJsonObject(text)
+  if (block === null) return { ok: false, raw: clipText(text) }
+  let obj
+  try { obj = JSON.parse(block) } catch { return { ok: false, raw: clipText(block) } }
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return { ok: false, raw: clipText(block) }
+  if (!Array.isArray(obj.issues)) return { ok: false, raw: clipText(block) }
+  const issues = obj.issues.map(normalizeIssue)
+  const verdict = asText(obj.verdict).trim()
+  return { ok: true, issues, verdict: verdict !== '' ? verdict : (issues.length === 0 ? 'converged' : 'issues-found') }
+}
+
+// 固定模板 + 被审产出 +（第 2 轮起）上一轮 issues 对照。
+function buildReviewPrompt(content, prev) {
+  const parts = [REVIEW_TEMPLATE, '', '【被审产出】', content]
+  const prevIssues = prev && Array.isArray(prev.issues) ? prev.issues : []
+  if (prevIssues.length > 0) {
+    parts.push(
+      '',
+      '【上一轮已发现的问题（请对照复核）】',
+      JSON.stringify(prevIssues, null, 2),
+      '已解决的不必重复罗列；仍未解决的请确认，并补充新发现的问题。',
+    )
+  }
+  parts.push('', '只输出一个 JSON 对象，不要输出额外解释。')
+  return parts.join('\n')
+}
+
+// 跑一轮 codex exec：与 /task 同配置（--ephemeral、stdin ignore、env 注入），
+// 但返回同步可见的 child 句柄（立即可被 cancel SIGTERM）+ 等待退出码的 promise。
+function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
+  const args = ['exec', '--skip-git-repo-check', '--ephemeral', '-o', outPath, prompt]
+  const child = spawn('codex', args, {
+    cwd: workdir,
+    env: { ...process.env, [envKey]: apiKey },
+    // stdin 必须显式关闭：Codex exec 等 stdin EOF，pipe 永不关闭会让任务假死。
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const wait = new Promise((resolve) => {
+    let settled = false
+    const done = (code) => {
+      if (settled) return
+      settled = true
+      resolve(Number.isInteger(code) ? code : -1)
+    }
+    child.on('exit', (code) => done(code))
+    // spawn 失败（二进制缺失等）不触发 exit，这里兜底。
+    child.on('error', () => done(-1))
+  })
+  return { child, wait }
+}
+
+// 读一轮的 -o 输出并删除文件（逐轮清理，不把中间产物留在 ~/.codex）。
+function readReviewOut(outPath) {
+  let text = ''
+  try { text = readFileSync(outPath, 'utf8') } catch { text = '' }
+  try { unlinkSync(outPath) } catch { /* 文件可能没生成，忽略 */ }
+  return text
+}
+
+// 服务层自动循环：每轮 spawn → 解析 → 按 issues/轮数推进，cancelled 即熔断。
+async function runReview(task, active) {
+  const envKey = `${active.id.toUpperCase()}_API_KEY`
+  try {
+    for (;;) {
+      if (task.status === 'cancelled' || task.cancelled === true) break
+      const round = task.rounds.length + 1
+      if (round > task.maxRounds) break
+      task.round = round
+      const prev = task.rounds.length > 0 ? task.rounds[task.rounds.length - 1] : null
+      const prompt = buildReviewPrompt(task.content, prev)
+      const outPath = join(CODEX_DIR, `review-${task.id}-r${round}.out`)
+      task.outPath = outPath
+      // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
+      task.activityAt = Date.now()
+      const { child, wait } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
+      task.child = child
+      const code = await wait
+      task.child = null
+      task.exitCode = task.cancelled === true ? -1 : code
+      const raw = readReviewOut(outPath)
+      if (task.status === 'cancelled' || task.cancelled === true) break
+      const parsed = parseReviewJson(raw)
+      if (!parsed.ok) {
+        task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: parsed.raw })
+        finalizeReview(task, 'error', 'unparsed', code === 0 ? '未能从复核输出解析出 JSON' : `codex 退出码 ${code}`)
+        void notifyTask(task)
+        return
+      }
+      // issues 为空 → 本轮即收敛；否则记下本轮结论供下一轮对照。
+      task.rounds.push({
+        round,
+        issues: parsed.issues,
+        verdict: parsed.issues.length === 0 ? 'converged' : parsed.verdict,
+      })
+      if (parsed.issues.length === 0) {
+        finalizeReview(task, 'done', 'converged')
+        void notifyTask(task)
+        return
+      }
+      if (round >= task.maxRounds) {
+        // 轮数用尽仍有问题：最后一轮 issues 已在 rounds 里，打包交用户裁决。
+        finalizeReview(task, 'done', 'max-rounds')
+        void notifyTask(task)
+        return
+      }
+    }
+    // 走到这里只可能是被取消（cancelled → 熔断退出）。
+    finalizeReview(task, 'cancelled', 'cancelled')
+  } catch (e) {
+    finalizeReview(task, 'error', 'error', errMsg(e))
+    void notifyTask(task)
+  }
+}
+
+// POST /review：body { content, rounds? }。立刻返回 { ok, id }，服务层后台自动循环。
+async function handleReviewCreate(req, res) {
+  try {
+    const body = await readBody(req)
+    const content = typeof body.content === 'string' ? body.content.trim() : ''
+    if (content === '') return send(res, { ok: false, error: 'content 不能为空' }, 400)
+    const requested = body.rounds === undefined || body.rounds === null ? REVIEW_DEFAULT_ROUNDS : Number(body.rounds)
+    if (!Number.isFinite(requested) || Math.floor(requested) < REVIEW_MIN_ROUNDS) {
+      return send(res, { ok: false, error: `rounds 必须是 ${REVIEW_MIN_ROUNDS}..${REVIEW_MAX_ROUNDS} 的整数` }, 400)
+    }
+    const maxRounds = Math.min(REVIEW_MAX_ROUNDS, Math.floor(requested))
+    const doc = loadKeyring()
+    const active = doc.providers.find((p) => p.id === doc.active)
+    if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
+    // 复核不接用户 workdir：默认工单目录不在时退回 ~/.codex（codex exec 需要一个存在的 cwd）。
+    const workdir = existsSync(DEFAULT_TASK_WORKDIR) ? DEFAULT_TASK_WORKDIR : CODEX_DIR
+    mkdirSync(CODEX_DIR, { recursive: true })
+
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0')
+    const task = {
+      id,
+      kind: 'review',
+      status: 'running',
+      round: 0,
+      maxRounds,
+      rounds: [],
+      verdict: '',
+      error: '',
+      content,
+      startedAt: Date.now(),
+      endedAt: null,
+      exitCode: null,
+      workdir,
+      child: null,
+      outPath: '',
+      cancelled: false,
+      stuckSuspect: false,
+    }
+    tasks.set(id, task)
+    pruneTasks()
+    startWatchdog(task)
+    void runReview(task, active)
+    send(res, { ok: true, id, maxRounds })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// POST /review/cancel：body { id }。置 cancelled（熔断），子进程活着则 SIGTERM。
+async function handleReviewCancel(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
+    const task = tasks.get(id)
+    if (task === undefined) return send(res, { ok: false, error: `未找到任务 '${id}'` }, 404)
+    if (task.kind !== 'review') return send(res, { ok: false, error: `任务 '${id}' 不是复核任务` }, 400)
+    if (task.status !== 'running') {
+      return send(res, { ok: false, error: `复核已结束（${task.status}），无需取消` }, 400)
+    }
+    // 先置熔断标记：循环每轮结束（及下一轮 spawn 前）都会检查，确保不再推进。
+    task.cancelled = true
+    task.status = 'cancelled'
+    task.verdict = 'cancelled'
+    const child = task.child
+    if (child !== null && child !== undefined) {
+      try { child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+    }
+    send(res, { ok: true, id, status: task.status })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
 // /api/task 同 path 两个方法：POST 下发 / GET 查询，其余 405。
 async function handleTaskRoot(req, res) {
   if (req.method === 'POST') return handleTaskCreate(req, res)
@@ -889,6 +1210,8 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/task', handler: handleTaskRoot },
       { kind: 'exact', path: '/second-engine/api/tasks', handler: handleTaskList },
       { kind: 'exact', path: '/second-engine/api/task/cancel', handler: handleTaskCancel },
+      { kind: 'exact', path: '/second-engine/api/review', handler: handleReviewCreate },
+      { kind: 'exact', path: '/second-engine/api/review/cancel', handler: handleReviewCancel },
     ]
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
