@@ -1,6 +1,6 @@
 {
   "name": "dsh-second-engine",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Second engine plugin for DeepSeek Harness: Codex 二元引擎状态、密钥写入与会话清理 API。",
   "type": "module",
   "main": "src/index.js",
@@ -9,6 +9,7 @@
     "./client": "./lib/client.js"
   },
   "files": [
+    "tools",
     "src",
     "lib",
     "skills",
