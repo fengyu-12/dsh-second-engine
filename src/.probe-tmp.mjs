@@ -31,7 +31,7 @@ import { spawn, execSync, execFile } from 'node:child_process'
 import http from 'node:http'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import z from '@deepseek-ai/schemastery'
+const z = { object: (x) => x }
 import { createBridgeServer } from './bridge.js'
 
 export const name = 'second-engine'
@@ -1522,3 +1522,5 @@ export function apply(ctx) {
     sctx.effect(() => () => { secondEngineSettingsScope = null }, 'second-engine: settings scope teardown')
   })
 }
+
+export { parseVersion, compareVersions, ensureGitBaseline, runAutoCleanup, handleVersion, handleTaskCreate, AUTO_CLEANUP_KEEP_DAYS, AUTO_CLEANUP_MAX_BYTES, AUTO_CLEANUP_INTERVAL_MS }
