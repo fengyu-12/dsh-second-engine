@@ -23,6 +23,11 @@
 //   POST   /second-engine/api/consult           Codex 卡点求助入队（内存 20 条 + 弹 App 通知）
 //   GET    /second-engine/api/consults          求助列表（不脱敏，给主 AI 收卷）
 //   GET    /second-engine/api/version           本机 codex 版本 vs GitHub 最新 release（updateAvailable）
+//   GET    /second-engine/api/websearch         读 config.toml 顶层 web_search（无则 disabled）
+//   POST   /second-engine/api/websearch         写 web_search { value: disabled|cached|indexed|live }
+//   GET    /second-engine/api/mcp               config.toml 全部 [mcp_servers.*] 段
+//   POST   /second-engine/api/mcp               新增 [mcp_servers.<name>] { name, url }（重名 409）
+//   DELETE /second-engine/api/mcp/<name>        删除该段（不存在 404）
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
@@ -58,6 +63,12 @@ const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
 const WIRE_API = 'responses'
 const SUPPORTED_WIRE_APIS = new Set(['responses', 'completions'])
 const ID_PATTERN = /^[a-z][a-z0-9_-]*$/
+// config.toml 顶层 web_search：Codex 原生联网搜索档位（二进制 WebSearchMode 枚举实证）。
+// disabled=关闭，live=开启；cached/indexed 是中间档，面板只暴露 disabled/live 两档。
+const WEB_SEARCH_MODES = ['disabled', 'cached', 'indexed', 'live']
+const DEFAULT_WEB_SEARCH = 'disabled'
+// MCP 段名：限定字符集堵住段头注入（换行/']'/引号都进不来）。
+const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 
 // ── 异步工单 ──
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
@@ -379,6 +390,97 @@ function extractMcpServerBlocks() {
   } catch { /* 原文件不存在：无可保留 */ return [] }
 }
 
+// ── config.toml 读写（web_search / mcp_servers）──
+// 与 extractMcpServerBlocks 同口径：读不到就当下不存在，绝不抛错。
+function readConfigRaw() {
+  try { return readFileSync(CONFIG_PATH, 'utf8') } catch { return '' }
+}
+
+// 落盘统一走这里：目录先建、权限 0600（config.toml 里有 apiKey 引用等敏感信息）。
+function writeConfigRaw(text) {
+  mkdirSync(CODEX_DIR, { recursive: true })
+  writeFileSync(CONFIG_PATH, text, 'utf8')
+  chmodSync(CONFIG_PATH, 0o600)
+}
+
+// 读顶层字符串字段（无该字段/文件缺失 → fallback）。与 sandbox_mode 保留同一写法。
+function readTopLevelString(key, fallback) {
+  const m = new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, 'm').exec(readConfigRaw())
+  return m === null ? fallback : m[1]
+}
+
+// 当前生效的 web_search：非法/缺失一律按 disabled（与 Codex 无该字段时的默认行为一致）。
+function readWebSearch() {
+  const value = readTopLevelString('web_search', DEFAULT_WEB_SEARCH)
+  return WEB_SEARCH_MODES.includes(value) ? value : DEFAULT_WEB_SEARCH
+}
+
+// 写顶层字符串字段。TOML 铁律：顶层键必须排在第一个 [table] 之前，否则会被归进那张表。
+// 已存在则原地替换，否则插在顶层块末尾。
+function writeTopLevelString(key, value) {
+  const lines = readConfigRaw().split('\n')
+  const firstTable = lines.findIndex((l) => /^\s*\[/.test(l))
+  const head = firstTable === -1 ? lines.slice() : lines.slice(0, firstTable)
+  const tail = firstTable === -1 ? [] : lines.slice(firstTable)
+  const line = `${key} = ${tomlString(value)}`
+  const at = head.findIndex((l) => new RegExp(`^\\s*${key}\\s*=`).test(l))
+  if (at === -1) head.push(line)
+  else head[at] = line
+  while (head.length > 0 && head[head.length - 1].trim() === '') head.pop()
+  const body = tail.length === 0 ? head : [...head, '', ...tail]
+  // 首部空行一并压掉：文件不存在时 head 以空行起手，别让新写的 config 顶着空行。
+  writeConfigRaw(`${body.join('\n').replace(/^\n+/, '').replace(/\n*$/, '')}\n`)
+}
+
+// 段头里的键可能被引号包着（[mcp_servers."my-srv"]），取值时剥掉。
+function unquoteTomlKey(raw) {
+  const key = String(raw).trim()
+  if (key.length >= 2 && key.startsWith('"') && key.endsWith('"')) {
+    return key.slice(1, -1).replace(/\\"/g, '"')
+  }
+  return key
+}
+
+// 列出 config.toml 全部 [mcp_servers.*] 段（名称 + url）；无 url 的段 url 回空串。
+function listMcpServers() {
+  const raw = readConfigRaw()
+  const out = []
+  const re = /^\[mcp_servers\.([^\]\n]+)\][^\n]*$/gm
+  let m
+  while ((m = re.exec(raw)) !== null) {
+    const next = raw.indexOf('\n[', m.index)
+    const body = raw.slice(m.index, next === -1 ? raw.length : next)
+    const u = /^\s*url\s*=\s*"([^"]*)"/m.exec(body)
+    out.push({ name: unquoteTomlKey(m[1]), url: u === null ? '' : u[1] })
+  }
+  return out
+}
+
+// 追加一个 [mcp_servers.<name>] 段（name/url 已由 handler 校验）。只追加不改写其它内容，
+// 用户的 [projects.*]/[model_providers.*] 一行都不会被碰。
+function addMcpServer(name, url) {
+  const block = `[mcp_servers.${name}]\nurl = ${tomlString(url)}`
+  const raw = readConfigRaw().replace(/\n*$/, '')
+  writeConfigRaw(raw === '' ? `${block}\n` : `${raw}\n\n${block}\n`)
+}
+
+// 原地删除一个 [mcp_servers.<name>] 段（段体直到下一个段头或文件尾）。
+// 存在并删除 → true；不存在 → false（handler 据此回 404）。
+function removeMcpServer(name) {
+  const raw = readConfigRaw()
+  const key = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`^\\[mcp_servers\\.(?:${key}|"${key}")\\][^\\n]*$`, 'm')
+  const m = re.exec(raw)
+  if (m === null) return false
+  const next = raw.indexOf('\n[', m.index)
+  const end = next === -1 ? raw.length : next + 1
+  const before = raw.slice(0, m.index).replace(/\s*$/, '')
+  const after = raw.slice(end).replace(/^\s*/, '')
+  const joined = after === '' ? `${before}\n` : `${before}\n\n${after}`
+  writeConfigRaw(joined.replace(/^\n+/, '').replace(/\n*$/, '') + '\n')
+  return true
+}
+
 // ── 翻译桥生命周期 ──
 // 进程内只保留一座桥：wireApi==='completions' 的提供方每次激活都会重建
 // （旧桥先 close，避免端口/回调残留在旧提供方上）。
@@ -437,10 +539,15 @@ async function writeCodexConfig(provider) {
     const m = /^sandbox_mode\s*=\s*"([^"]+)"/m.exec(readFileSync(CONFIG_PATH, 'utf8'))
     if (m) sandboxMode = m[1]
   } catch { /* 原文件不存在，用实证默认值 */ }
+  // 同理保留顶层 web_search（联网搜索开关）：面板切提供方时不丢用户的开关状态。
+  const webSearch = readWebSearch()
   const lines = [
     `model_provider = ${tomlString(provider.id)}`,
     `model = ${tomlString(provider.model)}`,
     `sandbox_mode = ${tomlString(sandboxMode)}`,
+    `web_search = ${tomlString(webSearch)}`,
+    // 审批策略固定 never：exec 模式非交互，默认值下工作副本外写入会请求人工审批 → 无限挂起假死（2026-09-21 实证）
+    `approval_policy = "never"`,
   ]
   // 模型元数据（预设提供方实证值）：Codex 顶层 model_context_window / model_max_output_tokens。
   if (Number.isFinite(provider.contextWindow)) {
@@ -1394,6 +1501,87 @@ async function handleConsultsList(_req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
+// ── /websearch：原生联网搜索开关（config.toml 顶层 web_search）──
+// GET 回显当前档位（无字段 → disabled）；POST 写入，非法档位 400。
+async function handleWebSearchGet(_req, res) {
+  try { send(res, { ok: true, value: readWebSearch() }) }
+  catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function handleWebSearchSet(req, res) {
+  try {
+    const body = await readBody(req)
+    const value = typeof body.value === 'string' ? body.value.trim() : ''
+    if (!WEB_SEARCH_MODES.includes(value)) {
+      return send(res, { ok: false, error: `value 只支持 ${WEB_SEARCH_MODES.join(' / ')}` }, 400)
+    }
+    writeTopLevelString('web_search', value)
+    send(res, { ok: true, value })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// /api/websearch 同 path 两个方法：GET 回显 / POST 保存，其余 405。
+async function handleWebSearchRoot(req, res) {
+  if (req.method === 'POST') return handleWebSearchSet(req, res)
+  if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') return handleWebSearchGet(req, res)
+  return send(res, { ok: false, error: 'method not allowed' }, 405)
+}
+
+// ── /mcp：MCP 服务器增删查（config.toml 的 [mcp_servers.*] 段）──
+// 注册为 prefix 路由（'prefix' 同时命中 /mcp 与 /mcp/<name>），按方法+子路径分发。
+const MCP_ROUTE_PREFIX = '/second-engine/api/mcp'
+
+// 新增返回 false 表示重名（handler 据此回 409，不做覆盖）。
+function handleMcpList(_req, res) {
+  try { send(res, { ok: true, servers: listMcpServers() }) }
+  catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function handleMcpAdd(req, res) {
+  try {
+    const body = await readBody(req)
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const url = typeof body.url === 'string' ? body.url.trim() : ''
+    if (name === '') return send(res, { ok: false, error: 'name 不能为空' }, 400)
+    if (!MCP_NAME_PATTERN.test(name)) {
+      return send(res, { ok: false, error: 'name 只允许字母、数字、下划线和连字符' }, 400)
+    }
+    if (!/^https?:\/\//.test(url)) {
+      return send(res, { ok: false, error: 'url 必须以 http:// 或 https:// 开头' }, 400)
+    }
+    if (listMcpServers().some((s) => s.name === name)) {
+      return send(res, { ok: false, error: `已存在同名 MCP 服务器 '${name}'` }, 409)
+    }
+    addMcpServer(name, url)
+    send(res, { ok: true, servers: listMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+function handleMcpDelete(res, name) {
+  try {
+    if (name === '' || !removeMcpServer(name)) {
+      return send(res, { ok: false, error: `未找到 MCP 服务器 '${name}'` }, 404)
+    }
+    send(res, { ok: true, servers: listMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// prefix 分发：'' → GET 列表 / POST 新增；'/<name>' → DELETE 删除。
+async function handleMcpRoot(req, res) {
+  const pathname = new URL(req.url === undefined ? '/' : req.url, 'http://127.0.0.1').pathname
+  const rest = pathname.slice(MCP_ROUTE_PREFIX.length)
+  const method = req.method === undefined ? 'GET' : req.method
+  if (method === 'DELETE') {
+    let name = rest.replace(/^\//, '')
+    try { name = decodeURIComponent(name) } catch { /* 非法百分号编码：按原文处理 */ }
+    return handleMcpDelete(res, name)
+  }
+  if (rest !== '' && rest !== '/') return send(res, { ok: false, error: 'not found' }, 404)
+  if (method === 'POST') return handleMcpAdd(req, res)
+  if (method === 'GET' || method === 'HEAD') return handleMcpList(req, res)
+  return send(res, { ok: false, error: 'method not allowed' }, 405)
+}
+
 // ── /version：版本检查 ──
 // 本机 `codex --version` 与 GitHub 最新 release 对比。远端结果做模块级缓存 60 分钟：
 // 设置页会反复刷新，匿名调用 api.github.com 的配额经不起每次请求都打一次。
@@ -1517,6 +1705,9 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/consult', handler: handleConsultCreate },
       { kind: 'exact', path: '/second-engine/api/consults', handler: handleConsultsList },
       { kind: 'exact', path: '/second-engine/api/version', handler: handleVersion },
+      { kind: 'exact', path: '/second-engine/api/websearch', handler: handleWebSearchRoot },
+      // prefix：'prefix' 同时命中 /mcp 与 /mcp/<name>，DELETE 的名字从 URL 尾巴取。
+      { kind: 'prefix', path: '/second-engine/api/mcp', handler: handleMcpRoot },
     ]
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
