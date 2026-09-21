@@ -778,6 +778,8 @@ async function handleTaskCreate(req, res) {
     const child = spawn('codex', args, {
       cwd: workdir,
       env: { ...process.env, [envKey]: active.apiKey },
+      // stdin 必须显式关闭：Codex exec 会等待 stdin EOF，默认 pipe 永不关闭 → 任务假死（CPU 0 实证）
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const task = {
       id,
