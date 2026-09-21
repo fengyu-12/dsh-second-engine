@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
+import { createBridgeServer } from './bridge.js'
 
 export const name = 'second-engine'
 
@@ -30,15 +31,18 @@ const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
 
 const CONFIG_BACKUP_PATH = join(CODEX_DIR, 'config.toml.bak-se')
 
-// 首次初始化写入的两家预设（apiKey 空，待设置页填写）。
+// 首次初始化写入的三家预设（apiKey 空，待设置页填写）。
 const PRESET_PROVIDERS = [
   { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'responses', model: 'deepseek-flash' },
   { id: 'zhipu', name: '智谱', baseUrl: 'https://open.bigmodel.cn/api/v1', wireApi: 'responses', model: 'glm-4.6' },
+  { id: 'yun', name: '云知声', baseUrl: 'https://maas-api.unisound.com/v1', wireApi: 'completions', model: 'u2-flash' },
 ]
 const PRESET_IDS = new Set(PRESET_PROVIDERS.map((p) => p.id))
 const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
-// 目前只支持 Responses 协议；其它协议需要「翻译桥」，暂不支持。
+// Codex 侧永远讲 Responses（config.toml 的 wire_api 恒为它），
+// 'completions' 提供方由本地翻译桥转接（见 ensureBridge）。
 const WIRE_API = 'responses'
+const SUPPORTED_WIRE_APIS = new Set(['responses', 'completions'])
 const ID_PATTERN = /^[a-z][a-z0-9_-]*$/
 
 // 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
@@ -198,11 +202,11 @@ function invalidIdError(id) {
   return null
 }
 
-// 只接受 'responses'；其它取值一律拒绝（需要翻译桥，暂不支持）。
+// 接受 'responses'（直连）与 'completions'（经本地翻译桥）；其余取值拒绝。
 function wireApiError(value) {
   if (value === undefined || value === null || value === '') return null
-  if (value === WIRE_API) return null
-  return `wireApi 只支持 '${WIRE_API}'，'${value}' 需要翻译桥，暂不支持`
+  if (SUPPORTED_WIRE_APIS.has(value)) return null
+  return `wireApi 只支持 'responses'（直连）或 'completions'（经本地桥），收到 '${value}'`
 }
 
 // ── config.toml 生成 ──
@@ -221,10 +225,56 @@ function backupConfig() {
   } catch { /* 备份失败不阻断切换（best effort） */ }
 }
 
+// ── 翻译桥生命周期 ──
+// 进程内只保留一座桥：wireApi==='completions' 的提供方每次激活都会重建
+// （旧桥先 close，避免端口/回调残留在旧提供方上）。
+let bridgeServer = null
+let bridgeBaseUrl = ''
+
+// 关闭当前桥（幂等；可安全用于 dispose / process 退出钩子）。
+function closeBridge() {
+  const server = bridgeServer
+  bridgeServer = null
+  bridgeBaseUrl = ''
+  if (server === null) return
+  try { server.close() } catch { /* 已关闭或从未监听成功 */ }
+}
+
+// 让 config.toml 指向正确的上游端点：
+//   completions → 起本地桥（127.0.0.1 随机端口），Codex 连桥、桥转 chat；
+//   responses   → 关掉旧桥，直连 provider.baseUrl。
+// 返回 { viaBridge, baseUrl }。
+async function ensureBridge(provider) {
+  if (provider.wireApi !== 'completions') {
+    closeBridge()
+    return { viaBridge: false, baseUrl: provider.baseUrl }
+  }
+  closeBridge()
+  const server = createBridgeServer({ upstreamBaseUrl: provider.baseUrl, apiKey: provider.apiKey })
+  try {
+    // createBridgeServer 已发起 listen(0,'127.0.0.1')，等 'listening' 才拿得到端口。
+    await new Promise((resolve, reject) => {
+      const onError = (err) => { server.off('listening', onListening); reject(err) }
+      const onListening = () => { server.off('error', onError); resolve() }
+      server.once('error', onError)
+      server.once('listening', onListening)
+    })
+  } catch (e) {
+    try { server.close() } catch { /* best effort */ }
+    throw e
+  }
+  bridgeServer = server
+  bridgeBaseUrl = `http://127.0.0.1:${server.address().port}`
+  return { viaBridge: true, baseUrl: bridgeBaseUrl }
+}
+
 // 按 active 提供方生成 config.toml，返回使用的 env_key。
-function writeCodexConfig(provider) {
+// base_url 写 ensureBridge 给出的端点（completions 时即本地桥）；
+// wire_api 恒为 'responses'——Codex 只会说 Responses，协议差异由桥承担。
+async function writeCodexConfig(provider) {
   mkdirSync(CODEX_DIR, { recursive: true })
   backupConfig()
+  const target = await ensureBridge(provider)
   const envKey = `${provider.id.toUpperCase()}_API_KEY`
   const tableKey = ID_PATTERN.test(provider.id) ? provider.id : tomlString(provider.id)
   // 保留原 config.toml 的 sandbox_mode：本机 proot 实测仅 danger-full-access 可跑工具，绝不能在切换提供方时丢失
@@ -240,7 +290,7 @@ function writeCodexConfig(provider) {
     '',
     `[model_providers.${tableKey}]`,
     `name = ${tomlString(provider.name)}`,
-    `base_url = ${tomlString(provider.baseUrl)}`,
+    `base_url = ${tomlString(target.baseUrl)}`,
     `env_key = ${tomlString(envKey)}`,
     `wire_api = ${tomlString(WIRE_API)}`,
     '',
@@ -315,7 +365,8 @@ async function handleProviderAdd(req, res) {
     if (doc.providers.some((p) => p.id === id)) {
       return send(res, { ok: false, error: `提供方 '${id}' 已存在` }, 400)
     }
-    const provider = { id, name, baseUrl, wireApi: WIRE_API, model, apiKey }
+    const wireApi = typeof body.wireApi === 'string' && body.wireApi !== '' ? body.wireApi : WIRE_API
+    const provider = { id, name, baseUrl, wireApi, model, apiKey }
     doc.providers.push(provider)
     saveKeyring(doc)
     send(res, { ok: true, active: doc.active, provider: providerView(provider) })
@@ -357,7 +408,7 @@ async function handleProviderActive(req, res) {
     if (target === undefined) return send(res, { ok: false, error: `未找到提供方 '${id}'` }, 404)
     doc.active = id
     saveKeyring(doc)
-    const envKey = writeCodexConfig(target)
+    const envKey = await writeCodexConfig(target)
     send(res, { ok: true, active: id, configPath: CONFIG_PATH, backupPath: CONFIG_BACKUP_PATH, envKey })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -381,7 +432,7 @@ async function handleProviderDelete(req, res) {
       doc.active = DEFAULT_ACTIVE
       const fallback = doc.providers.find((p) => p.id === DEFAULT_ACTIVE)
       if (fallback !== undefined) {
-        writeCodexConfig(fallback)
+        await writeCodexConfig(fallback)
         configRegenerated = true
       }
     }
@@ -439,7 +490,7 @@ async function handleProviderUpdate(req, res) {
 
     let configRegenerated = false
     if (doc.active === id && (updated.includes('baseUrl') || updated.includes('model'))) {
-      writeCodexConfig(target)
+      await writeCodexConfig(target)
       configRegenerated = true
     }
     send(res, { ok: true, id, updated, configRegenerated })
@@ -543,7 +594,7 @@ async function handleProviderModel(req, res) {
     saveKeyring(doc)
     let configRegenerated = false
     if (target.id === doc.active) {
-      writeCodexConfig(target)
+      await writeCodexConfig(target)
       configRegenerated = true
     }
     send(res, { ok: true, id: target.id, model, configRegenerated })
@@ -594,6 +645,15 @@ async function handleCleanup(req, res) {
 }
 
 export function apply(ctx) {
+  // 桥清理：插件卸载/热重载时关掉本地桥，避免 server 句柄与端口残留。
+  // 宿主用 cordis fiber：ctx.effect 回调返回的函数即卸载时的 disposer（同 guard 写法）；
+  // 宿主若没有 effect（老版本），退回 process.on('exit')。
+  try {
+    ctx.effect(() => closeBridge, 'second-engine: bridge teardown')
+  } catch {
+    try { process.on('exit', closeBridge) } catch { /* best effort */ }
+  }
+
   // 设置页 API：webServer 后挂载时也能注册；无 webServer 的 profile 自然不注册。
   ctx.inject(['webServer'], (wctx) => {
     const routes = [
