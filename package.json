@@ -15,7 +15,8 @@
     "lib",
     "skills",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "engines": {
     "node": ">=22"
