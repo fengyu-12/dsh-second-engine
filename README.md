@@ -1,5 +1,8 @@
 # dsh-second-engine
 
+> **English**: Plug OpenAI Codex CLI into DeepSeek Harness as a *second agent* — async work orders, adversarial review, a shared terminal↔web session bridge, and a file-based task board. Design notes live in `docs/`.
+
+
 > 🚀 **你的 AI 也能拥有自己的 AI**：装一个插件、再装个 223MB 的 Codex CLI，你的 DeepSeek Harness 里就多了一位 7×24 待命的**第二引擎**——主 AI 干累了可以「让 Codex 试试」，写完代码自动互审挑刺，卡住还会主动喊救命。一个手机，两颗大脑，你只管裁决。
 
 | 平台 | 状态 |
