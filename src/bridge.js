@@ -324,7 +324,11 @@ function readBody(req) {
   })
 }
 
-// Responses SSE 回放：created → (output_text.delta) → completed → [DONE]。
+// Responses SSE 回放：created → item.added → part.added → text.delta → text.done
+//                     → part.done → item.done → completed → [DONE]。
+// 2026-09-30 修：此前只发 created/delta/completed，缺 item 生命周期事件，
+// codex 的 responses 解析器遇到 delta 时没有活跃 item，报
+// "OutputTextDelta without active item" 并把整段文本丢弃（token 照烧、屏幕空白）。
 function replayAsSse(res, response) {
   res.statusCode = 200
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -339,12 +343,50 @@ function replayAsSse(res, response) {
 
   const text = firstText(response)
   if (text !== '') {
+    const itemId = `msg_${response.id}`
+    writeEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+    })
+    writeEvent(res, 'response.content_part.added', {
+      type: 'response.content_part.added',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: '', annotations: [] },
+    })
     writeEvent(res, 'response.output_text.delta', {
       type: 'response.output_text.delta',
       delta: text,
-      item_id: `msg_${response.id}`,
+      item_id: itemId,
       output_index: 0,
       content_index: 0,
+    })
+    writeEvent(res, 'response.output_text.done', {
+      type: 'response.output_text.done',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      text,
+    })
+    writeEvent(res, 'response.content_part.done', {
+      type: 'response.content_part.done',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text, annotations: [] },
+    })
+    writeEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: {
+        id: itemId,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text, annotations: [] }],
+      },
     })
   }
 

@@ -1,0 +1,154 @@
+#!/bin/bash
+# 第二引擎 · 启动器（可搬运版，不硬编码任何路径/端口/token）
+#
+# 用法：codex-env [-r] [-a [会话id]] [-s] [工作目录]
+#   （不带参数） 从 keyring 注入 key，进 Codex TUI —— **开在会话所有者上**，
+#               所以终端和网页共享同一条（网页里几秒内出现「未开始」）
+#   -s          开独立新会话（网页里看不见，老行为）
+#   -r          直接续最近一条会话（codex resume --last）
+#   -a          挂到网页桥的**会话所有者**上（终端与网页共享同一批会话，两边可同时发）
+#   -a <会话id> 挂上去并直接打开指定会话
+#
+# 所有路径都可用环境变量覆盖：
+#   BRIDGE_DIR      网页桥目录（默认=脚本自身所在目录，即插件包内 bridge/web）
+#   CODEX_KEYRING   key 来源（默认 $HOME/.codex/keyring.json）
+#   SECOND_ENGINE_WORKDIR  默认工作目录（默认 $HOME/proj）
+#   BRIDGE_AS_PORT / BRIDGE_PORT / CODEX_BIN  同 ctl.sh
+set -e
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+BRIDGE_DIR=${BRIDGE_DIR:-$SELF_DIR}
+KEYRING=${CODEX_KEYRING:-$HOME/.codex/keyring.json}
+DEFAULT_WORKDIR=${SECOND_ENGINE_WORKDIR:-$HOME/proj}
+
+RESUME=""; ATTACH=""; ATTACH_ID=""; SOLO=""
+
+case "${1:-}" in
+  -h|--help|help)
+    cat <<TXT
+第二引擎 · codex-env —— 终端侧启动器
+
+  codex-env               开新会话并挂到会话所有者上（终端 + 网页共享，推荐）
+  codex-env -s            开一个独立新会话（网页里看不见）
+  codex-env -r            续最近的独立会话（codex resume --last）
+  codex-env -a            挂到会话所有者上，弹会话选择器（与网页共享）
+  codex-env -a <会话id>   挂上去并直接打开指定会话
+  codex-env <目录>        在指定目录开新会话（默认 $DEFAULT_WORKDIR）
+  codex-env -u | --url    只打印网页桥网址就退出（不进 TUI、不注入 key）
+  codex-env -h            看这份说明
+
+  不带参数时：新会话直接开在 owner 上，网页列表里几秒内出现（标「未开始」），
+  手机上就能接着打第一句 —— 不需要先在终端说句话把它"催"落盘。
+  会话说出第一句之前只活在 owner 内存里，owner 重启就丢了（本来也没内容）。
+
+  想让终端和网页看到同一段对话：终端直接 codex-env，网页用下面这条网址打开
+    $BRIDGE_DIR/ctl.sh url
+  拿会话 id
+    $BRIDGE_DIR/ctl.sh threads
+  只有 -s / -r 才是独立会话（网页列表里看不到，也不和网页抢会话写锁）。
+
+  环境变量：BRIDGE_DIR / CODEX_KEYRING / SECOND_ENGINE_WORKDIR
+            BRIDGE_PORT / BRIDGE_AS_PORT / CODEX_BIN
+TXT
+    exit 0
+    ;;
+esac
+
+# -u/--url：只取桥网址就退出 —— 不注入 key、不进 TUI（09-28 加于本机版，09-29 回灌到可搬运版）
+if [ "${1:-}" = "-u" ] || [ "${1:-}" = "--url" ]; then
+  if [ -x "$BRIDGE_DIR/ctl.sh" ]; then
+    "$BRIDGE_DIR/ctl.sh" url
+  else
+    echo "✗ 未找到 $BRIDGE_DIR/ctl.sh"; exit 1
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "-r" ]; then RESUME=1; shift; fi
+if [ "${1:-}" = "-s" ] || [ "${1:-}" = "--solo" ]; then SOLO=1; shift; fi
+if [ "${1:-}" = "-a" ]; then
+  ATTACH=1; shift
+  case "${1:-}" in
+    [0-9a-fA-F]*-[0-9a-fA-F]*-*) ATTACH_ID="$1"; shift ;;
+  esac
+fi
+
+[ -f "$KEYRING" ] || { echo "✗ 未找到 $KEYRING（DSH：设置 → 第二引擎 里配提供方）"; exit 1; }
+eval "$(python3 - "$KEYRING" <<'PY'
+import json, shlex, sys
+d = json.load(open(sys.argv[1]))
+providers = {p['id']: p for p in d.get('providers', [])}
+p = providers.get(d.get('active'))
+if not p or not p.get('apiKey'):
+    print("echo '✗ 激活提供方未配置 key'; exit 1")
+else:
+    print('export %s_API_KEY=%s' % (str(d['active']).upper(), shlex.quote(p['apiKey'])))
+    print("echo '✓ 已注入 %s'" % p.get('name', d.get('active')))
+PY
+)"
+
+cd "${1:-$DEFAULT_WORKDIR}"
+
+# 尽力把桥拉起来（幂等；失败不挡 TUI）
+AS_URL=""
+if [ -x "$BRIDGE_DIR/ctl.sh" ]; then
+  timeout 20 "$BRIDGE_DIR/ctl.sh" start >/dev/null 2>&1 || true
+  "$BRIDGE_DIR/ctl.sh" url 2>/dev/null | sed 's|^http|  http|' || true
+  AS_URL=$("$BRIDGE_DIR/ctl.sh" as-url 2>/dev/null || true)
+  if [ -n "$AS_URL" ] && curl -sf -m 2 "${AS_URL/ws:\/\//http://}/readyz" >/dev/null 2>&1; then
+    echo "→ 会话所有者在线：$AS_URL"
+    echo "  默认就在它上面开新会话（终端 + 网页共享）；想单独用加 -s"
+  else
+    AS_URL=""
+  fi
+fi
+
+if [ -n "$ATTACH" ]; then
+  [ -n "$AS_URL" ] || { echo "✗ 没有在跑的会话所有者，先：$BRIDGE_DIR/ctl.sh start"; exit 1; }
+  if [ -n "$ATTACH_ID" ]; then
+    echo "→ 打开会话 ${ATTACH_ID:0:8}…，挂在 $AS_URL"
+    exec codex resume --remote "$AS_URL" "$ATTACH_ID"
+  fi
+  echo "→ 挂到 $AS_URL（会弹会话选择器）"
+  exec codex resume --remote "$AS_URL"
+fi
+
+# 新会话默认开在会话所有者上：owner 内存里立刻就有这条会话（thread/loaded/list 能报出来），
+# 网页几秒内显示成「未开始」，手机可以直接发第一句。
+# 为什么不能"先在本地开、以后再挂"：codex 只在说出第一句时才把会话写进
+# ~/.codex/sessions/…，在那之前它对网页、对 codex resume 都不存在。
+if [ -z "$SOLO" ] && [ -z "$RESUME" ] && [ -n "$AS_URL" ]; then
+  # 共享会话的工作目录由 owner 决定（TUI 走 --remote 建会话时不带 cwd），
+  # 目录不一致时与其悄悄跑错地方，不如退回独立会话并说清楚。
+  OWNER_DIR=$(curl -s -m 3 "http://127.0.0.1:${BRIDGE_PORT:-3095}/api/health" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("workdir",""))' 2>/dev/null || true)
+  if [ -n "$OWNER_DIR" ] && [ "$OWNER_DIR" != "$PWD" ]; then
+    SOLO=1
+    echo "⚠ 共享会话的工作目录由 owner 决定（$OWNER_DIR），你当前在 $PWD"
+    echo "  这次给你开独立会话（网页里看不见）。想共享就 cd $OWNER_DIR 再跑 codex-env"
+  else
+    echo "→ 在会话所有者上开新会话（终端 + 网页共享，网页里会立刻出现）"
+    echo "  只想自己用、不在网页出现：codex-env -s"
+    exec codex --remote "$AS_URL"
+  fi
+fi
+
+# -r 想续最近那条会话；但它若还开在别的终端里，codex 会直接报
+# "thread ... already has an active writer"。先探它的 flock，占用中就别硬上。
+# （09-28 加于本机版，09-29 回灌到可搬运版）
+if [ -n "$RESUME" ]; then
+  newest=$(ls -t "$HOME"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -1)
+  sid=$(basename "${newest:-}" 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  lock="$HOME/.codex/thread-writer-locks/${sid}.lock"
+  if [ -n "$sid" ] && [ -f "$lock" ] && ! flock -n "$lock" -c true 2>/dev/null; then
+    echo "⚠ 最近那条会话（${sid:0:8}…）正被另一个终端占用，-r 会撞车 —— 这次给你开新会话"
+    RESUME=""
+  fi
+fi
+
+# 2026-09-30：codex 0.158.0 默认要连 background daemon，而本机是单文件二进制
+# （无 codex-package.json 完整包布局）→ daemon 校验失败，裸 `codex` 报
+# "this CLI has no complete local package"。独立会话必须显式 --no-daemon。
+# ⚠️ --no-daemon 与 --remote 互斥（实测报 "cannot be used with --remote"），
+#    上面三条共享会话分支（--remote）不能加。
+echo "→ 启动 Codex TUI（独立会话，网页里看不见；退出：Ctrl+D 或 /quit）"
+if [ -n "$RESUME" ]; then exec codex resume --last --no-daemon; else exec codex --no-daemon; fi

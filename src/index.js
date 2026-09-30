@@ -27,22 +27,40 @@
 //   POST   /second-engine/api/websearch         写 web_search { value: disabled|cached|indexed|live }
 //   GET    /second-engine/api/mcp               config.toml 全部 [mcp_servers.*] 段
 //   POST   /second-engine/api/mcp               新增 [mcp_servers.<name>] { name, url }（重名 409）
+//   POST   /second-engine/api/mcp/<name>         启用/禁用该 MCP { enabled: bool }（保留配置段；Codex 官方 enabled 字段）
 //   DELETE /second-engine/api/mcp/<name>        删除该段（不存在 404）
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, appendFileSync } from 'node:fs'
 import { spawn, execSync, execFile } from 'node:child_process'
+import { registerBridgeRoutes } from './bridge-routes.js'
 import http from 'node:http'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
+import { startAppServerTurn } from './app-server-client.js'
 
 export const name = 'second-engine'
 
 const CODEX_DIR = join(homedir(), '.codex')
 const CODEX_BINARY = '/usr/local/bin/codex'
+// T5：工单/复核执行模式。exec = 旧的一次性 `codex exec`（默认，零风险）；
+// appserver = JSON-RPC 长连接，能看到流式进度、能真打断。验收通过后再把默认改为 appserver。
+// 模式判定（运行时读取，改文件即切换，无需重启）：
+//   1) env SECOND_ENGINE_EXEC_MODE 优先（exec|appserver）
+//   2) 否则读 ~/.dsh/second-engine-mode.txt（内容 exec|appserver）
+//   3) 都没有 → exec（零风险默认）
+function execMode() {
+  const fromEnv = process.env.SECOND_ENGINE_EXEC_MODE
+  if (fromEnv === 'appserver' || fromEnv === 'exec') return fromEnv
+  try {
+    const fromFile = readFileSync(join(homedir(), '.dsh', 'second-engine-mode.txt'), 'utf8').trim()
+    if (fromFile === 'appserver' || fromFile === 'exec') return fromFile
+  } catch { /* 文件不存在 → 默认 */ }
+  return 'exec'
+}
 const CONFIG_PATH = join(CODEX_DIR, 'config.toml')
 const KEYRING_PATH = join(CODEX_DIR, 'keyring.json')
 const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
@@ -74,7 +92,7 @@ const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
 // 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
 const tasks = new Map()
-const DEFAULT_TASK_WORKDIR = '/root/proj'
+const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(homedir(), 'proj')
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
 
@@ -85,7 +103,7 @@ const consults = []
 const CONSULT_KEEP_LIMIT = 20
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
-const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
+const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(homedir(), '.dsh'), '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
 // ── 双向互审（review）──
@@ -256,6 +274,7 @@ const AGENTS_SECTION = `${AGENTS_MARK}
   提交后正常结束会话（输出已有成果），主 AI 会带建议回来。
 - 若 HTTP 不通，在最终输出末尾追加一行：[CONSULT-NEEDED] <卡点描述>。
 - 只在指定工作副本内写文件；最终决策权在主 AI 与用户。
+- **临时产物自清（2026-09-29 起，与主 AI 同规）**：排查/解包/实验过程中写进 \`/tmp\` 的文件与目录，任务收尾前必须自己删净（\`/tmp\` 不会自动清理）；只保留系统自带运行时项（\`dsh-*\`、\`tmux-*\`、\`node-compile-cache\`）。
 
 ## 联网搜索策略（三档降级制）
 
@@ -441,7 +460,8 @@ function unquoteTomlKey(raw) {
   return key
 }
 
-// 列出 config.toml 全部 [mcp_servers.*] 段（名称 + url）；无 url 的段 url 回空串。
+// 列出 config.toml 全部 [mcp_servers.*] 段（名称 + url + enabled）。
+// enabled 缺省 true —— 与 Codex 无该字段时的默认行为一致（官方字段：enabled = true|false）。
 function listMcpServers() {
   const raw = readConfigRaw()
   const out = []
@@ -451,7 +471,12 @@ function listMcpServers() {
     const next = raw.indexOf('\n[', m.index)
     const body = raw.slice(m.index, next === -1 ? raw.length : next)
     const u = /^\s*url\s*=\s*"([^"]*)"/m.exec(body)
-    out.push({ name: unquoteTomlKey(m[1]), url: u === null ? '' : u[1] })
+    const en = /^\s*enabled\s*=\s*(true|false)\s*$/m.exec(body)
+    out.push({
+      name: unquoteTomlKey(m[1]),
+      url: u === null ? '' : u[1],
+      enabled: en === null ? true : en[1] === 'true',
+    })
   }
   return out
 }
@@ -477,6 +502,32 @@ function removeMcpServer(name) {
   const before = raw.slice(0, m.index).replace(/\s*$/, '')
   const after = raw.slice(end).replace(/^\s*/, '')
   const joined = after === '' ? `${before}\n` : `${before}\n\n${after}`
+  writeConfigRaw(joined.replace(/^\n+/, '').replace(/\n*$/, '') + '\n')
+  return true
+}
+
+// 改写一个 [mcp_servers.<name>] 段的 enabled（Codex 官方字段：enabled = true|false）。
+// 段内已有 enabled 行则原地替换，否则插在段头之后第一行。存在并改写 → true；不存在 → false。
+// 用途：面板「禁用」某个 MCP —— 保留配置段，只让 Codex 不再连接它（不删除）。
+function setMcpServerEnabled(name, enabled) {
+  const raw = readConfigRaw()
+  const key = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`^\\[mcp_servers\\.(?:${key}|"${key}")\\][^\\n]*$`, 'm')
+  const m = re.exec(raw)
+  if (m === null) return false
+  const next = raw.indexOf('\n[', m.index)
+  const end = next === -1 ? raw.length : next + 1
+  let block = raw.slice(m.index, end).replace(/\n*$/, '')
+  const line = `enabled = ${enabled ? 'true' : 'false'}`
+  if (/^\s*enabled\s*=/m.test(block)) {
+    block = block.replace(/^\s*enabled\s*=.*$/m, line)
+  } else {
+    const nl = block.indexOf('\n')
+    block = nl === -1 ? `${block}\n${line}` : `${block.slice(0, nl)}\n${line}${block.slice(nl)}`
+  }
+  const before = raw.slice(0, m.index).replace(/\s*$/, '')
+  const after = raw.slice(end).replace(/^\s*/, '')
+  const joined = after === '' ? `${before}\n${block}\n` : `${before}\n${block}\n\n${after}`
   writeConfigRaw(joined.replace(/^\n+/, '').replace(/\n*$/, '') + '\n')
   return true
 }
@@ -778,6 +829,15 @@ function modelsUrl(baseUrl) {
   return `${baseUrl.replace(/\/+$/, '')}/models`
 }
 
+// 智谱：open.bigmodel.cn 上 /api/v1 是 **Codex 专用适配端点**（模型清单只列 codex 适配好的几个），
+// 而 /api/coding/paas/v4 是编程端点、列出全量模型；两者共用同一把 key（2026-09-28 实测）。
+// 这里给它一个辅助清单 URL，与主端点求并集展示，避免"面板只显示 3 个模型"的误判。
+function bigmodelAuxModelsUrl(baseUrl) {
+  return /open\.bigmodel\.cn/i.test(baseUrl)
+    ? 'https://open.bigmodel.cn/api/coding/paas/v4/models'
+    : null
+}
+
 // 兼容两种实测返回格式：
 //   OpenAI（DeepSeek）：{ object:'list', data:[{ id, ... }] }
 //   Z.ai（智谱）：      { models:[{ id, display_name, ... }] }
@@ -821,31 +881,45 @@ async function handleModels(req, res) {
       return send(res, { ok: false, error: `提供方 '${target.id}' 未配置 baseUrl` }, 400)
     }
 
-    const url = modelsUrl(target.baseUrl)
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 15000)
-    let json = null
-    try {
-      const r = await fetch(url, {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${target.apiKey}`, Accept: 'application/json' },
-        signal: controller.signal,
-      })
-      const text = await r.text()
-      try { json = JSON.parse(text) } catch { json = null }
-      if (!r.ok) {
-        const detail = json !== null && typeof json.error?.message === 'string' ? `：${json.error.message}` : ''
-        return send(res, { ok: false, error: `GET ${url} 返回 HTTP ${r.status}${detail}` })
+    const urls = [modelsUrl(target.baseUrl)]
+    const auxUrl = bigmodelAuxModelsUrl(target.baseUrl)
+    if (auxUrl !== null && auxUrl !== urls[0]) urls.push(auxUrl)
+
+    const models = []
+    let primaryError = ''
+    for (let i = 0; i < urls.length; i += 1) {
+      const url = urls[i]
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 15000)
+      try {
+        const r = await fetch(url, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${target.apiKey}`, Accept: 'application/json' },
+          signal: controller.signal,
+        })
+        const text = await r.text()
+        let json = null
+        try { json = JSON.parse(text) } catch { json = null }
+        if (!r.ok) {
+          const detail = json !== null && typeof json.error?.message === 'string' ? `：${json.error.message}` : ''
+          // 主端点失败才算失败；辅助端点失败静默（它只是锦上添花）
+          if (i === 0) primaryError = `GET ${url} 返回 HTTP ${r.status}${detail}`
+        } else if (json !== null) {
+          for (const m of extractModels(json)) if (!models.includes(m)) models.push(m)
+        } else if (i === 0) {
+          primaryError = `GET ${url} 返回非 JSON 响应`
+        }
+      } catch (e) {
+        if (i === 0) primaryError = `请求 ${url} 失败：${errMsg(e)}`
+      } finally {
+        clearTimeout(timer)
       }
-    } catch (e) {
-      return send(res, { ok: false, error: `请求 ${url} 失败：${errMsg(e)}` })
-    } finally {
-      clearTimeout(timer)
     }
-    if (json === null) {
-      return send(res, { ok: false, error: `GET ${url} 返回非 JSON 响应` })
+    if (models.length === 0 && primaryError !== '') {
+      return send(res, { ok: false, error: primaryError })
     }
-    send(res, { ok: true, id: target.id, models: extractModels(json) })
+    // sources 回显实际拉取的端点，便于核对"为什么是这个清单"
+    send(res, { ok: true, id: target.id, models, sources: urls })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -932,6 +1006,14 @@ function taskView(task) {
     workdir: task.workdir,
     output: typeof task.output === 'string' ? task.output : '',
   }
+  // 实时进度可见性：exec 模式看 liveBytes（过程流字节数，在涨=在动），
+  // appserver 模式另加 progress（归一化事件）。
+  if (task.live !== undefined && task.live !== null) view.liveBytes = task.live.bytes ?? 0
+  if (task.mode === 'appserver') {
+    // T5：app-server 模式的实时进度（归一化事件，最近 20 条），供界面做流式展示。
+    view.mode = 'appserver'
+    view.progress = Array.isArray(task.progress) ? task.progress.slice(-20) : []
+  }
   if (view.kind === 'review') {
     // 互审进度：第 N/上限轮 + 每轮 {issues,verdict} 全量（issues 体量小，列表也带上，展开即见）。
     view.round = Number.isInteger(task.round) ? task.round : 0
@@ -940,6 +1022,7 @@ function taskView(task) {
     view.rounds = Array.isArray(task.rounds) ? task.rounds : []
   }
   if (task.stuckSuspect === true) view.stuckSuspect = true
+  if (task.lastSignal) view.lastSignal = task.lastSignal
   if (typeof task.error === 'string' && task.error !== '') view.error = task.error
   return view
 }
@@ -1077,6 +1160,66 @@ function ensureGitBaseline(workdir) {
   } catch { /* best effort：基线失败不影响任务本身 */ }
 }
 
+// T5：app-server 执行模式 —— 长连接 JSON-RPC。归一化事件进 task.progress；
+// agentMessage 增量由客户端直接 append 到 -o 文件，故 finalizeTask/看门狗逻辑零改动。
+function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey }) {
+  const env = { ...process.env, [envKey]: apiKey }
+  const task = {
+    id,
+    kind: 'task',
+    status: 'running',
+    exitCode: null,
+    output: '',
+    startedAt: Date.now(),
+    endedAt: null,
+    workdir,
+    child: null,
+    outPath,
+    cancelled: false,
+    mode: 'appserver',
+    progress: [],
+  }
+  const handle = startAppServerTurn({
+    cwd: workdir,
+    env,
+    prompt,
+    outPath,
+    onEvent: (evt) => {
+      // 进度只保生产所需字段：meta.raw 是原始帧（可能很大），落盘前剔除
+      const meta = { ...(evt.meta ?? {}) }
+      delete meta.raw
+      task.progress.push({ at: Date.now(), ...evt, ...(evt.meta ? { meta } : {}) })
+      if (task.progress.length > 20) task.progress.shift()
+      // 任何事件都刷新 -o mtime：既有看门狗「300s 无变化 → stuckSuspect」自动适配流式场景
+      try {
+        const now = new Date()
+        utimesSync(outPath, now, now)
+      } catch { /* 文件可能尚未创建 */ }
+    },
+  })
+  task.child = handle.child
+  task.app = handle
+  tasks.set(id, task)
+  pruneTasks()
+  startWatchdog(task)
+
+  handle.run.catch((e) => {
+    task.appError = errMsg(e)
+    if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+  })
+  handle.done
+    .then((r) => {
+      const ok = r.status === 'completed'
+      if (finalizeTask(task, ok ? 0 : 1, ok ? 'done' : 'error') && task.cancelled !== true) void notifyTask(task)
+    })
+    .catch((e) => {
+      task.appError = errMsg(e)
+      if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+    })
+
+  send(res, { ok: true, id, mode: 'appserver' })
+}
+
 // POST /task：body { prompt, workdir?, ephemeral? }。立刻返回 { ok, id }，任务后台跑。
 // ephemeral 缺省 true（不落盘 rollout），只有显式 body.ephemeral === false 才持久化会话。
 async function handleTaskCreate(req, res) {
@@ -1096,23 +1239,55 @@ async function handleTaskCreate(req, res) {
 
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0')
     const outPath = join(CODEX_DIR, `task-${id}.out`)
+    if (execMode() === 'appserver') {
+      startAppServerTask({
+        res,
+        id,
+        outPath,
+        workdir,
+        prompt,
+        envKey: `${active.id.toUpperCase()}_API_KEY`,
+        apiKey: active.apiKey,
+      })
+      return
+    }
     const args = [
       'exec',
       '--skip-git-repo-check',
       // 规划 8.3-10①：缺省按临时工单跑（不落盘 rollout），显式 false 才留档。
       ...(body.ephemeral === false ? [] : ['--ephemeral']),
       '-o', outPath,
-      prompt,
+      // 提示词改走 stdin（'-' 占位）：argv 不再携带正文。2026-09-24 实证：prompt 以 argv
+      // 出现在 /proc/<pid>/cmdline 时，工单若执行 pkill -f <模式>（如 dsh-browser 的
+      // headless_shell 拼接串）会命中父进程自身 → 自杀（三单 76/97.5/101.3s 死亡的真因，
+      // 见工作目录下的 owner 报告）。
+      '-',
     ]
     // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。
     const envKey = `${active.id.toUpperCase()}_API_KEY`
     ensureGitBaseline(workdir)
+    const live = { bytes: 0, path: `${outPath}.live` }
     const child = spawn('codex', args, {
       cwd: workdir,
       env: { ...process.env, [envKey]: active.apiKey },
-      // stdin 必须显式关闭：Codex exec 会等待 stdin EOF，默认 pipe 永不关闭 → 任务假死（CPU 0 实证）
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // stdin 改 pipe：写入提示词后立即 end()，EOF 自然到达（codex exec 等 stdin EOF 开始干活）。
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
+    child.stdin?.write(prompt)
+    child.stdin?.end()
+    // stdout/stderr 必须持续排空：长任务过程流写满管道缓冲（~64KB）后 codex 被写阻塞、永不退出
+    // → 看门狗 300s 误杀（2026-09-24 三单复现实证）。
+    // 同时**实时落盘到 <outPath>.live** 并计数：这样 exec 模式也能"直观看到有没有在动"
+    // （最终结果仍以 -o 文件为准；live 文件是过程流，保留供诊断）。
+    const livePath = `${outPath}.live`
+    const writeLive = (buf) => {
+      try {
+        appendFileSync(livePath, buf)
+        live.bytes += buf.length
+      } catch { /* best effort */ }
+    }
+    child.stdout?.on('data', writeLive)
+    child.stderr?.on('data', writeLive)
     const task = {
       id,
       kind: 'task',
@@ -1124,17 +1299,20 @@ async function handleTaskCreate(req, res) {
       workdir,
       child,
       outPath,
+      live,
       cancelled: false,
     }
     tasks.set(id, task)
     pruneTasks()
     startWatchdog(task)
 
-    child.on('exit', (code) => {
+    child.on('exit', (code, signal) => {
       // 被取消的任务固定 error/-1；其余按真实退出码判定。
       const cancelled = task.cancelled === true
       const exitCode = cancelled ? -1 : (Number.isInteger(code) ? code : -1)
       const status = cancelled ? 'error' : (exitCode === 0 ? 'done' : 'error')
+      // 记录终止信号：exitCode=-1 时只有它能区分「外部 SIGTERM/SIGKILL」与「spawn 失败」。
+      if (signal) task.lastSignal = signal
       // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
       if (finalizeTask(task, exitCode, status) && !cancelled) void notifyTask(task)
     })
@@ -1185,7 +1363,21 @@ async function handleTaskCancel(req, res) {
     task.cancelled = true
     task.status = 'error'
     task.exitCode = -1
+    // T5：app-server 模式先发 turn/interrupt（优雅结束当前 turn），kill 作为兜底。
+    if (task.app !== undefined && typeof task.app.interrupt === 'function') {
+      void task.app.interrupt()
+    }
     try { task.child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+    // 兜底（2026-09-27 实测：codex 子进程偶有 SIGTERM 后残留）：3s 后仍未退出则 SIGKILL。
+    const child = task.child
+    setTimeout(() => {
+      try {
+        if (child !== null && child !== undefined && child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL')
+          task.forcedKill = true
+        }
+      } catch { /* best effort */ }
+    }, 3000)
     send(res, { ok: true, id, status: task.status, exitCode: task.exitCode })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -1274,13 +1466,19 @@ function buildReviewPrompt(content, prev) {
 // 跑一轮 codex exec：与 /task 同配置（--ephemeral、stdin ignore、env 注入），
 // 但返回同步可见的 child 句柄（立即可被 cancel SIGTERM）+ 等待退出码的 promise。
 function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
-  const args = ['exec', '--skip-git-repo-check', '--ephemeral', '-o', outPath, prompt]
+  // 与 /task 同改：提示词走 stdin（'-' 占位），argv 不携带正文，免疫 pkill -f 误杀父进程。
+  const args = ['exec', '--skip-git-repo-check', '--ephemeral', '-o', outPath, '-']
   const child = spawn('codex', args, {
     cwd: workdir,
     env: { ...process.env, [envKey]: apiKey },
-    // stdin 必须显式关闭：Codex exec 等 stdin EOF，pipe 永不关闭会让任务假死。
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // stdin 写入提示词后 end()，EOF 自然到达。
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
+  child.stdin?.write(prompt)
+  child.stdin?.end()
+  // 同 handleTaskCreate：pipe 无人消费会被长输出塞满 → codex 写阻塞假死，必须持续排空。
+  child.stdout?.resume()
+  child.stderr?.resume()
   const wait = new Promise((resolve) => {
     let settled = false
     const done = (code) => {
@@ -1566,17 +1764,33 @@ function handleMcpDelete(res, name) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-// prefix 分发：'' → GET 列表 / POST 新增；'/<name>' → DELETE 删除。
+// 启用/禁用（保留配置段，不删除）：POST /mcp/<name> { enabled: bool }
+// 依据 Codex 官方字段 [mcp_servers.*] enabled = true|false；禁用后新会话不再连接它。
+async function handleMcpToggle(req, res, name) {
+  try {
+    const body = await readBody(req)
+    if (typeof body.enabled !== 'boolean') {
+      return send(res, { ok: false, error: 'enabled 必须是布尔值' }, 400)
+    }
+    if (name === '' || !setMcpServerEnabled(name, body.enabled)) {
+      return send(res, { ok: false, error: `未找到 MCP 服务器 '${name}'` }, 404)
+    }
+    send(res, { ok: true, servers: listMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// prefix 分发：'' → GET 列表 / POST 新增；'/<name>' → DELETE 删除 / POST 启用·禁用。
 async function handleMcpRoot(req, res) {
   const pathname = new URL(req.url === undefined ? '/' : req.url, 'http://127.0.0.1').pathname
   const rest = pathname.slice(MCP_ROUTE_PREFIX.length)
   const method = req.method === undefined ? 'GET' : req.method
-  if (method === 'DELETE') {
+  if (rest !== '' && rest !== '/') {
     let name = rest.replace(/^\//, '')
     try { name = decodeURIComponent(name) } catch { /* 非法百分号编码：按原文处理 */ }
-    return handleMcpDelete(res, name)
+    if (method === 'DELETE') return handleMcpDelete(res, name)
+    if (method === 'POST') return handleMcpToggle(req, res, name)
+    return send(res, { ok: false, error: 'not found' }, 404)
   }
-  if (rest !== '' && rest !== '/') return send(res, { ok: false, error: 'not found' }, 404)
   if (method === 'POST') return handleMcpAdd(req, res)
   if (method === 'GET' || method === 'HEAD') return handleMcpList(req, res)
   return send(res, { ok: false, error: 'method not allowed' }, 405)
@@ -1712,6 +1926,9 @@ export function apply(ctx) {
     for (const route of routes) {
       wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
     }
+    // 浏览器聊天桥（2026-09-29）：4 个透传路由（status/start/stop/url）由模块自行注册。
+    // 模块内用 execFile + 固定子命令白名单，不做通用透传；桥目录可用 BRIDGE_DIR 覆盖。
+    registerBridgeRoutes(wctx)
   })
 
   // 设置 > 插件 > 插件配置 的 namespace：宿主 settings 服务只派发「served 的

@@ -1,6 +1,6 @@
 # Codex 工具集
 
-给第二引擎 Codex（或任何有 shell 的 agent）用的两个轻量工具，复制到工作目录（如 /root/proj）即可，`chmod +x` 后直接 bash 调用。
+给第二引擎 Codex（或任何有 shell 的 agent）用的两个轻量工具，复制到工作目录（如 ~/proj）即可，`chmod +x` 后直接 bash 调用。
 
 ## t-tool.sh — tmux 交互窗口工具（依赖 tmux）
 

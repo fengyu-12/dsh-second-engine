@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>第二引擎</title>
+<script>try{if(localStorage.getItem('bridge_theme')==='dark')document.documentElement.setAttribute('data-theme','dark')}catch(e){}</script>
+<style>
+  /* 浅色是默认；深色挂在 html[data-theme="dark"] 上（head 里那段内联脚本负责提前套上，
+     免得深色用户看到一瞬白屏）。所有配色都走变量，别再往规则里写死颜色。 */
+  :root {
+    color-scheme: light;
+    --bg: #f4f5f7; --panel: #ffffff; --line: #dce0e6;
+    --fg: #171a1f; --dim: #5f6774; --muted: #8a8a8a;
+    --accent: #2f6fed; --err: #c8342b; --warn: #8a5a00;
+    --bubble-me: #dbe7ff; --bubble-ai: #ffffff;
+    --input-bg: #ffffff; --btn-fg: #ffffff;
+    --sel: #e4ecff; --mask: rgba(15,18,22,.35); --hover-warn: rgba(138,90,0,.12);
+  }
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #14161a; --panel: #1c1f25; --line: #2b3038;
+    --fg: #e6e8ec; --dim: #98a0ad; --muted: #8a8a8a;
+    --accent: #6aa9ff; --err: #ff7b72; --warn: #e3b341;
+    --bubble-me: #22304a; --bubble-ai: #1c1f25;
+    --input-bg: #0f1115; --btn-fg: #0b0d10;
+    --sel: #22304a; --mask: rgba(0,0,0,.55); --hover-warn: rgba(227,179,65,.15);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 2;
+  }
+  header .title { font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 13px; max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header .menu { background: transparent; color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 4px 10px; font: inherit; font-size: 17px; line-height: 1.2; }
+  header .status { color: var(--dim); font-size: 13px; margin-left: auto; }
+  main { flex: 1; overflow-y: auto; padding: 12px; -webkit-overflow-scrolling: touch; }
+  .msg { margin: 0 0 14px; }
+  .msg .who { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  .bubble { padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .me .bubble { background: var(--bubble-me); }
+  .ai .bubble { background: var(--bubble-ai); border: 1px solid var(--line); }
+  .act { color: var(--dim); font-size: 13px; padding: 2px 0 2px 4px; border-left: 2px solid var(--line); margin: 4px 0; }
+  .note { font-size: 13px; padding: 4px 0; }
+  .note.error { color: var(--err); }
+  .note.warn { color: var(--warn); }
+  pre { background: var(--input-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; margin: 8px 0; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; }
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 48px; max-height: 40vh;
+    background: var(--input-bg); color: var(--fg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; font: inherit;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); color: var(--btn-fg); border: 0; border-radius: 10px;
+    padding: 11px 14px; font: inherit; font-weight: 600; white-space: nowrap;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+  button:disabled { opacity: .5; }
+  .tools { display: flex; gap: 8px; margin-top: 8px; }
+  .tools .hint { color: var(--dim); font-size: 12px; margin-left: auto; align-self: center; }
+
+  /* 会话抽屉：照 DSH 那种左侧列表做的 */
+  .drawer { position: fixed; inset: 0; z-index: 9; display: none; }
+  .drawer.open { display: block; }
+  .drawer .mask { position: absolute; inset: 0; background: var(--mask); }
+  .drawer .panel {
+    position: absolute; top: 0; bottom: 0; left: 0; width: min(86vw, 360px);
+    background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column;
+  }
+  .drawer .bar { display: flex; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .drawer .bar .grow { flex: 1; font-weight: 600; }
+  .drawer .bar button { padding: 7px 10px; font-size: 14px; }
+  .drawer .list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .titem { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .titem.active { background: var(--sel); }
+  .titem .tt { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .titem .tm { display: flex; gap: 6px; align-items: center; color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .titem.empty { color: var(--dim); cursor: default; }
+  .tag { border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; font-size: 11px; }
+  .tag.busy { color: var(--warn); border-color: var(--warn); }
+  .tag.new { color: var(--accent); border-color: var(--accent); }
+  .tag.idchip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted, #8a8a8a); cursor: pointer; }
+  .tag.busy.clickable { cursor: pointer; }
+  .tag.busy.clickable:hover { background: var(--hover-warn); }
+  .drawer .searchbar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .drawer .searchbar input {
+    flex: 1; background: var(--input-bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px; font: inherit; font-size: 14px;
+  }
+  .drawer .searchbar input:focus { outline: none; border-color: var(--accent); }
+  .drawer .searchbar button { padding: 6px 9px; font-size: 13px; }
+  .titem .countrow { color: var(--dim); font-size: 12px; padding: 6px 14px; border-bottom: 1px solid var(--line); }
+  .titem .trow { display: flex; align-items: center; gap: 8px; }
+  .titem .trow .tt { flex: 1; }
+  .titem .more { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 8px; padding: 0 8px; font: inherit; font-size: 15px; line-height: 1.5; }
+  .titem .tacts { display: none; gap: 6px; margin-top: 8px; }
+  .titem.menu-open .tacts { display: flex; }
+  .titem .tacts button { padding: 5px 10px; font-size: 13px; }
+  .titem .tacts button.danger { color: var(--err); border-color: var(--err); }
+  header .sync { background: transparent; color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 3px 9px; font: inherit; font-size: 15px; line-height: 1.3; }
+</style>
+</head>
+<body>
+<header>
+  <button class="menu" id="menu" title="会话列表">☰</button>
+  <span class="title">第二引擎</span>
+  <span class="sub" id="subtitle"></span>
+  <button class="sync" id="theme" title="切换深浅色">🌙</button>
+  <button class="sync" id="sync" title="同步消息">⟳</button>
+  <span class="status" id="status">就绪</span>
+</header>
+
+<div class="drawer" id="drawer">
+  <div class="mask" id="mask"></div>
+  <div class="panel">
+    <div class="bar">
+      <span class="grow">会话</span>
+      <button class="ghost" id="refresh">刷新</button>
+      <button id="newconv">＋ 新会话</button>
+    </div>
+    <div class="searchbar">
+      <input id="tsearch" type="search" placeholder="搜索标题 / 会话 ID（Ctrl+K）" autocomplete="off" spellcheck="false">
+      <button class="ghost" id="tclear" title="清空搜索">✕</button>
+    </div>
+    <div class="list" id="tlist"></div>
+  </div>
+</div>
+
+<main id="log"></main>
+
+<footer>
+  <div class="row">
+    <textarea id="input" rows="2" placeholder="在这里打字（手机输入法可用）…"></textarea>
+    <button id="send">发送</button>
+  </div>
+  <div class="tools">
+    <button class="ghost" id="stop" disabled>中断</button>
+    <span class="hint">Enter 发送 · Shift+Enter 换行</span>
+  </div>
+</footer>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const log = $('#log');
+
+// token 从网址取一次，之后存本地并从地址栏抹掉（免得留在浏览器历史里）
+const params = new URLSearchParams(location.search);
+const fromUrl = params.get('t');
+if (fromUrl) {
+  localStorage.setItem('bridge_token', fromUrl);
+  params.delete('t');
+  const rest = params.toString();
+  history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
+}
+const TOKEN = localStorage.getItem('bridge_token') || '';
+let threadId = localStorage.getItem('bridge_thread') || null;
+let controller = null;
+let lastBubble = null;
+let ended = false;
+let lastUsage = null;
+let pendingTitle = null;
+const seenNotes = new Set();
+
+// ── 会话与历史 ───────────────────────────────────────────────────────────────
+// 每个对话一份历史，存在 localStorage；服务端各自是一个 codex thread。
+const DRAFT = 'draft';
+let threads = [];
+let threadQuery = '';                 // 会话列表的本地过滤词（纯前端，不发请求）
+let currentTitle = '';
+let currentBusy = false;
+let stamp = '';
+
+const logKey = (id) => `bridge_log_${id || DRAFT}`;
+function loadEntries(id) {
+  try { return JSON.parse(localStorage.getItem(logKey(id)) || '[]'); } catch { return []; }
+}
+function storeEntries(list) {
+  const kept = list.slice(-80);
+  try { localStorage.setItem(logKey(threadId), JSON.stringify(kept)); } catch {}
+  return kept;
+}
+
+let entries = [];
+function saveEntries() { entries = storeEntries(entries); }
+function pushEntry(entry) { entries.push(entry); saveEntries(); }
+
+// 旧版只有一个 bridge_log，迁到当前会话名下，别把已有的对话弄丢
+(function migrateLegacyLog() {
+  const legacy = localStorage.getItem('bridge_log');
+  if (!legacy) return;
+  if (!localStorage.getItem(logKey(threadId))) localStorage.setItem(logKey(threadId), legacy);
+  localStorage.removeItem('bridge_log');
+})();
+
+function upsertThread(id, title) {
+  const hit = threads.find((t) => t.id === id);
+  if (hit) { if (title) hit.title = title; }
+  else threads.unshift({ id, title: title || '（无标题）', source: 'bridge', updatedAt: new Date().toISOString() });
+  if (title) setSubtitle(title);
+  renderConvoList();
+}
+
+function setSubtitle(text) {
+  currentTitle = text || '';
+  $('#subtitle').textContent = currentTitle;
+}
+
+function drawer(open) { $('#drawer').classList.toggle('open', open); }
+
+// 搜索框匹配：标题或完整会话 ID 含关键词即可（大小写不敏感）
+function matchesQuery(t, q) {
+  return String(t.title || '').toLowerCase().includes(q) || String(t.id || '').toLowerCase().includes(q);
+}
+
+function when(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+  if (d.toDateString() === new Date(now.getTime() - 86400000).toDateString()) return `昨天 ${hm}`;
+  return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+// 会话列表来自服务端（也就是 codex 自己的会话存储），所以终端里聊过的也能在网页里切
+async function loadThreads() {
+  if (!TOKEN) return;
+  try {
+    const resp = await fetch('/api/threads?limit=80', { headers: { 'x-bridge-token': TOKEN } });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    threads = data.threads || [];
+  } catch (err) {
+    setStatus('会话列表读取失败');
+    return;
+  }
+  renderConvoList();
+  currentBusy = Boolean(threads.find((t) => t.id === threadId)?.busy);
+  if (threadId && !currentTitle) {
+    const hit = threads.find((t) => t.id === threadId);
+    if (hit) setSubtitle(hit.title);
+  }
+}
+
+function renderConvoList() {
+  const list = $('#tlist');
+  list.innerHTML = '';
+  if (!threads.length) {
+    list.appendChild(el('div', 'titem empty', '（还没有会话记录）'));
+    return;
+  }
+  const q = threadQuery.trim().toLowerCase();
+  const shown = q ? threads.filter((t) => matchesQuery(t, q)) : threads;
+  if (q) list.appendChild(el('div', 'countrow', `${shown.length} / ${threads.length} 条匹配`));
+  if (!shown.length) {
+    list.appendChild(el('div', 'titem empty', '没有匹配的会话（换关键词或点 ✕ 清空）'));
+    return;
+  }
+  for (const t of shown) {
+    const item = el('div', 'titem' + (t.id === threadId ? ' active' : ''));
+    const row = el('div', 'trow');
+    row.appendChild(el('div', 'tt', t.title || '（无标题）'));
+    const more = el('button', 'more', '⋯');
+    more.title = '更多操作';
+    more.addEventListener('click', (ev) => { ev.stopPropagation(); item.classList.toggle('menu-open'); });
+    row.appendChild(more);
+    item.appendChild(row);
+    const meta = el('div', 'tm');
+    meta.appendChild(el('span', 'tag', t.source === 'bridge' ? '网页' : '终端'));
+    meta.appendChild(el('span', null, when(t.updatedAt)));
+    if (t.busy) {
+      // 点一下问服务端：到底是谁占着（旧版只说"另一个终端"，等于没说）
+      const busyTag = el('span', 'tag busy clickable', '占用中');
+      busyTag.title = '点击查看是谁占着这条会话';
+      busyTag.addEventListener('click', (ev) => { ev.stopPropagation(); checkLockOwner(t.id); });
+      meta.appendChild(busyTag);
+    }
+    if (t.pending) meta.appendChild(el('span', 'tag new', '未开始'));
+    // 会话 ID 芯片：点一下复制完整 id（终端里 codex-env -a <id> 要用）
+    const shortId = String(t.id || '').slice(0, 8);
+    const idChip = el('span', 'tag idchip', shortId);
+    idChip.title = '点击复制完整会话 ID：' + t.id;
+    idChip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      copyText(t.id, () => {
+        idChip.textContent = '已复制';
+        setTimeout(() => { idChip.textContent = shortId; }, 1200);
+      });
+    });
+    meta.appendChild(idChip);
+    item.appendChild(meta);
+    item.title = t.id;
+
+    const acts = el('div', 'tacts');
+    const arch = el('button', 'ghost', '归档');
+    arch.addEventListener('click', (ev) => { ev.stopPropagation(); threadAction('archive', t); });
+    const del = el('button', 'ghost danger', '删除');
+    del.addEventListener('click', (ev) => { ev.stopPropagation(); threadAction('delete', t); });
+    acts.append(arch, del);
+    item.appendChild(acts);
+
+    item.addEventListener('click', () => openThread(t.id));
+    list.appendChild(item);
+  }
+}
+
+function replay() {
+  log.innerHTML = '';
+  seenNotes.clear();
+  lastBubble = null;
+  for (const entry of entries) {
+    if (entry.t === 'me' || entry.t === 'ai') addMessage(entry.t, entry.text, true);
+    else if (entry.t === 'act') addActivity(entry.name, entry.detail, true);
+    else if (entry.t === 'note') addNote(entry.text, entry.level, true);
+  }
+  if (entries.length) scroll(true);
+}
+
+async function openThread(id) {
+  if (controller) { addNote('正在跑一轮，先等它结束或点「中断」', 'warn'); return; }
+  drawer(false);
+  saveEntries();                       // 先把当前这份存好
+  threadId = id;
+  localStorage.setItem('bridge_thread', id);
+  const hit = threads.find((t) => t.id === id);
+  setSubtitle(hit ? hit.title : '');
+  currentBusy = Boolean(hit?.busy);
+  log.innerHTML = '';
+  seenNotes.clear();
+  lastBubble = null;
+  setStatus('载入中…');
+  try {
+    const resp = await fetch(`/api/transcript?id=${encodeURIComponent(id)}`, { headers: { 'x-bridge-token': TOKEN } });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    entries = data.entries || [];
+    replay();
+    const s = await (await fetch(`/api/stamp?id=${encodeURIComponent(id)}`, { headers: { 'x-bridge-token': TOKEN } })).json().catch(() => ({}));
+    stamp = s.stamp || '';
+    setStatus(entries.length ? `已载入 ${entries.length} 条` : '这条会话没有文本记录');
+    if (currentBusy) {
+      // 别只说"被占用"就完事：把真正的锁持有者查出来，用户才知道该去关谁
+      noteFresh('这条会话在 app-server 里还是 active：可以看，但在这里发消息会被拦住。正在查是谁占着写锁…', 'warn');
+      checkLockOwner(id);
+    }
+    else if (hit?.pending) addNote('这是终端刚开、还没说话的新会话：它还没落盘，网页暂时接管不了。去终端里说一句，之后两边都能发。', 'warn');
+  } catch (err) {
+    addNote(`载入失败：${err.message}`, 'error');
+  }
+  renderConvoList();
+}
+
+function newThread() {
+  if (controller) { addNote('正在跑一轮，先点「中断」再开新会话', 'warn'); return; }
+  drawer(false);
+  saveEntries();
+  threadId = null;
+  localStorage.removeItem('bridge_thread');
+  entries = [];
+  log.innerHTML = '';
+  seenNotes.clear();
+  lastBubble = null;
+  setSubtitle('');
+  currentBusy = false;
+  stamp = '';
+  renderConvoList();
+  setStatus('新会话');
+  $('#input').focus();
+}
+
+function setStatus(text) { $('#status').textContent = text; }
+
+// 归档 / 删除：走服务端的 codex 命令，删之前一定问一次
+async function threadAction(kind, t) {
+  const label = kind === 'delete' ? '永久删除' : '归档';
+  const detail = kind === 'delete'
+    ? '记录会从磁盘上删掉，不能恢复。'
+    : '归档后从列表消失，文件挪进 archived_sessions。';
+  if (!confirm(`${label}「${t.title || '（无标题）'}」？\n${detail}`)) return;
+  setStatus(kind === 'delete' ? '删除中…' : '归档中…');
+  try {
+    const resp = await fetch(`/api/thread/${kind}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-token': TOKEN },
+      body: JSON.stringify({ id: t.id }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      // 409 时服务端会带上锁持有者，一并显示出来（否则用户不知道该关哪个进程）
+      throw new Error([data.error, data.holder?.hint].filter(Boolean).join(' ') || resp.statusText);
+    }
+    if (t.id === threadId) newThread();
+    await loadThreads();
+    setStatus(kind === 'delete' ? '已删除' : '已归档');
+  } catch (err) {
+    addNote(`${label}失败：${err.message}`, 'error');
+  }
+}
+
+// 同步：终端那边在这条会话里说了话，网页按一下（或每 5 秒自动）就能跟上
+async function syncNow(quiet) {
+  if (!threadId || controller) return;
+  try {
+    const s = await (await fetch(`/api/stamp?id=${encodeURIComponent(threadId)}`, { headers: { 'x-bridge-token': TOKEN } })).json();
+    if (!s.stamp) return;
+    if (s.stamp === stamp) {
+      if (!quiet) setStatus('已是最新');
+      return;
+    }
+    const resp = await fetch(`/api/transcript?id=${encodeURIComponent(threadId)}`, { headers: { 'x-bridge-token': TOKEN } });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    stamp = s.stamp;
+    entries = data.entries || [];
+    replay();
+    setStatus(`已同步 ${entries.length} 条`);
+  } catch (err) {
+    if (!quiet) addNote(`同步失败：${err.message}`, 'error');
+  }
+}
+
+function copyText(text, done) {
+  const ok = () => { try { done(); } catch {} };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok).catch(() => fallback());
+  } else { fallback(); }
+  function fallback() {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); ok(); } catch {}
+    document.body.removeChild(ta);
+  }
+}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 120; }
+function scroll(force) { if (force || nearBottom()) log.scrollTop = log.scrollHeight; }
+
+function addMessage(who, text, restore) {
+  const box = el('div', 'msg ' + who);
+  box.appendChild(el('div', 'who', who === 'me' ? '你' : 'Codex'));
+  const bubble = el('div', 'bubble', text);
+  box.appendChild(bubble);
+  log.appendChild(box);
+  lastBubble = who === 'ai' ? bubble : null;
+  if (!restore) pushEntry({ t: who, text });
+  scroll(true);
+  return bubble;
+}
+
+function addAgentChunk(text) {
+  if (!lastBubble) lastBubble = addMessage('ai', '');
+  lastBubble.textContent += text;
+  const last = entries[entries.length - 1];
+  if (last && last.t === 'ai') { last.text = lastBubble.textContent; saveEntries(); }
+  scroll(false);
+}
+
+function addActivity(name, detail, restore) {
+  const line = el('div', 'act', '· ' + name + (detail ? '：' + detail : ''));
+  log.appendChild(line);
+  lastBubble = null;
+  if (!restore) pushEntry({ t: 'act', name, detail });
+  scroll(false);
+}
+
+function addNote(text, level, restore) {
+  if (seenNotes.has(text)) return;      // 同一条提示只显示一次（例如每轮都会冒出来的元数据告警）
+  seenNotes.add(text);
+  log.appendChild(el('div', 'note ' + (level || ''), '⚠ ' + text));
+  lastBubble = null;
+  if (!restore) pushEntry({ t: 'note', text, level: level || '' });
+  scroll(false);
+}
+
+// 需要重复出现的提示（每次点都该看到）绕开 seenNotes 去重
+function noteFresh(text, level) {
+  seenNotes.delete(text);
+  addNote(text, level);
+}
+
+// 问服务端：这条会话的写锁在谁手里（扫 /proc，按需调用，不进列表轮询）
+async function checkLockOwner(id) {
+  setStatus('查占用中…');
+  let info = null;
+  try {
+    const resp = await fetch(`/api/lock-info?id=${encodeURIComponent(id)}`, { headers: { 'x-bridge-token': TOKEN } });
+    info = await resp.json();
+    if (!resp.ok) throw new Error(info.error || resp.statusText);
+  } catch (err) {
+    noteFresh(`查占用失败：${err.message || err}`, 'error');
+    setStatus('查占用失败');
+    return;
+  }
+  if (!info.held) {
+    noteFresh('没查到写锁持有者（锁文件不存在）：多半是 app-server 里的状态残留，刷新列表或稍后再试。', 'warn');
+    setStatus('无锁持有者');
+    return;
+  }
+  noteFresh(info.hint || '锁被占着，但没拿到细节', info.selfOnly ? 'warn' : 'error');
+  for (const h of info.holders || []) {
+    if (!h.isUpstream) noteFresh(`  占用进程 pid ${h.pid}（${h.comm || '?'}）：${h.cmdline || '（读不到命令行）'}`, 'error');
+  }
+  setStatus(info.selfOnly ? '锁在上游 app-server' : '锁在别的进程');
+}
+
+async function send() {
+  const input = $('#input');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!TOKEN) { addNote('没有 token：请用启动时打印的完整网址打开本页', 'error'); return; }
+  if (threadId && currentBusy) {
+    setStatus('会话被占用');
+    noteFresh('这条会话在 app-server 里还是 active，发不出去。正在查是谁占着写锁…', 'warn');
+    checkLockOwner(threadId);
+    return;
+  }
+
+  addMessage('me', text);
+  input.value = '';
+  input.style.height = 'auto';
+  $('#send').disabled = true;
+  $('#stop').disabled = false;
+  setStatus('运行中…');
+  const t0 = Date.now();
+  ended = false;
+  const tick = setInterval(() => {
+    if (!ended) setStatus(`运行中 ${Math.round((Date.now() - t0) / 1000)}s`);
+  }, 500);
+
+  controller = new AbortController();
+  const startingFresh = !threadId;
+  if (startingFresh) pendingTitle = text.slice(0, 24);
+  try {
+    const resp = await fetch('/api/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-token': TOKEN },
+      body: JSON.stringify({ text, threadId }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).error || detail; } catch {}
+      addNote(detail, 'error');
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.kind === 'meta') {
+          const wasDraft = !threadId;
+          threadId = ev.threadId;
+          currentBusy = false;
+          localStorage.setItem('bridge_thread', threadId);
+          if (wasDraft) { try { localStorage.removeItem(logKey(DRAFT)); } catch {} }
+          upsertThread(threadId, pendingTitle);
+          saveEntries();
+        } else if (ev.kind === 'text') {
+          addAgentChunk(ev.text);
+        } else if (ev.kind === 'activity') {
+          addActivity(ev.name, ev.detail);
+        } else if (ev.kind === 'note') {
+          // 「模型元数据缺失」是已知的无害告警，降级成黄色，别当成错误
+          const known = ev.text.startsWith('Model metadata for');
+          addNote(ev.text, known ? 'warn' : ev.level);
+        } else if (ev.kind === 'end') {
+          ended = true;
+          lastUsage = ev.usage || null;
+        } else if (ev.kind === 'done') {
+          const tokens = lastUsage && lastUsage.output_tokens ? ` · 输出 ${lastUsage.output_tokens} tok` : '';
+          const failed = ev.ok === false ? ' · 有错误' : '';
+          setStatus(`完成 ${(ev.ms / 1000).toFixed(1)}s${tokens}${failed}`);
+          loadThreads();          // 标题/时间在服务端才权威，这轮结束后对一次表
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') addNote('已中断', 'warn');
+    else addNote(String(err.message || err), 'error');
+  } finally {
+    clearInterval(tick);
+    controller = null;
+    $('#send').disabled = false;
+    $('#stop').disabled = true;
+    if ($('#status').textContent.startsWith('运行中')) setStatus('结束');
+    lastBubble = null;
+  }
+}
+
+async function stop() {
+  // abort 放在前面：它只作用于绑了 controller.signal 的 /api/send 流（见 send()），
+  // 不会取消下面的停止请求；先 abort 让 UI 立刻有反馈，不必干等最长 15s 的 interrupt RPC。
+  if (controller) controller.abort();
+  let state = '';
+  try {
+    const r = await fetch('/api/stop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-token': TOKEN },
+      body: JSON.stringify(threadId ? { threadId } : {}),
+    });
+    const d = await r.json().catch(() => ({}));
+    state = d.state || '';
+    if (state === 'none') addNote('没有正在跑的回合', 'warn');
+    else if (state === 'pending') addNote('回合还在启动，已登记取消：它一起来就会被停', 'warn');
+    else if (state === 'stopped') addNote('已中断');
+    else if (state === 'failed') addNote('中断已发出，但上游未确认；若仍在跑请再点一次', 'warn');
+    else if (state === 'ambiguous') addNote(d.error || '有多个活跃回合，无法确定停哪个', 'error');
+    else if (!r.ok) addNote(d.error || ('中断失败：HTTP ' + r.status), 'error');
+  } catch (err) {
+    addNote('中断失败：' + String(err.message || err), 'error');
+  }
+}
+
+$('#send').addEventListener('click', send);
+$('#stop').addEventListener('click', stop);
+
+// 主题：浅色默认，点一下切深色，选择记在 localStorage（重开还是你选的那个）
+const THEME_KEY = 'bridge_theme';
+function applyTheme(t) {
+  const dark = t === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const btn = $('#theme');
+  btn.textContent = dark ? '☀' : '🌙';
+  btn.title = dark ? '切到浅色' : '切到深色';
+}
+let theme = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
+applyTheme(theme);
+$('#theme').addEventListener('click', () => {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  try { localStorage.setItem(THEME_KEY, theme); } catch {}
+  applyTheme(theme);
+});
+$('#menu').addEventListener('click', () => drawer(true));
+$('#mask').addEventListener('click', () => drawer(false));
+$('#refresh').addEventListener('click', () => loadThreads());
+$('#newconv').addEventListener('click', newThread);
+$('#sync').addEventListener('click', () => syncNow(false));
+
+// 会话列表检索：纯前端过滤，Ctrl+K / Cmd+K 唤起并聚焦（PC 桌面用）
+const tsearch = $('#tsearch');
+function setQuery(v) {
+  threadQuery = v;
+  tsearch.value = v;
+  renderConvoList();
+}
+tsearch.addEventListener('input', () => { threadQuery = tsearch.value; renderConvoList(); });
+tsearch.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') { ev.preventDefault(); setQuery(''); }
+  if (ev.key === 'Enter') { ev.preventDefault(); $('#tlist').querySelector('.titem:not(.empty)')?.click(); }
+});
+$('#tclear').addEventListener('click', () => { setQuery(''); tsearch.focus(); });
+document.addEventListener('keydown', (ev) => {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.key.toLowerCase() !== 'k') return;
+  ev.preventDefault();
+  drawer(true);
+  tsearch.focus();
+  tsearch.select();
+});
+// 开着页面时每 5 秒对一次版本戳（只 stat 文件，很便宜）
+setInterval(() => {
+  if (document.visibilityState !== 'visible' || controller) return;
+  if (threadId) syncNow(true);
+  loadThreads();   // 终端里新开的会话、别处结束的回合，都会自己出现在列表里
+}, 5000);
+
+const input = $('#input');
+input.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+    ev.preventDefault();
+    send();
+  }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + 'px';
+});
+
+entries = loadEntries(threadId);
+replay();
+renderConvoList();
+loadThreads();
+
+if (!TOKEN) addNote('没有 token：请用启动时打印的完整网址打开本页', 'error');
+else setStatus(threadId ? '已接上一轮对话' : '就绪');
+</script>
+</body>
+</html>

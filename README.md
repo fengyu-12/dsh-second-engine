@@ -42,6 +42,18 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 | DSH 主 AI | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
+## 协作看板（dual-board，v1.3 · 2026-09-27）
+
+长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `~/proj/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `~/proj/AGENTS.md` 自动注入，无需人工提醒）：
+
+- **写板唯一入口 `board.sh`**（v1.2 起）：CAS + O_EXCL 锁 + 原子写 + 状态机 + JSONL 归档 + `doctor` 体检都在工具里，**手改 `board.json` 视为破坏协议**。退出码即语义（3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。
+- **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit 与工作区脏快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
+- **看板**：`board.json` —— 状态 `pending / in_progress / blocked / completed / abandoned`（**无 reopen**，completed 不可复改）；工单三字段：`task`（用户原话，不可变）/ `context`（主 AI 解读）/ `frame`（质疑前提是分内事，由工具自动写入）。
+- **收件箱**：`inbox-codex.md` / `inbox-lead.md` 双向留言（经 `board.sh inbox-append`），已读标注 + 按月 JSONL 转档（`archive/`）；交付必含四段：交付 / **异议位** / 下一步建议 / 自验。
+- **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
+- **可视化**：浏览器聊天桥（3095）的会话列表抽屉 = 成员会话切换，终端/网页/主 AI 三方同链。
+- ⚠️ **已知限制**：脏工作区下 scope 校验会漏报（协议 §十一）；给 Codex 的 workdir 尽量干净。
+
 ## 前置要求
 
 - DeepSeek Harness（新版 App + Web）
@@ -63,12 +75,12 @@ codex --version   # 验证
 
 ```bash
 # 1. 放置插件实体
-cp -a dsh-second-engine /root/dsha-second-engine
-cd /root/dsha-second-engine && npm install --omit=dev
+cp -a dsh-second-engine <插件目录>
+cd <插件目录> && npm install --omit=dev
 
-# 2. 注册进 profile（link: 方式，须指向 /root/dsha-* 实体）
+# 2. 注册进 profile（link: 方式，指向插件实体目录）
 cd ~/.dsh/profiles/web
-#   package.json: dependencies 加 "dsh-second-engine": "link:/root/dsha-second-engine"
+#   package.json: dependencies 加 "dsh-second-engine": "link:<插件目录>"
 #   dsh.profile.bundles 数组加 "dsh-second-engine"
 pnpm install
 
@@ -80,14 +92,16 @@ pnpm install
 1. 设置 → 第二引擎 → 模型提供方 → 选择预设（DeepSeek / 智谱）或添加自定义；
 2. 填入 API Key（保存于 `~/.codex/keyring.json`，0600 权限，界面仅脱敏回显）；
 3. 「获取模型列表」→ 下拉选择模型 → 启用；
-4. 终端快速启动：`codex-env`（自动注入激活提供方的 Key 并进入 Codex TUI）。
+4. 终端快速启动：`codex-env`（自动注入激活提供方的 Key 并进入 Codex TUI）；只想取浏览器聊天桥网址用 `codex-env -u`。
 
 ### 终端使用（TUI）
 
 | 动作 | 方式 |
 |---|---|
-| **启动** | 终端页敲 `codex-env`（自动注入激活提供方的 Key → 进入 /root/proj → 拉起 TUI）|
+| **启动** | 终端页敲 `codex-env`（自动注入激活提供方的 Key → 进入 ~/proj → 拉起 TUI）|
 | **退出** | `Ctrl+D` 或输入 `/quit` |
+| **取桥网址** | `codex-env -u`（只打印网址、不进 TUI、不注入 Key）；或 `cat <桥目录>/.url`（桥目录＝运行实例目录，默认 `bridge/web/`） |
+| **网页聊天桥** | 浏览器打开取到的网址（`127.0.0.1:3095`，自带 token 鉴权，等于密码别外传）；终端 TUI 与网页**共享同一批会话** |
 | 换模型 | TUI 内 `/model`（或回设置面板「获取模型列表」选）|
 | 看改动 | `/diff`；会话恢复 `codex resume` |
 | 中文输入 | App 终端输入法受限时，在 Web 输入框写好复制粘贴进去 |
@@ -110,7 +124,27 @@ pnpm install
 
 服务层每 6 小时自动兜底清理（保留 7 天 / 总量超 200MB 从最旧删）；面板「会话清理」可手动按天清理。
 
-## 支持能力一览（v1.0.0）
+## API 入口（唤起 Codex 的正确地址）
+
+插件路由挂在 **Web 服务**上，地址取环境变量 **`$DSH_WEB_URL`**（DSH 启动时注入，随 Web 端口变化，**不要写死端口**）：
+
+```bash
+W="$DSH_WEB_URL"                                            # 例: http://127.0.0.1:<Web端口>
+
+curl -s "$W/second-engine/api/status"                       # 自检: {"ok":true,"codexBinary":true,...}
+
+curl -s -X POST "$W/second-engine/api/task" \
+     -H 'Content-Type: application/json' \
+     -d '{"prompt":"<自包含工单>","workdir":"~/proj","ephemeral":true}'   # → {"id":"..."} 立即返回
+```
+
+- ⚠️ **不要用 App 设备桥的端口**（`/app/*`：读屏/点按/截屏/通知那套）去拼插件路由：那不是插件路由，未知路径会被当 shell 命令执行，返回
+  `{"result":"[NO_CMD]"}` —— 看着像「插件 API 不存在」，实际是敲错门（2026-09-27 实测）。
+- **工单是异步的**：`POST /api/task` 拿到 `{id}` 就可以走人，**完成经 App 通知提醒**；等结果用
+  `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
+  **不要自己写 `sleep`+`curl` 轮询**。
+
+## 支持能力一览（v1.1.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -134,6 +168,29 @@ pnpm install
 - **DeepSeek 无联网搜索**：官方 Responses API 不执行 `web_search`（文档明示禁用）——搜索走 Exa 备胎或主 AI 代查；
 - **完成通知节流**：App 通知 30 秒节流，连续快速完成的任务可能合并提醒；
 - **插件 API 无鉴权**：`/second-engine/api/*` 仅绑定 127.0.0.1（外网不可及），但本机任意 App 均可无认证调用——个人设备低风险，接入外部 agent 前将统一加 token（bridge_token 同款机制）。
+
+## 执行模式（2026-09-27 起）
+
+工单与复核支持两种执行模式，**切换不需要重启**：
+
+| 模式 | 机制 | 能力 |
+|---|---|---|
+| **exec**（默认） | `codex exec` 一次性子进程 + `-o` 文件 | 与旧版完全一致，零风险 |
+| **appserver** | `codex app-server` JSON-RPC 长连接 | **流式进度**（`GET /api/task?id=` 的 `progress`，最近 20 条归一化事件）+ **真打断**（`/api/task/cancel` 先发 `turn/interrupt`，65ms 级结束）；输出仍落 `-o` 文件，看门狗判据不变 |
+
+```sh
+echo appserver > ~/.dsh/second-engine-mode.txt   # 切 app-server 模式
+echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
+```
+
+优先级：环境变量 `SECOND_ENGINE_EXEC_MODE` > 上述模式文件 > 默认 `exec`。
+验收脚本：`bash $DSH_HOME/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
+
+**实时可见性（怎么判断"到底行动了没"）**：
+- **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
+- **exec 模式**：`GET /api/task?id=` 看 `liveBytes`（过程流字节数，持续增长即在动）；过程流保留在 `<outPath>.live`（最终结果仍以 `-o` 文件为准）。
+- **appserver 模式**：除 `liveBytes` 外还有 `progress` 数组（归一化事件，最近 20 条，可见 reasoning / 文本增量 / 工具调用 / 用量）。
+协议依据：`~/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
 ## 架构
 

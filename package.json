@@ -1,7 +1,7 @@
 {
   "name": "dsh-second-engine",
-  "version": "1.0.0",
-  "description": "Second engine plugin for DeepSeek Harness: Codex 二元引擎状态、密钥写入与会话清理 API。",
+  "version": "1.1.0",
+  "description": "Second engine plugin for DeepSeek Harness: plug OpenAI Codex CLI in as a second agent — async work orders, adversarial review, a shared terminal/web session bridge, and a file-based task board.",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -9,6 +9,7 @@
     "./client": "./lib/client.js"
   },
   "files": [
+    "bridge",
     "tools",
     "src",
     "lib",
@@ -17,15 +18,26 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fengyu-12/dsh-second-engine.git"
+  },
+  "homepage": "https://github.com/fengyu-12/dsh-second-engine#readme",
+  "bugs": {
+    "url": "https://github.com/fengyu-12/dsh-second-engine/issues"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",
     "cordis",
     "plugin",
-    "codex"
+    "codex",
+    "codex-cli",
+    "terminal-agent",
+    "second-engine"
   ],
   "dsh": {
     "bundle": {
