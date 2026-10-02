@@ -50,12 +50,12 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `~/proj/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `~/proj/AGENTS.md` 自动注入，无需人工提醒）：
 
 - **写板唯一入口 `board.sh`**（v1.2 起）：CAS + O_EXCL 锁 + 原子写 + 状态机 + JSONL 归档 + `doctor` 体检都在工具里，**手改 `board.json` 视为破坏协议**。退出码即语义（3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。
-- **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit 与工作区脏快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
+- **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit、工作区脏快照与 `write_scopes` 的 sha256 快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
 - **看板**：`board.json` —— 状态 `pending / in_progress / blocked / completed / abandoned`（**无 reopen**，completed 不可复改）；工单三字段：`task`（用户原话，不可变）/ `context`（主 AI 解读）/ `frame`（质疑前提是分内事，由工具自动写入）。
 - **收件箱**：`inbox-codex.md` / `inbox-lead.md` 双向留言（经 `board.sh inbox-append`），已读标注 + 按月 JSONL 转档（`archive/`）；交付必含四段：交付 / **异议位** / 下一步建议 / 自验。
 - **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
 - **可视化**：浏览器聊天桥（3095）的会话列表抽屉 = 成员会话切换，终端/网页/主 AI 三方同链。
-- ⚠️ **已知限制**：脏工作区下 scope 校验会漏报（协议 §十一）；给 Codex 的 workdir 尽量干净。
+- ✅ **scope 校验（v1.2 起）**：派单时对 `write_scopes` 记 sha256 快照，交付后比对——**「派单前就脏、之后又被改」不再漏报**（协议 §十一 那条限制已解）；workdir 无 git 时降级为哈希校验，不再直接判「未验证」。
 
 ## 前置要求
 
@@ -147,10 +147,13 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v1.1.0）
+## 支持能力一览（v1.2.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用，原来只有触屏纵向）+ 松手吸附最近的左右边缘（维持半露圆球形态）+ 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
+| scope-check 脏工作区 | ✅ v1.2 修复 | 派单时对 `write_scopes` 记 sha256 快照，交付后比对——**「派单前就脏、交付后又被改」不再漏报**；workdir 无 git 时降级为哈希校验，而非直接判「未验证」 |
+| Codex 功能表 | ✅ v1.2 | `skills/second-engine/Codex功能表.md`：feature 开关、版本变更日志、升级后检查清单、三条插件已知限制，随包分发 |
 | 提供方切换 / 工单 / 双向互审 | ✅ | DeepSeek / 智谱直连，云知声经翻译桥；切换不丢用户配置（sandbox、MCP） |
 | AGENTS.md 联网搜索三档降级 | ✅ v2 | 原生 web_search 优先 → Exa MCP 备胎 → 全无则凭已有知识完成任务并标注「未经联网核实」；v1 用户自动原位升级 |
 | tools/t-tool.sh | ✅ 实测 | tmux 交互窗口：屏幕快照、哨兵式等待、`run` 退出码回传、owner 防串台；**依赖 tmux**（`apt install tmux`） |
