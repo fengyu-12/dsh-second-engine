@@ -92,7 +92,7 @@ const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
 // 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
 const tasks = new Map()
-const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(homedir(), 'proj')
+const DEFAULT_TASK_WORKDIR = '/root/proj'
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
 
@@ -103,7 +103,7 @@ const consults = []
 const CONSULT_KEEP_LIMIT = 20
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
-const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(homedir(), '.dsh'), '.bridge_token')
+const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
 const NOTIFY_TIMEOUT_MS = 3000
 
 // ── 双向互审（review）──
@@ -409,6 +409,35 @@ function extractMcpServerBlocks() {
   } catch { /* 原文件不存在：无可保留 */ return [] }
 }
 
+// 插件模板自己生成的段（每次重写都会重新生成）—— 重写时只排除这一类，其余段原样保留。
+// 用黑名单而非白名单：白名单每出现一种新段就要补一次名单，漏补 = 静默丢配置。
+// 2026-10-02 实证：旧白名单只保留 mcp_servers.*，切一次提供方就把 [features] 整段丢掉，
+// memories / multi_agent_v2 / network_proxy / recommended_plugins 全部回到默认 false，
+// [projects."/root/proj"] 的 trust_level 也一并消失，且全程零报错。
+//
+// memories 也归模板管：它的两个模型字段必须跟随当前提供方。缺省时 Codex 会去挑
+// 内置目录里的 OpenAI 模型名，落到第三方提供方上就是「模型不存在，请检查模型代码」，
+// 记忆生成全失败（2026-10-02 实证：jobs 表 6 条全 error、stage1_outputs 0 行）。
+const TEMPLATE_OWNED_SECTION = /^\[(?:model_providers\.[^\]\n]+|memories)\][^\n]*$/
+
+// 提取原 config.toml 中「除模板自有段之外」的全部段（段体直到下一个段头或文件尾）。
+// 原文件不存在或读取失败时返回空数组。
+function extractPreservedSections() {
+  try {
+    const raw = readFileSync(CONFIG_PATH, 'utf8')
+    const blocks = []
+    const re = /^\[[^\]\n]+\][^\n]*$/gm
+    let m
+    while ((m = re.exec(raw)) !== null) {
+      if (TEMPLATE_OWNED_SECTION.test(m[0])) continue   // 模板每次自己会生成
+      const next = raw.indexOf('\n[', m.index)
+      const end = next === -1 ? raw.length : next + 1
+      blocks.push(raw.slice(m.index, end).replace(/\n*$/, ''))
+    }
+    return blocks
+  } catch { /* 原文件不存在：无可保留 */ return [] }
+}
+
 // ── config.toml 读写（web_search / mcp_servers）──
 // 与 extractMcpServerBlocks 同口径：读不到就当下不存在，绝不抛错。
 function readConfigRaw() {
@@ -616,9 +645,22 @@ async function writeCodexConfig(provider) {
     `wire_api = ${tomlString(WIRE_API)}`,
     '',
   )
-  // 保留用户自挂的 [mcp_servers.*] 段（同 sandbox_mode 保留逻辑：模板外的用户配置不在切换时丢失）
-  const mcpBlocks = extractMcpServerBlocks()
-  if (mcpBlocks.length > 0) lines.push(...mcpBlocks, '')
+  // 记忆流水线的模型跟随当前提供方（缺省会落到内置 OpenAI 模型名 → 上游报「模型不存在」）。
+  // 写死成 provider.model 后，切厂商自动同步，不必每次手改。
+  if (provider.model) {
+    lines.push(
+      '',
+      '[memories]',
+      `extract_model = ${tomlString(provider.model)}`,
+      `consolidation_model = ${tomlString(provider.model)}`,
+    )
+  }
+  // 保留模板外的用户/工具配置段：mcp_servers.*、features、tui、projects.* 等。
+  // 同 sandbox_mode 的保留逻辑 —— 不在重写时丢失。
+  // （2026-10-02 修正：原先只保留 mcp_servers，切提供方时 [features] 被丢，
+  //   feature 开关被静默重置为默认值，见 extractPreservedSections 注释。）
+  const keptBlocks = extractPreservedSections()
+  if (keptBlocks.length > 0) lines.push(...keptBlocks, '')
   writeFileSync(CONFIG_PATH, lines.join('\n'), 'utf8')
   chmodSync(CONFIG_PATH, 0o600)
   return envKey
@@ -1260,7 +1302,7 @@ async function handleTaskCreate(req, res) {
       // 提示词改走 stdin（'-' 占位）：argv 不再携带正文。2026-09-24 实证：prompt 以 argv
       // 出现在 /proc/<pid>/cmdline 时，工单若执行 pkill -f <模式>（如 dsh-browser 的
       // headless_shell 拼接串）会命中父进程自身 → 自杀（三单 76/97.5/101.3s 死亡的真因，
-      // 见工作目录下的 owner 报告）。
+      // 见 /root/proj/se-exec-owner-report.md）。
       '-',
     ]
     // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。
