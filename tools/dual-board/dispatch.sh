@@ -12,6 +12,7 @@ set -euo pipefail
 exec python3 - "$@" <<'PY'
 import argparse
 import datetime
+import hashlib
 import os
 import json
 import subprocess
@@ -107,7 +108,35 @@ def dirty_paths(workdir):
     return sorted(set(paths))
 
 
-def write_base(task_id, commit, workdir, scopes, dirty):
+def snapshot_scope_hashes(workdir, scopes):
+    """#4：对 write_scopes 覆盖的文件记 sha256（派单前快照）。
+
+    脏工作区下 scope-check 靠 git 排除「派单前就脏」的文件，会把
+    「派单前就脏、派单后又被改」的真实改动一并排除（协议 §十一 的漏报）。
+    哈希比对不受 git 状态影响：交付后重算即可把这类改动捞回来；
+    workdir 无 git 时也能靠它降级校验，而不是直接判「未验证」。
+    """
+    out = {}
+    wd = Path(workdir)
+    for s in scopes or []:
+        base = Path(s) if os.path.isabs(s) else (wd / s)
+        if base.is_file():
+            files = [base]
+        elif base.is_dir():
+            files = sorted(p for p in base.rglob("*")
+                           if p.is_file() and ".git" not in p.parts)
+        else:
+            files = []
+        for f in files:
+            try:
+                rel = os.path.relpath(f, wd).replace(os.sep, "/")
+                out[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+            except OSError:
+                continue
+    return out
+
+
+def write_base(task_id, commit, workdir, scopes, dirty, hashes):
     DISPATCH_DIR.mkdir(parents=True, exist_ok=True)
     record = {
         "task_id": task_id,
@@ -115,6 +144,7 @@ def write_base(task_id, commit, workdir, scopes, dirty):
         "workdir": str(workdir),
         "write_scopes": scopes,
         "dirty_before": dirty,
+        "scope_hashes": hashes,
         "dispatched_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     (DISPATCH_DIR / f"{task_id}.base").write_text(
@@ -125,6 +155,7 @@ def dispatch_task(prompt, workdir, scopes):
     # 基线必须在派单之前取：派单后 codex 可能已开始改文件
     commit = baseline_commit(workdir)
     dirty = dirty_paths(workdir)
+    hashes = snapshot_scope_hashes(workdir, scopes)
     body = json.dumps(
         {"prompt": prompt, "workdir": str(workdir), "ephemeral": True},
         ensure_ascii=False,
@@ -154,7 +185,7 @@ def dispatch_task(prompt, workdir, scopes):
     if not isinstance(task_id, str) or not task_id:
         raise RuntimeError(f"响应缺少有效 id: {response_body}")
 
-    write_base(task_id, commit, workdir, scopes, dirty)
+    write_base(task_id, commit, workdir, scopes, dirty, hashes)
     return task_id, commit
 
 

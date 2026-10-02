@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -478,6 +479,32 @@ def cmd_inbox_archive(a) -> None:
     print(f"ok: {len(moved_segs)} 段已读转档 archive/inbox-{a.who}-{month}.jsonl")
 
 
+def _scope_hashes_now(workdir: str, scopes) -> dict:
+    """交付后重算 write_scopes 覆盖文件的 sha256（与 dispatch 侧快照同构）。
+
+    #4：脏工作区下 git 分不清「派单前就脏」与「派单后又被改」，哈希可以。
+    """
+    out = {}
+    wd = os.path.abspath(workdir)
+    for s in scopes or []:
+        base = s if os.path.isabs(s) else os.path.join(wd, s)
+        files = []
+        if os.path.isfile(base):
+            files = [base]
+        elif os.path.isdir(base):
+            for root, dirs, names in os.walk(base):
+                dirs[:] = [d for d in dirs if d != ".git"]
+                files.extend(os.path.join(root, n) for n in names)
+        for f in files:
+            try:
+                rel = os.path.relpath(f, wd).replace(os.sep, "/")
+                with open(f, "rb") as fh:
+                    out[rel] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                continue
+    return out
+
+
 def _load_base_record(task_id: str):
     """读 .dispatch/<id>.base；v1.2 为 JSON，v1.1 为纯 commit 行（兼容）。"""
     path = os.path.join(DISPATCH_DIR, f"{task_id}.base")
@@ -508,9 +535,13 @@ def cmd_scope_check(a) -> None:
     workdir = a.workdir or rec.get("workdir") or "."
     scopes = rec.get("write_scopes") or (task or {}).get("write_scopes") or []
     commit = rec.get("commit")
-    if not commit or commit == "no-git":
-        print("warn: workdir 无 git 基线，scope 校验降级为『未验证』", file=sys.stderr)
+    scope_hashes = rec.get("scope_hashes") or {}
+    no_git = (not commit) or commit == "no-git"
+    if no_git and not scope_hashes:
+        print("warn: workdir 无 git 基线且派单时无哈希快照，scope 校验降级为『未验证』", file=sys.stderr)
         sys.exit(8)
+    if no_git:
+        print("warn: workdir 无 git 基线，本次改用派单时的 sha256 快照校验", file=sys.stderr)
 
     def git(*args) -> str:
         r = subprocess.run(["git", "-C", workdir, "-c", "core.quotepath=false", *args],
@@ -539,8 +570,10 @@ def cmd_scope_check(a) -> None:
     def paths(out: str) -> set:
         return {unquote(x) for x in out.splitlines() if x.strip()}
 
-    tracked = paths(git("diff", "--name-only", commit, "--"))
-    untracked = paths(git("ls-files", "--others", "--exclude-standard"))
+    tracked, untracked = set(), set()
+    if not no_git:
+        tracked = paths(git("diff", "--name-only", commit, "--"))
+        untracked = paths(git("ls-files", "--others", "--exclude-standard"))
     dirty_before = set(rec.get("dirty_before") or [])
     # .dispatch 基线文件与锁是派单/写板工具自身产物，不算任务产出
     # 协议授权的管理/通讯文件不算任务产出（工具自身产物 + 双方共写通讯件）。
@@ -553,7 +586,16 @@ def cmd_scope_check(a) -> None:
     managed_files = {f"{board_rel}/{n}" for n in
                      ("board.json", "board.json.lock", "channel.md",
                       "inbox-codex.md", "inbox-lead.md")}
-    changed = sorted(p for p in (tracked | untracked) - dirty_before
+    # #4：派单时的 sha256 快照 —— 捞回「派单前就脏、派单后又被改」的真实改动。
+    # 这类文件会被 dirty_before 整批排除，正是协议 §十一 记录的漏报来源。
+    hash_changed = set()
+    if scope_hashes:
+        now_hashes = _scope_hashes_now(workdir, scopes)
+        hash_changed = {p for p in set(scope_hashes) | set(now_hashes)
+                        if scope_hashes.get(p) != now_hashes.get(p)}
+    changed_set = (tracked | untracked) - dirty_before
+    changed_set |= hash_changed
+    changed = sorted(p for p in changed_set
                      if not p.startswith(managed_prefixes) and p not in managed_files)
 
     scopes_abs = [os.path.abspath(s if os.path.isabs(s) else os.path.join(workdir, s)) for s in scopes]
@@ -562,7 +604,7 @@ def cmd_scope_check(a) -> None:
         p = os.path.abspath(os.path.join(workdir, c))
         ok = any(p == s or p.startswith(s.rstrip("/") + "/") for s in scopes_abs)
         (inside if ok else violations).append(c)
-    skipped = sorted((tracked | untracked) & dirty_before)
+    skipped = sorted(((tracked | untracked) & dirty_before) - hash_changed)
     print(f"task={a.id} workdir={workdir} baseline={commit[:12]} scopes={scopes}")
     for c in inside:
         print(f"  ✓ {c}")
