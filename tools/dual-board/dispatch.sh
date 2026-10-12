@@ -6,8 +6,11 @@
 #   2) 附固定【派单纪律】尾段
 #   3) 派单「之前」记录 workdir 基线 commit + write_scopes → .dispatch/<task id>.base（供 board.sh scope-check 用）
 #
-# 用法：dispatch.sh "<工单正文>" [--workdir DIR] [--scope "路径1,路径2"] [--dry-run]
-# 纪律：真实派单必须带 --scope（工单的写范围），否则 scope-check 无据可依。
+# 用法：dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "路径1,路径2" | --read-only] [--workdir DIR] [--dry-run]
+# 纪律（2026-10-13 起为硬约束）：真实派单必须带 --context（lead 的解读）、--self-test（自测/验收）
+#       以及 write_scopes（或显式 --read-only），缺任一即拒发。
+#       由来：协议层定了工单三字段 task/context/frame，但 wrapper 的 build_prompt(task, scopes)
+#       从来没有 context 入口 ⇒ 约束只活在文档里（「协议写了但没人执行」）。
 set -euo pipefail
 exec python3 - "$@" <<'PY'
 import argparse
@@ -29,7 +32,7 @@ API_URL = (os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/")
 
 def usage(parser):
     parser.print_usage(sys.stderr)
-    print('dispatch.sh "<工单正文>" [--workdir DIR] [--scope "p1,p2"] [--dry-run]', file=sys.stderr)
+    print('dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--dry-run]', file=sys.stderr)
 
 
 def unread_segments(text):
@@ -50,7 +53,7 @@ def unread_segments(text):
     return segments
 
 
-def build_prompt(task, scopes):
+def build_prompt(task, context, self_test, scopes):
     try:
         inbox_text = INBOX.read_text(encoding="utf-8")
     except OSError as error:
@@ -60,8 +63,9 @@ def build_prompt(task, scopes):
     segments = unread_segments(inbox_text)
     if segments:
         parts.append("【未读收件箱】\n" + "\n".join(segments))
-    parts.append(task)
-    scope_line = "；\n".join(f"  · {s}" for s in scopes) if scopes else "  · （本单未声明 write_scopes，按协议视为只读）"
+    parts.append("【task】\n" + task)
+    parts.append("【context】\n" + context)
+    scope_line = "；\n".join(f"  · {s}" for s in scopes) if scopes else "  · （只读单：显式 --read-only，无 write_scopes）"
     parts.append(
         f"【派单纪律】\n"
         f"先读 {BOARD_DIR}/PROTOCOL.md；\n"
@@ -69,7 +73,22 @@ def build_prompt(task, scopes):
         "本单 write_scopes：\n" + scope_line + "；\n"
         "交付必含四段：交付/异议位/下一步建议/自验。"
     )
+    parts.append("【自测/验收】\n" + self_test)
     return "\n\n".join(parts), segments
+
+
+def validate_workorder(args, scopes):
+    """硬约束：真实派单前校验工单四要素齐备（--dry-run 只出草稿，不走这里）。"""
+    missing = []
+    if not (args.task or "").strip():
+        missing.append("task（工单正文）")
+    if not (args.context or "").strip():
+        missing.append("--context（lead 的解读：目标 / 约束 / 相关文件）")
+    if not scopes and not args.read_only:
+        missing.append("--scope（write_scopes；确实只读就显式加 --read-only）")
+    if not (args.self_test or "").strip():
+        missing.append("--self-test（自测 / 验收方式）")
+    return missing
 
 
 def baseline_commit(workdir):
@@ -223,6 +242,9 @@ def main():
     parser.add_argument("task", nargs="?")
     parser.add_argument("--workdir", default=".")
     parser.add_argument("--scope", default="")
+    parser.add_argument("--context", default="")
+    parser.add_argument("--self-test", default="")
+    parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--board-id", default=None,
                         help="看板任务 id（如 T5）：写一份 <board-id>.base 别名，"
@@ -231,7 +253,7 @@ def main():
     args = parser.parse_args()
 
     if args.help:
-        print('用法: dispatch.sh "<工单正文>" [--workdir DIR] [--scope "p1,p2"] [--board-id ID] [--dry-run]')
+        print('用法: dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--dry-run]')
         return 0
     if not args.task or not args.task.strip():
         usage(parser)
@@ -243,16 +265,21 @@ def main():
     scopes = [s for s in args.scope.split(",") if s.strip()]
 
     try:
-        prompt, _ = build_prompt(args.task, scopes)
+        prompt, _ = build_prompt(args.task, args.context, args.self_test, scopes)
         if args.dry_run:
             print(prompt)
             print(f"\n基线: {baseline_commit(args.workdir)}")
-            print(f"write_scopes: {scopes or '（未声明）'}")
+            print(f"write_scopes: {scopes or '（只读单）'}")
             return 0
-        if not scopes:
-            print("warn: 未传 --scope，scope-check 将无据可依", file=sys.stderr)
-        auto_archive()
+        missing = validate_workorder(args, scopes)
+        if missing:
+            print("派单被拒（工单四要素不齐）:", file=sys.stderr)
+            for item in missing:
+                print(f"  - 缺 {item}", file=sys.stderr)
+            return 2
         task_id, commit = dispatch_task(prompt, args.workdir, scopes)
+        # P0：归档必须在派单成功之后 —— 否则派单失败会静默吞掉收件箱未读段
+        auto_archive()
         if args.board_id:
             link = DISPATCH_DIR / f"{args.board_id}.base"
             try:
