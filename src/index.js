@@ -268,7 +268,7 @@ const AGENTS_SECTION = `${AGENTS_MARK}
 # Codex 全局协作协议（by dsh-second-engine）
 
 你是「第二引擎」，与主 AI（DSH）互为伙伴。卡点自救协议：
-- 同一路径/命令连续失败 3 次以上、或在绕圈、或缺信息/权限无法自行获取时，必须主动求助而非硬试：
+- 同一路径/命令连续失败 2 次、或在绕圈、或缺信息/权限无法自行获取时，必须主动求助而非硬试：
   curl -s -X POST http://127.0.0.1:3080/second-engine/api/consult -H 'Content-Type: application/json' \\
     -d '{"from":"codex","task":"<当前任务一句话>","stuckContext":"<试过什么、错在哪、需要什么>"}'
   提交后正常结束会话（输出已有成果），主 AI 会带建议回来。
