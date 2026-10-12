@@ -208,7 +208,7 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 
 - **脚本/协议随插件**：`tools/dual-board/{board.sh,board_tool.py,dispatch.sh,PROTOCOL.md}`（2026-09-30 收编；自定位，`DUAL_BOARD_DIR` 可覆盖数据目录）；**运行数据**默认仍在 `~/proj/dual-board/`（Codex 侧登记 `~/proj/AGENTS.md`）。派单涉及多环节长任务或需 Codex 持续记忆时走这套。
 - **写板唯一入口 `board.sh`（v1.2 核心）**：CAS + O_EXCL 锁 + 原子写 + 状态机 + 归档 + 体检全在工具里，**手改 board.json = 破坏协议**。子命令：`new/claim/complete/block/abandon/set/show`、`inbox-append|unread|read|archive`、`archive`、`scope-check`、`doctor`；退出码即语义（0 成功 / 3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。**无 reopen**：completed 不可复改，出问题开新任务引用旧任务。
-- **派单走 `dispatch.sh`**：自动注入 `inbox-codex.md` 未读段 + 派单**前**记基线 commit 与脏快照 → `.dispatch/<task id>.base`；交付后 `board.sh scope-check <id> --workdir <dir>` 机械校验 write_scopes 越界（⚠️ 脏工作区会漏报，尽量给干净目录，见协议 §十一）。
+- **派单走 `dispatch.sh`**：自动注入 `inbox-codex.md` 未读段 + 派单**前**记基线 commit 与脏快照 → `.dispatch/<task id>.base`；交付后 `board.sh scope-check <id> --workdir <dir>` 机械校验 write_scopes 越界（⚠️ 脏工作区会漏报，尽量给干净目录，见协议 §十一）。 **2026-10-13 起硬约束**：`--context`（lead 的解读）/ `--self-test`（自测与验收方式）/ write_scopes（或显式 `--read-only`）**缺一即拒发**（exit 2）；`auto_archive()` 已移到派单**成功之后**（原顺序在派单前，派单失败会静默吞掉收件箱未读段）。
 - **双通道**：短任务 `POST /api/task`（ephemeral 零记忆，互审/复核用）；长任务 `codex exec` 落盘 + `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，thread id 记在看板 `session` 字段；0.156.1 实测跨单记忆保持）。长任务不走 API（API 不支持 resume），用命令行降级姿势手动注入 key。
 - 工单三字段 task/context/frame；交付强制四段含【异议位】。细则读 PROTOCOL.md §九（工具化纪律）与 §十一（已知限制）。
 
