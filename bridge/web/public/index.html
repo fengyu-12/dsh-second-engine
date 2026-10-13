@@ -4,27 +4,50 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>第二引擎</title>
-<script>try{if(localStorage.getItem('bridge_theme')==='dark')document.documentElement.setAttribute('data-theme','dark')}catch(e){}</script>
+<script>try{if(localStorage.getItem('bridge_skin')==='claude')document.documentElement.setAttribute('data-skin','claude');if(localStorage.getItem('bridge_theme')==='dark')document.documentElement.setAttribute('data-theme','dark')}catch(e){}</script>
 <style>
-  /* 浅色是默认；深色挂在 html[data-theme="dark"] 上（head 里那段内联脚本负责提前套上，
-     免得深色用户看到一瞬白屏）。所有配色都走变量，别再往规则里写死颜色。 */
+  /* 皮肤 × 明暗：默认 = Codex 皮（浅）；html[data-theme="dark"] = Codex 深；
+     html[data-skin="claude"] = Claude 皮（浅）；再叠 [data-theme="dark"] = Claude 深。
+     head 里那段内联脚本负责提前套上，免得深色/换皮用户看到一瞬白屏。
+     所有配色都走变量，别再往规则里写死颜色。
+     色值来源：Codex 皮取自 dsh-codex-ui 的 src/style.css（--cg-* 系列）；
+     Claude 皮取自 dsh-claude-theme 的 claude/skin.css（--dsw-alias-* 系列，浅深成对）。
+     字体暂未随包：若要衬线正文，把 woff2 放进本目录后在此加 @font-face 即可。 */
   :root {
     color-scheme: light;
-    --bg: #f4f5f7; --panel: #ffffff; --line: #dce0e6;
-    --fg: #171a1f; --dim: #5f6774; --muted: #8a8a8a;
-    --accent: #2f6fed; --err: #c8342b; --warn: #8a5a00;
-    --bubble-me: #dbe7ff; --bubble-ai: #ffffff;
+    --bg: #fbfbfb; --panel: #ffffff; --line: #e5e5e5;
+    --fg: #202123; --dim: #404043; --muted: #999999;
+    --accent: #3982fa; --err: #c8342b; --warn: #8a5a00;
+    --bubble-me: #f1f1f1; --bubble-ai: #ffffff;
     --input-bg: #ffffff; --btn-fg: #ffffff;
-    --sel: #e4ecff; --mask: rgba(15,18,22,.35); --hover-warn: rgba(138,90,0,.12);
+    --sel: #e7e7e7; --mask: rgba(15,18,22,.35); --hover-warn: rgba(138,90,0,.12);
   }
   html[data-theme="dark"] {
     color-scheme: dark;
-    --bg: #14161a; --panel: #1c1f25; --line: #2b3038;
-    --fg: #e6e8ec; --dim: #98a0ad; --muted: #8a8a8a;
-    --accent: #6aa9ff; --err: #ff7b72; --warn: #e3b341;
-    --bubble-me: #22304a; --bubble-ai: #1c1f25;
-    --input-bg: #0f1115; --btn-fg: #0b0d10;
-    --sel: #22304a; --mask: rgba(0,0,0,.55); --hover-warn: rgba(227,179,65,.15);
+    --bg: #171717; --panel: #212121; --line: #303030;
+    --fg: #ececec; --dim: #929292; --muted: #8a8a8a;
+    --accent: #3982fa; --err: #ff7b72; --warn: #e3b341;
+    --bubble-me: #303030; --bubble-ai: #212121;
+    --input-bg: #303030; --btn-fg: #ffffff;
+    --sel: #303030; --mask: rgba(0,0,0,.55); --hover-warn: rgba(227,179,65,.15);
+  }
+  html[data-skin="claude"] {
+    color-scheme: light;
+    --bg: #faf9f5; --panel: #f5f0e8; --line: #e6dfd8;
+    --fg: #141413; --dim: #8e8b82; --muted: #8e8b82;
+    --accent: #d97757; --err: #c8342b; --warn: #8a5a00;
+    --bubble-me: #f3e0d8; --bubble-ai: #ffffff;
+    --input-bg: #ffffff; --btn-fg: #ffffff;
+    --sel: #efe9de; --mask: rgba(20,20,19,.35); --hover-warn: rgba(138,90,0,.12);
+  }
+  html[data-skin="claude"][data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #181715; --panel: #1f1e1b; --line: #2b2925;
+    --fg: #faf9f5; --dim: #8e8b82; --muted: #8a8a8a;
+    --accent: #e08a6a; --err: #ff7b72; --warn: #e3b341;
+    --bubble-me: #2b2925; --bubble-ai: #252320;
+    --input-bg: #1f1e1b; --btn-fg: #1a1a18;
+    --sel: #2b2925; --mask: rgba(0,0,0,.6); --hover-warn: rgba(227,179,65,.15);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -117,6 +140,7 @@
   <button class="menu" id="menu" title="会话列表">☰</button>
   <span class="title">第二引擎</span>
   <span class="sub" id="subtitle"></span>
+  <button class="sync" id="skin" title="切换界面风格">CX</button>
   <button class="sync" id="theme" title="切换深浅色">🌙</button>
   <button class="sync" id="sync" title="同步消息">⟳</button>
   <span class="status" id="status">就绪</span>
@@ -650,8 +674,17 @@ async function stop() {
 $('#send').addEventListener('click', send);
 $('#stop').addEventListener('click', stop);
 
-// 主题：浅色默认，点一下切深色，选择记在 localStorage（重开还是你选的那个）
+// 界面风格：codex（默认）/ claude 两套皮肤；两套各自带浅深两档，所以白夜切换照旧保留
+const SKIN_KEY = 'bridge_skin';
 const THEME_KEY = 'bridge_theme';
+function applySkin(s) {
+  const claude = s === 'claude';
+  document.documentElement.setAttribute('data-skin', claude ? 'claude' : 'codex');
+  const btn = $('#skin');
+  btn.textContent = claude ? 'CL' : 'CX';
+  btn.title = claude ? '当前：Claude 风（点一下换 Codex 风）' : '当前：Codex 风（点一下换 Claude 风）';
+}
+// 主题：浅色默认，点一下切深色，选择记在 localStorage（重开还是你选的那个）
 function applyTheme(t) {
   const dark = t === 'dark';
   document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
@@ -659,8 +692,15 @@ function applyTheme(t) {
   btn.textContent = dark ? '☀' : '🌙';
   btn.title = dark ? '切到浅色' : '切到深色';
 }
+let skin = localStorage.getItem(SKIN_KEY) === 'claude' ? 'claude' : 'codex';
 let theme = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
+applySkin(skin);
 applyTheme(theme);
+$('#skin').addEventListener('click', () => {
+  skin = skin === 'claude' ? 'codex' : 'claude';
+  try { localStorage.setItem(SKIN_KEY, skin); } catch {}
+  applySkin(skin);
+});
 $('#theme').addEventListener('click', () => {
   theme = theme === 'dark' ? 'light' : 'dark';
   try { localStorage.setItem(THEME_KEY, theme); } catch {}

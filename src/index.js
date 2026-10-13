@@ -41,6 +41,7 @@ import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
 import { startAppServerTurn } from './app-server-client.js'
+import { createHash } from 'node:crypto'
 
 export const name = 'second-engine'
 
@@ -92,7 +93,7 @@ const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
 // 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
 const tasks = new Map()
-const DEFAULT_TASK_WORKDIR = '/root/proj'
+const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(homedir(), 'proj')
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
 
@@ -103,7 +104,7 @@ const consults = []
 const CONSULT_KEEP_LIMIT = 20
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
-const NOTIFY_TOKEN_PATH = '/root/.dsh/.bridge_token'
+const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(homedir(), '.dsh'), '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
 // ── 双向互审（review）──
@@ -119,6 +120,13 @@ const WATCHDOG_INTERVAL_MS = 30000
 const WATCHDOG_STALL_MS = 300000
 // 解析失败时回显的原始输出上限，避免把超长文本灌进任务表。
 const REVIEW_RAW_CLIP = 2000
+// 互审的硬预算缺省值（2026-10-03 补：此前只有轮数上限，"无新增即收敛"是**语义**条件，
+// 两个 AI 在「主张 X / 反对 X」之间振荡时没有任何刹车，会一路烧到额度见底）。
+// 两者都可在配置里覆盖（keyring 顶层 reviewWallMs / reviewTokenLimit）。
+const REVIEW_DEFAULT_WALL_MS = 30 * 60 * 1000   // 墙钟 30 分钟
+const REVIEW_DEFAULT_TOKEN_LIMIT = 400000       // 累计 40 万 token（按 codex 自报的 tokens used 累加）
+const REVIEW_MIN_WALL_MS = 60 * 1000
+const REVIEW_MIN_TOKEN_LIMIT = 1000
 
 // 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
 const DEFAULT_KEEP_DAYS = 7
@@ -260,6 +268,18 @@ function normalizeReviewRounds(value) {
   return REVIEW_ROUNDS_CHOICES.includes(n) ? n : REVIEW_DEFAULT_ROUNDS
 }
 
+// 互审硬预算（2026-10-03）：非法/缺失/过小一律回落缺省值 ——
+// 宁可给个保守值，也不要"0 预算"把互审一进去就停。
+function normalizeReviewWallMs(value) {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= REVIEW_MIN_WALL_MS ? Math.floor(n) : REVIEW_DEFAULT_WALL_MS
+}
+
+function normalizeReviewTokenLimit(value) {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= REVIEW_MIN_TOKEN_LIMIT ? Math.floor(n) : REVIEW_DEFAULT_TOKEN_LIMIT
+}
+
 // ── Codex 协作协议（AGENTS.md 自动写入）──
 // 让 Codex 拥有「卡点求助本能」：连续失败/绕圈时主动调 /api/consult。幂等：带标记则跳过。
 const AGENTS_MARK = '<!-- dsh-second-engine:v2 -->'
@@ -319,7 +339,7 @@ function loadKeyring() {
   } catch { doc = null }
 
   if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    const fresh = { providers: presetProviders(), active: DEFAULT_ACTIVE, reviewRounds: REVIEW_DEFAULT_ROUNDS }
+    const fresh = { providers: presetProviders(), active: DEFAULT_ACTIVE, reviewRounds: REVIEW_DEFAULT_ROUNDS, reviewWallMs: REVIEW_DEFAULT_WALL_MS, reviewTokenLimit: REVIEW_DEFAULT_TOKEN_LIMIT }
     try { saveKeyring(fresh) } catch { /* 只读降级：内存里照常可用 */ }
     return fresh
   }
@@ -329,7 +349,7 @@ function loadKeyring() {
     const providers = presetProviders()
     const target = providers.find((p) => p.id === id)
     if (typeof doc.key === 'string') target.apiKey = doc.key.trim()
-    const migrated = { providers, active: id, reviewRounds: normalizeReviewRounds(doc.reviewRounds) }
+    const migrated = { providers, active: id, reviewRounds: normalizeReviewRounds(doc.reviewRounds), reviewWallMs: normalizeReviewWallMs(doc.reviewWallMs), reviewTokenLimit: normalizeReviewTokenLimit(doc.reviewTokenLimit) }
     try { saveKeyring(migrated) } catch { /* 迁移落盘失败不阻断读取 */ }
     return migrated
   }
@@ -346,7 +366,7 @@ function loadKeyring() {
     if (preset.maxOutput !== undefined && existing.maxOutput === undefined) existing.maxOutput = preset.maxOutput
   }
   const active = providers.some((p) => p.id === doc.active) ? doc.active : DEFAULT_ACTIVE
-  return { providers, active, reviewRounds: normalizeReviewRounds(doc.reviewRounds) }
+  return { providers, active, reviewRounds: normalizeReviewRounds(doc.reviewRounds), reviewWallMs: normalizeReviewWallMs(doc.reviewWallMs), reviewTokenLimit: normalizeReviewTokenLimit(doc.reviewTokenLimit) }
 }
 
 // 对外视图：apiKey 只暴露 { configured, preview }，绝不回显明文。
@@ -413,7 +433,7 @@ function extractMcpServerBlocks() {
 // 用黑名单而非白名单：白名单每出现一种新段就要补一次名单，漏补 = 静默丢配置。
 // 2026-10-02 实证：旧白名单只保留 mcp_servers.*，切一次提供方就把 [features] 整段丢掉，
 // memories / multi_agent_v2 / network_proxy / recommended_plugins 全部回到默认 false，
-// [projects."/root/proj"] 的 trust_level 也一并消失，且全程零报错。
+// [projects."<工作目录>"] 的 trust_level 也一并消失，且全程零报错。
 //
 // memories 也归模板管：它的两个模型字段必须跟随当前提供方。缺省时 Codex 会去挑
 // 内置目录里的 OpenAI 模型名，落到第三方提供方上就是「模型不存在，请检查模型代码」，
@@ -574,6 +594,119 @@ function closeBridge() {
   bridgeBaseUrl = ''
   if (server === null) return
   try { server.close() } catch { /* 已关闭或从未监听成功 */ }
+}
+
+// ── 期望态对账 tick（2026-10-03 · 待办 🚧 第 1 项）──────────────────────────
+// 现象：桥是模块级内存态，Web 重启即丢失；而 config.toml 仍指旧桥端口 →
+//       completions 提供方连不上（ERROR: Reconnecting... waiting for network；临时解法=切一次提供方）。
+// 治法：常驻 tick 把「期望态」与「观测态」对齐，**只对差异动手**（幂等可重入）。
+// 纪律：**绝不把「重启 Node」当「重启作业」** —— 作业探活只判失联并置状态，不主动杀任何子进程。
+const RECONCILE_INTERVAL_MS = 7000
+
+let reconcileTimer = null
+let reconcileRunning = false
+
+// 读 /proc/<pid>/stat 的 starttime（第 22 字段），用于防 PID 重用。
+// comm（第 2 字段）可能含空格与括号，故取最后一个 ')' 之后切分才稳；
+// 读不到（非 Linux / 权限受限）返回 null —— 此时不据此判死，退化为"只看存在性"。
+function readProcStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const parts = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    // 切分后下标 = 原字段号 - 3（field 3 即 parts[0]）；starttime 是 field 22 → parts[19]
+    const raw = parts[19]
+    return raw === undefined ? null : raw
+  } catch { return null }
+}
+
+// config.toml 里的 base_url 是否已指向给定端点。
+// 用于「不一致才重写」：writeCodexConfig 会连带重建桥并留备份，绝不能每轮 tick 都调它。
+function configPointsTo(baseUrl) {
+  if (baseUrl === '') return false
+  try {
+    const m = /^\s*base_url\s*=\s*"([^"]*)"/m.exec(readFileSync(CONFIG_PATH, 'utf8'))
+    return m !== null && m[1] === baseUrl
+  } catch { return false }
+}
+
+// 作业失联判定 —— 只做第一层（进程不存在 / PID 被重用）。
+// 心跳新鲜度与 stuckSuspect 交给既有 startWatchdog：它只告警不置死，因为
+// "长时间无输出"常常只是模型在长生成，据此判死会误杀健康作业。
+// 返回 null = 仍活着（或无法判定）；返回字符串 = 失联原因。
+function probeTaskLost(task) {
+  const pid = task.childPid
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  try {
+    process.kill(pid, 0)
+  } catch (e) {
+    if (e !== null && e !== undefined && e.code === 'ESRCH') return 'process-gone'
+    return null // EPERM 等：进程还在，只是没权限探测
+  }
+  const nowStart = readProcStartTime(pid)
+  if (task.childStart !== undefined && task.childStart !== null && nowStart !== null && nowStart !== task.childStart) {
+    return 'pid-reused'
+  }
+  return null
+}
+
+// 一轮对账。返回动作清单（空数组 = 无差异、未改任何东西）。
+async function reconcileOnce() {
+  const actions = []
+
+  // ① 桥对账：以 active 提供方的 wireApi 为期望态
+  try {
+    const doc = loadKeyring()
+    const active = doc.providers.find((p) => p.id === doc.active)
+    if (active !== undefined) {
+      if (active.wireApi !== 'completions') {
+        if (bridgeServer !== null) { closeBridge(); actions.push('bridge:closed') }
+      } else if (bridgeServer === null || !configPointsTo(bridgeBaseUrl)) {
+        // 桥不在、或 config 没指向当前桥 → 交给 writeCodexConfig 一次对齐两件。
+        // 它内部 ensureBridge 是幂等的（先 closeBridge 再起新桥），且这里只在"确实不一致"时才调。
+        await writeCodexConfig(active)
+        actions.push(`bridge:aligned@${bridgeBaseUrl}`)
+      }
+    }
+  } catch (e) { actions.push(`bridge:error:${errMsg(e)}`) }
+
+  // ② 作业探活：仅对内存中 running 的作业判失联（健康作业一律不碰）
+  for (const task of tasks.values()) {
+    if (task.status !== 'running') continue
+    const why = probeTaskLost(task)
+    if (why === null) continue
+    task.reconcileLost = why
+    if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+    actions.push(`task:${task.id}:${why}`)
+  }
+
+  return actions
+}
+
+function stopReconcileTick() {
+  if (reconcileTimer !== null) { clearInterval(reconcileTimer); reconcileTimer = null }
+}
+
+// 常驻对账 tick：启动先跑一次，之后每 RECONCILE_INTERVAL_MS 一次。
+// 幂等可重入：上一轮未结束则跳过（不叠加）；任何异常都不外抛，绝不让对账拖垮宿主。
+function startReconcileTick() {
+  stopReconcileTick()
+  // 可观测性：落一个启动标记，供 se-reconcile-verify.sh 判断"新代码是否已被 Web 加载"。
+  // 没有它，Web 未重启时验收脚本会"空跑通过"（tick 根本没跑）→ 假阳性。
+  try {
+    writeFileSync(join(process.env.HOME || homedir(), '.dsh', 'second-engine-reconcile.started'), `${Date.now()}\n`)
+  } catch { /* best effort */ }
+  const tick = async () => {
+    if (reconcileRunning) return
+    reconcileRunning = true
+    try {
+      const actions = await reconcileOnce()
+      if (actions.length > 0) console.log('[second-engine] reconcile:', actions.join(', '))
+    } catch { /* best effort */ } finally { reconcileRunning = false }
+  }
+  void tick()
+  reconcileTimer = setInterval(() => { void tick() }, RECONCILE_INTERVAL_MS)
+  if (typeof reconcileTimer.unref === 'function') reconcileTimer.unref()
 }
 
 // 让 config.toml 指向正确的上游端点：
@@ -809,39 +942,47 @@ async function handleProviderDelete(req, res) {
 }
 
 // POST /providers/update：编辑既有提供方。apiKey 省略 = 不改，其余字段只更新出现的。
-// 该提供方为 active 且 baseUrl/model 有变化时重写 config.toml（这两个值写在里面）。
+// 该提供方为 active 且 baseUrl/wireApi/model 有变化时重写 config.toml（这些值会影响 config.toml）。
 async function handleProviderUpdate(req, res) {
   try {
     const body = await readBody(req)
+    const ignored = Object.keys(body)
+      .filter((key) => !['id', 'name', 'baseUrl', 'wireApi', 'model', 'apiKey'].includes(key))
     const id = typeof body.id === 'string' ? body.id.trim() : ''
-    if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
+    if (id === '') return send(res, { ok: false, error: 'id 不能为空', ignored }, 400)
     const doc = loadKeyring()
     const target = doc.providers.find((p) => p.id === id)
-    if (target === undefined) return send(res, { ok: false, error: `未找到提供方 '${id}'` }, 404)
+    if (target === undefined) return send(res, { ok: false, error: `未找到提供方 '${id}'`, ignored }, 404)
 
     // 先把请求里出现过的字段全部校验完再落盘，避免校验失败后半更新。
     const patch = {}
     if (body.name !== undefined) {
       const name = typeof body.name === 'string' ? body.name.trim() : ''
-      if (name === '') return send(res, { ok: false, error: 'name 不能为空' }, 400)
+      if (name === '') return send(res, { ok: false, error: 'name 不能为空', ignored }, 400)
       patch.name = name
     }
     if (body.baseUrl !== undefined) {
       const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : ''
       if (!/^https?:\/\//i.test(baseUrl)) {
-        return send(res, { ok: false, error: 'baseUrl 必须以 http:// 或 https:// 开头' }, 400)
+        return send(res, { ok: false, error: 'baseUrl 必须以 http:// 或 https:// 开头', ignored }, 400)
       }
       patch.baseUrl = baseUrl
     }
+    if (body.wireApi !== undefined) {
+      const wireApi = typeof body.wireApi === 'string' ? body.wireApi.trim() : ''
+      const wireErr = wireApiError(wireApi)
+      if (wireErr !== null) return send(res, { ok: false, error: wireErr, ignored }, 400)
+      patch.wireApi = wireApi
+    }
     if (body.model !== undefined) {
       const model = typeof body.model === 'string' ? body.model.trim() : ''
-      if (model === '') return send(res, { ok: false, error: 'model 不能为空' }, 400)
+      if (model === '') return send(res, { ok: false, error: 'model 不能为空', ignored }, 400)
       patch.model = model
     }
     // apiKey 省略 = 保持原值；显式传空串属于误用（不修改就不该带这个字段）。
     if (body.apiKey !== undefined) {
       const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
-      if (apiKey === '') return send(res, { ok: false, error: 'apiKey 不能为空（不修改请省略该字段）' }, 400)
+      if (apiKey === '') return send(res, { ok: false, error: 'apiKey 不能为空（不修改请省略该字段）', ignored }, 400)
       patch.apiKey = apiKey
     }
 
@@ -856,11 +997,11 @@ async function handleProviderUpdate(req, res) {
     if (updated.length > 0) saveKeyring(doc)
 
     let configRegenerated = false
-    if (doc.active === id && (updated.includes('baseUrl') || updated.includes('model'))) {
+    if (doc.active === id && (updated.includes('baseUrl') || updated.includes('wireApi') || updated.includes('model'))) {
       await writeCodexConfig(target)
       configRegenerated = true
     }
-    send(res, { ok: true, id, updated, configRegenerated })
+    send(res, { ok: true, id, updated, ignored, configRegenerated })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -1062,9 +1203,15 @@ function taskView(task) {
     view.maxRounds = Number.isInteger(task.maxRounds) ? task.maxRounds : REVIEW_DEFAULT_ROUNDS
     view.verdict = typeof task.verdict === 'string' ? task.verdict : ''
     view.rounds = Array.isArray(task.rounds) ? task.rounds : []
+    // ⑤ 硬预算：「是哪道刹车生效」必须能从外部看出来（converged|rounds|wallclock|tokens|loop），
+    // 否则事后无法判断是正常收敛还是被预算掐断；振荡时另给命中的历史轮次。
+    if (typeof task.stopReason === 'string' && task.stopReason !== '') view.stopReason = task.stopReason
+    if (Number.isInteger(task.loopWithRound)) view.loopWithRound = task.loopWithRound
   }
   if (task.stuckSuspect === true) view.stuckSuspect = true
   if (task.lastSignal) view.lastSignal = task.lastSignal
+  // ① 对账 tick 判失联的原因（'process-gone' | 'pid-reused'）——不暴露就没法验收探活。
+  if (typeof task.reconcileLost === 'string' && task.reconcileLost !== '') view.reconcileLost = task.reconcileLost
   if (typeof task.error === 'string' && task.error !== '') view.error = task.error
   return view
 }
@@ -1104,6 +1251,11 @@ function outFileMtimeMs(outPath) {
 // 复核每轮换新的 outPath，检查时按 task.outPath 动态取值，故 interval 可跨越整个任务生命周期。
 function startWatchdog(task) {
   if (task.watchdog !== null && task.watchdog !== undefined) return
+  // 顺带固定子进程身份（对账 tick 判失联用）：只在首次记录，重复调用不覆盖。
+  if (task.childPid === undefined && task.child !== null && task.child !== undefined) {
+    task.childPid = Number.isInteger(task.child.pid) ? task.child.pid : null
+    task.childStart = readProcStartTime(task.childPid)
+  }
   task.activityAt = Date.now()
   task.watchdog = setInterval(() => {
     try {
@@ -1302,7 +1454,7 @@ async function handleTaskCreate(req, res) {
       // 提示词改走 stdin（'-' 占位）：argv 不再携带正文。2026-09-24 实证：prompt 以 argv
       // 出现在 /proc/<pid>/cmdline 时，工单若执行 pkill -f <模式>（如 dsh-browser 的
       // headless_shell 拼接串）会命中父进程自身 → 自杀（三单 76/97.5/101.3s 死亡的真因，
-      // 见 /root/proj/se-exec-owner-report.md）。
+      // 见 既有 owner 排查记录）。
       '-',
     ]
     // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。
@@ -1519,8 +1671,12 @@ function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
   child.stdin?.write(prompt)
   child.stdin?.end()
   // 同 handleTaskCreate：pipe 无人消费会被长输出塞满 → codex 写阻塞假死，必须持续排空。
-  child.stdout?.resume()
-  child.stderr?.resume()
+  // 这里顺带**只留尾部 8KB**：既排空了管道，又能从尾巴上抽 codex 自报的 "tokens used"
+  // —— 这是 token 硬预算的数据来源，**别改回 resume()**（那样就拿不到用量了）。
+  let tail = ''
+  const keepTail = (buf) => { tail = (tail + buf.toString()).slice(-8192) }
+  child.stdout?.on('data', keepTail)
+  child.stderr?.on('data', keepTail)
   const wait = new Promise((resolve) => {
     let settled = false
     const done = (code) => {
@@ -1532,7 +1688,7 @@ function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
     // spawn 失败（二进制缺失等）不触发 exit，这里兜底。
     child.on('error', () => done(-1))
   })
-  return { child, wait }
+  return { child, wait, getUsage: () => parseTokensUsed(tail) }
 }
 
 // 读一轮的 -o 输出并删除文件（逐轮清理，不把中间产物留在 ~/.codex）。
@@ -1543,24 +1699,70 @@ function readReviewOut(outPath) {
   return text
 }
 
+// 从 codex exec 输出尾部抽 "tokens used\nN"（codex 自报的累计用量）。
+// 抽不到返回 0 —— 宁可少算也不误停（硬预算语义是"到量才停"，不是"猜一个"）。
+function parseTokensUsed(text) {
+  if (typeof text !== 'string' || text === '') return 0
+  const m = /tokens used\s*\n?\s*([\d,]+)/i.exec(text)
+  if (m === null) return 0
+  const n = Number(m[1].replace(/,/g, ''))
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+// 振荡检测用的稳定指纹：只取 issues 的三个语义字段，排序后哈希（顺序无关）。
+// 两个 AI 在「主张 X / 反对 X」之间来回时，同一批 issues 会原样回来 → 命中即判循环。
+function issuesHash(issues) {
+  const norm = (Array.isArray(issues) ? issues : []).map((i) => [
+    String(i?.severity ?? '').trim(),
+    String(i?.point ?? '').trim(),
+    String(i?.suggestion ?? '').trim(),
+  ])
+  norm.sort((a, b) => (a.join('\u0000') < b.join('\u0000') ? -1 : 1))
+  return createHash('sha256').update(JSON.stringify(norm)).digest('hex').slice(0, 16)
+}
+
 // 服务层自动循环：每轮 spawn → 解析 → 按 issues/轮数推进，cancelled 即熔断。
 async function runReview(task, active) {
   const envKey = `${active.id.toUpperCase()}_API_KEY`
+  // 硬预算（2026-10-03 补）：墙钟与累计 token 任一先到即停。
+  // "无新增即收敛"降级为**提前停止的一种**，不再是唯一终止条件。
+  const wallMs = Number.isFinite(task.wallMs) && task.wallMs >= REVIEW_MIN_WALL_MS ? task.wallMs : REVIEW_DEFAULT_WALL_MS
+  const tokenLimit = Number.isFinite(task.tokenLimit) && task.tokenLimit >= REVIEW_MIN_TOKEN_LIMIT ? task.tokenLimit : REVIEW_DEFAULT_TOKEN_LIMIT
+  const startedAt = Date.now()
+  const seenHashes = new Map()   // issuesHash → round，振荡检测用
+  let tokensUsed = 0
   try {
     for (;;) {
       if (task.status === 'cancelled' || task.cancelled === true) break
       const round = task.rounds.length + 1
       if (round > task.maxRounds) break
       task.round = round
+      // ── 进轮前先判硬预算（第一轮不拦：连一轮都没跑就停没有意义）──
+      if (round > 1) {
+        if (Date.now() - startedAt >= wallMs) {
+          task.stopReason = 'wallclock'
+          finalizeReview(task, 'done', 'wallclock')
+          void notifyTask(task)
+          return
+        }
+        if (tokensUsed >= tokenLimit) {
+          task.stopReason = 'tokens'
+          finalizeReview(task, 'done', 'tokens')
+          void notifyTask(task)
+          return
+        }
+      }
       const prev = task.rounds.length > 0 ? task.rounds[task.rounds.length - 1] : null
       const prompt = buildReviewPrompt(task.content, prev)
       const outPath = join(CODEX_DIR, `review-${task.id}-r${round}.out`)
       task.outPath = outPath
       // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
       task.activityAt = Date.now()
-      const { child, wait } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
+      const { child, wait, getUsage } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
       task.child = child
       const code = await wait
+      // 本轮 codex 自报用量累加进总账（抽不到记 0 —— 宁可少算也不误停）。
+      tokensUsed += getUsage()
       task.child = null
       task.exitCode = task.cancelled === true ? -1 : code
       const raw = readReviewOut(outPath)
@@ -1579,18 +1781,31 @@ async function runReview(task, active) {
         verdict: parsed.issues.length === 0 ? 'converged' : parsed.verdict,
       })
       if (parsed.issues.length === 0) {
+        task.stopReason = 'converged'
         finalizeReview(task, 'done', 'converged')
         void notifyTask(task)
         return
       }
+      // ── 振荡检测：本轮 issues 与历史某轮完全一致 → 判循环、立即停 ──
+      const h = issuesHash(parsed.issues)
+      if (seenHashes.has(h)) {
+        task.stopReason = 'loop'
+        task.loopWithRound = seenHashes.get(h)
+        finalizeReview(task, 'done', `loop(与第 ${seenHashes.get(h)} 轮相同)`)
+        void notifyTask(task)
+        return
+      }
+      seenHashes.set(h, round)
       if (round >= task.maxRounds) {
         // 轮数用尽仍有问题：最后一轮 issues 已在 rounds 里，打包交用户裁决。
+        task.stopReason = 'rounds'
         finalizeReview(task, 'done', 'max-rounds')
         void notifyTask(task)
         return
       }
     }
     // 走到这里只可能是被取消（cancelled → 熔断退出）。
+    task.stopReason = 'cancelled'
     finalizeReview(task, 'cancelled', 'cancelled')
   } catch (e) {
     finalizeReview(task, 'error', 'error', errMsg(e))
@@ -1636,6 +1851,9 @@ async function handleReviewCreate(req, res) {
       outPath: '',
       cancelled: false,
       stuckSuspect: false,
+      // 硬预算（可由配置覆盖）—— runReview 里再用缺省值兜底。
+      wallMs: doc.reviewWallMs,
+      tokenLimit: doc.reviewTokenLimit,
     }
     tasks.set(id, task)
     pruneTasks()
@@ -1681,7 +1899,7 @@ async function handleTaskRoot(req, res) {
 async function handleConfigGet(_req, res) {
   try {
     const doc = loadKeyring()
-    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES })
+    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit, wallMsMin: REVIEW_MIN_WALL_MS, tokenLimitMin: REVIEW_MIN_TOKEN_LIMIT })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -1692,10 +1910,29 @@ async function handleConfigSet(req, res) {
     if (!REVIEW_ROUNDS_CHOICES.includes(rounds)) {
       return send(res, { ok: false, error: `reviewRounds 只支持 ${REVIEW_ROUNDS_CHOICES.join(' / ')}` }, 400)
     }
+    // 硬预算为**可选**字段：传了才改，且拒绝过小值（避免"0 预算"让互审一进去就停）。
+    let wallMs = null
+    if (body.reviewWallMs !== undefined && body.reviewWallMs !== null) {
+      const n = Number(body.reviewWallMs)
+      if (!Number.isFinite(n) || n < REVIEW_MIN_WALL_MS) {
+        return send(res, { ok: false, error: `reviewWallMs 必须是不小于 ${REVIEW_MIN_WALL_MS} 的数字（毫秒）` }, 400)
+      }
+      wallMs = Math.floor(n)
+    }
+    let tokenLimit = null
+    if (body.reviewTokenLimit !== undefined && body.reviewTokenLimit !== null) {
+      const n = Number(body.reviewTokenLimit)
+      if (!Number.isFinite(n) || n < REVIEW_MIN_TOKEN_LIMIT) {
+        return send(res, { ok: false, error: `reviewTokenLimit 必须是不小于 ${REVIEW_MIN_TOKEN_LIMIT} 的数字` }, 400)
+      }
+      tokenLimit = Math.floor(n)
+    }
     const doc = loadKeyring()
     doc.reviewRounds = rounds
+    if (wallMs !== null) doc.reviewWallMs = wallMs
+    if (tokenLimit !== null) doc.reviewTokenLimit = tokenLimit
     saveKeyring(doc)
-    send(res, { ok: true, reviewRounds: rounds })
+    send(res, { ok: true, reviewRounds: rounds, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -1937,6 +2174,15 @@ export function apply(ctx) {
     ctx.effect(() => stopAutoCleanup, 'second-engine: auto cleanup teardown')
   } catch {
     try { process.on('exit', stopAutoCleanup) } catch { /* best effort */ }
+  }
+
+  // 期望态对账 tick（见 startReconcileTick 注释）：治「Web 重启后桥消失、config 仍指旧端口」。
+  // 启动即跑一轮，之后每 7s 一次；只对差异动手，幂等。
+  startReconcileTick()
+  try {
+    ctx.effect(() => stopReconcileTick, 'second-engine: reconcile tick teardown')
+  } catch {
+    try { process.on('exit', stopReconcileTick) } catch { /* best effort */ }
   }
 
   // 设置页 API：webServer 后挂载时也能注册；无 webServer 的 profile 自然不注册。

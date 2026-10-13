@@ -1,7 +1,7 @@
 /**
  * app-server 客户端（stdio JSON-RPC，零依赖）—— second-engine 的 app-server 执行模式。
  *
- * 协议事实来源：~/proj/appserver-spike/FINDINGS.md + run1.log（Codex T4 实测，2026-09-27）
+ * 协议事实来源：app-server 协议实测记录（Codex T4，2026-09-27）
  *   initialize → initialized → thread/start → turn/start → 事件流 → turn/completed
  *   interrupt: turn/interrupt {threadId, turnId}
  *
@@ -80,7 +80,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
     }
     if (!msg.method) return
     const p = msg.params || {}
-    // 归一化 envelope 按 T6 的 appserver-spike/MAPPING.md：{kind,text,tool,usage,done,meta}
+    // 归一化 envelope 按 T6 的 映射表：{kind,text,tool,usage,done,meta}
     const base = {
       threadId: p.threadId ?? threadId,
       turnId: p.turnId ?? turnId,
