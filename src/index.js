@@ -1287,6 +1287,19 @@ function finalizeTask(task, exitCode, status) {
   try { task.output = readFileSync(task.outPath, 'utf8') } catch { task.output = '' }
   try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成，忽略 */ }
   task.endedAt = Date.now()
+  // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
+  // 关联用时间窗口（consults 是内存队列、无 taskId）：at >= startedAt 即属本次任务。
+  try {
+    const started = typeof task.startedAt === 'number' ? task.startedAt : 0
+    const fresh = consults.filter(c => typeof c.at === 'number' && c.at >= started)
+    if (fresh.length > 0) {
+      const block = fresh.map(c =>
+        `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
+      ).join('\n')
+      task.output = `${task.output === '' ? '' : `${task.output}\n\n`}---\n`
+        + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
+    }
+  } catch { /* best effort：求助追加绝不影响收尾 */ }
   return true
 }
 
@@ -1319,6 +1332,20 @@ function finalizeReview(task, status, verdict, error) {
   task.verdict = verdict
   task.error = typeof error === 'string' ? error : ''
   task.endedAt = Date.now()
+  // 与 finalizeTask 同一段逻辑：互审是**最容易绕圈求助**的场景，这里不能漏。
+  // 本任务期间的求助按时间窗口关联（consults 是内存队列、无 taskId）：at >= startedAt 即属本次。
+  try {
+    const started = typeof task.startedAt === 'number' ? task.startedAt : 0
+    const fresh = consults.filter(c => typeof c.at === 'number' && c.at >= started)
+    if (fresh.length > 0) {
+      const block = fresh.map(c =>
+        `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
+      ).join('\n')
+      const base = typeof task.output === 'string' ? task.output : ''
+      task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
+        + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
+    }
+  } catch { /* best effort：求助追加绝不影响收尾 */ }
   return true
 }
 
