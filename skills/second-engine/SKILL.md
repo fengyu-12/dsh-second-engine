@@ -41,7 +41,7 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 ```
 
 ## 引擎现状（2026-09-21 发布版实测）
-- 二进制 `/usr/local/bin/codex`（**当前 0.158.0**，musl 静态；2026-09-28 由 0.156.1 换源升级——npmmirror 平台包 + sha512 校验，200MB 单文件；方法见 RESTORE 月志）；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**
+- 二进制 `/usr/local/bin/codex`（**当前 0.162.1**，musl 静态；2026-10-11 复验：工具面 / 执行链 / 依赖点三条全过）；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**
 - 提供方与 key 由插件统一管理：`~/.codex/keyring.json`（0600，**不要手改**），激活提供方切换时自动重写 `~/.codex/config.toml`（**不要手改**，sandbox_mode 已自动保留）
 - 预设三家均实测直连：DeepSeek（responses）/ 智谱（responses，Coding 端点）/ 云知声（chat，经本地翻译桥自动挂接）
 
