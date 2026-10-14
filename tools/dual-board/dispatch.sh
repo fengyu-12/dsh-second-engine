@@ -258,9 +258,21 @@ def main():
     if not args.task or not args.task.strip():
         usage(parser)
         return 2
-    if not Path(args.workdir).is_dir():
-        print(f"workdir 不存在或不是目录: {args.workdir}", file=sys.stderr)
+    # workdir 安全校验（2026-10-14 事故）：默认值 "." 是相对路径，按 Web 进程 cwd
+    # 解析会落到 $HOME；插件的 ensureGitBaseline 会在那里 git init + add -A，
+    # 把整张家目录（含 .ssh/.dsh 凭据）加进 git 索引。故：必须绝对路径 + 禁止家/根。
+    if not os.path.isabs(args.workdir):
+        print(f"--workdir 必须是绝对路径（收到 {args.workdir!r}；相对路径会按 Web 进程 cwd 解析，可能落到 $HOME）", file=sys.stderr)
+        return 2
+    wd = os.path.realpath(args.workdir)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if wd in (home, os.path.dirname(home), "/"):
+        print(f"--workdir 不允许指向 {wd}（插件会在该目录 git init + git add -A）", file=sys.stderr)
+        return 2
+    if not os.path.isdir(wd):
+        print(f"workdir 不存在或不是目录: {wd}", file=sys.stderr)
         return 1
+    args.workdir = wd
 
     scopes = [s for s in args.scope.split(",") if s.strip()]
 

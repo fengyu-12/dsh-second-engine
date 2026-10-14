@@ -36,7 +36,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync
 import { spawn, execSync, execFile } from 'node:child_process'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import http from 'node:http'
-import { join } from 'node:path'
+import { join, resolve, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
@@ -93,7 +93,7 @@ const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
 // 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
 const tasks = new Map()
-const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(homedir(), 'proj')
+const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || '/root/proj'
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
 
@@ -104,7 +104,7 @@ const consults = []
 const CONSULT_KEEP_LIMIT = 20
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
-const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(homedir(), '.dsh'), '.bridge_token')
+const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || '/root/.dsh', '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
 // ── 双向互审（review）──
@@ -433,7 +433,7 @@ function extractMcpServerBlocks() {
 // 用黑名单而非白名单：白名单每出现一种新段就要补一次名单，漏补 = 静默丢配置。
 // 2026-10-02 实证：旧白名单只保留 mcp_servers.*，切一次提供方就把 [features] 整段丢掉，
 // memories / multi_agent_v2 / network_proxy / recommended_plugins 全部回到默认 false，
-// [projects."<工作目录>"] 的 trust_level 也一并消失，且全程零报错。
+// [projects."/root/proj"] 的 trust_level 也一并消失，且全程零报错。
 //
 // memories 也归模板管：它的两个模型字段必须跟随当前提供方。缺省时 Codex 会去挑
 // 内置目录里的 OpenAI 模型名，落到第三方提供方上就是「模型不存在，请检查模型代码」，
@@ -694,7 +694,7 @@ function startReconcileTick() {
   // 可观测性：落一个启动标记，供 se-reconcile-verify.sh 判断"新代码是否已被 Web 加载"。
   // 没有它，Web 未重启时验收脚本会"空跑通过"（tick 根本没跑）→ 假阳性。
   try {
-    writeFileSync(join(process.env.HOME || homedir(), '.dsh', 'second-engine-reconcile.started'), `${Date.now()}\n`)
+    writeFileSync(join(process.env.HOME || '/root', '.dsh', 'second-engine-reconcile.started'), `${Date.now()}\n`)
   } catch { /* best effort */ }
   const tick = async () => {
     if (reconcileRunning) return
@@ -1376,8 +1376,15 @@ function gitCommitEnv(workdir) {
 
 function ensureGitBaseline(workdir) {
   try {
-    if (existsSync(join(workdir, '.git'))) return
-    execSync('git init && git add -A && git commit --allow-empty -m "second-engine 基线"', { cwd: workdir, env: gitCommitEnv(workdir) })
+    const wd = resolve(workdir)
+    const home = homedir()
+    // 护栏（2026-10-14 事故）：绝不在家目录/根/含运行数据的目录里 git init + git add -A。
+    // 复盘：调用方传了相对路径 "."，按 Web 进程 cwd 解析成 /root，于是把整张家目录
+    //（含 .ssh/qq_access、.dsh/creds/*、.codex/*）加进了 git 索引。
+    if (wd === home || wd === dirname(home) || wd === '/') return
+    if (/(^|\/)(\.ssh|\.dsh|\.codex|\.gnupg|\.config)(\/|$)/.test(wd)) return
+    if (existsSync(join(wd, '.git'))) return
+    execSync('git init && git add -A && git commit --allow-empty -m "second-engine 基线"', { cwd: wd, env: gitCommitEnv(wd) })
   } catch { /* best effort：基线失败不影响任务本身 */ }
 }
 
@@ -1481,7 +1488,7 @@ async function handleTaskCreate(req, res) {
       // 提示词改走 stdin（'-' 占位）：argv 不再携带正文。2026-09-24 实证：prompt 以 argv
       // 出现在 /proc/<pid>/cmdline 时，工单若执行 pkill -f <模式>（如 dsh-browser 的
       // headless_shell 拼接串）会命中父进程自身 → 自杀（三单 76/97.5/101.3s 死亡的真因，
-      // 见 既有 owner 排查记录）。
+      // 见 /root/proj/se-exec-owner-report.md）。
       '-',
     ]
     // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。

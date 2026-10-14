@@ -279,36 +279,39 @@ def cmd_set(a) -> None:
 
 
 def cmd_ready(a) -> None:
-    """列出现在可以开工的任务：status == pending 且 blocked_by 全部 completed。
+    """列出现在可以开工的任务：status ∈ {pending, blocked} 且 blocked_by 全部 completed。
 
+    与 cmd_claim 的状态门对齐（claim 接受 pending|blocked）：blocked 是「挂起待续」（协议 §12.1），
+    前置齐了就该能被派，不能从 ready 里无声消失。
     只读：不加锁、不写盘、不改 revision、无任何副作用。
     依赖判定复用既有 done/missing 语义（与 check_deps 一致）。
     """
     data = load_board()
     done = {t["id"] for t in data["tasks"] if t.get("status") == "completed"}
-    ready = []
+    ready, blocked = [], []
     for t in data["tasks"]:
-        if t.get("status") != "pending":
+        if t.get("status") not in ("pending", "blocked"):
             continue
-        if [b for b in t.get("blocked_by") or [] if b not in done]:
-            continue
-        ready.append(t)
+        missing = [b for b in t.get("blocked_by") or [] if b not in done]
+        (blocked if missing else ready).append((t, missing))
 
     if getattr(a, "json", False):
         print(json.dumps({
             "revision": data.get("revision"),
             "ready": [{"id": t.get("id"), "subject": t.get("subject", ""),
                        "blocked_by": t.get("blocked_by") or [], "owner": t.get("owner") or ""}
-                      for t in ready],
+                      for t, _ in ready],
+            "blocked": [{"id": t.get("id"), "subject": t.get("subject", ""), "missing": miss}
+                        for t, miss in blocked],
         }, ensure_ascii=False, indent=2))
         return
 
-    for t in ready:
+    for t, _ in ready:
         print("%-10s %-40s blocked_by=%-20s owner=%s" % (
             t.get("id", "-"), (t.get("subject") or "")[:40],
             ",".join(t.get("blocked_by") or []) or "-", t.get("owner") or "-"))
-    print("ready: %d / tasks: %d / revision: %s" % (
-        len(ready), len(data["tasks"]), data.get("revision")))
+    print("ready: %d / blocked: %d / tasks: %d / revision: %s" % (
+        len(ready), len(blocked), len(data["tasks"]), data.get("revision")))
 
 
 def cmd_show(a) -> None:

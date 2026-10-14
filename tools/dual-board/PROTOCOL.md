@@ -149,7 +149,7 @@ board.sh scope-check <task id> --workdir <dir>
 
 **6. 体检**：`board.sh doctor` 检查锁残留、schema 缺字段、状态与 owner 不一致、completed 无 result。建议每次合账前跑一次。
 
-**7. 派单前先看 `ready`（v1.4 新增）**：主循环每轮派单前跑一次 `board.sh ready`，只从输出里挑**前置已满足**的下一步；`blocked_by` 未满足的任务不会出现在输出里。`claim` 的依赖门（退出码 4）是**拒绝**，`ready` 是**引导**，两者互补。空态（无可派任务）打印 `ready: 0 / tasks: N / revision: R` 并**退出码 0**（「现在没活」是正常态，不是错误）。
+**7. 派单前先看 `ready`（v1.4 新增）**：主循环每轮派单前跑一次 `board.sh ready`，只从输出里挑**前置已满足**的下一步；`blocked_by` 未满足的任务不会出现在输出里。`claim` 的依赖门（退出码 4）是**拒绝**，`ready` 是**引导**，两者互补。输出形态 `ready: R / blocked: B / tasks: N / revision: V`：**列 `pending` 与 `blocked`（前置已满足）两类**——`claim` 本就接受 `pending|blocked`，两者不该分叉；`--json` 另给 `blocked[]`（带 `missing` 原因），用于区分「没活」与「全被挡住」。空态打印 `ready: 0 / blocked: 0 / …` 并**退出码 0**（正常态，不是错误）。
 
 ## 十、时间基准（v1.2 裁定）
 

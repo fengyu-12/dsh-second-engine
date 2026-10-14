@@ -1,8 +1,5 @@
 # dsh-second-engine
 
-> **English**: Plug OpenAI Codex CLI into DeepSeek Harness as a *second agent* — async work orders, adversarial review, a shared terminal↔web session bridge, and a file-based task board. Design notes live in `docs/`.
-
-
 > 🚀 **你的 AI 也能拥有自己的 AI**：装一个插件、再装个 223MB 的 Codex CLI，你的 DeepSeek Harness 里就多了一位 7×24 待命的**第二引擎**——主 AI 干累了可以「让 Codex 试试」，写完代码自动互审挑刺，卡住还会主动喊救命。一个手机，两颗大脑，你只管裁决。
 
 | 平台 | 状态 |
@@ -16,15 +13,6 @@
 
 在同一台 Android 设备的 DSHA 容器（Ubuntu / proroot）里，主 AI（DSH）与 Codex 双引擎并存：主 AI 编排与审核，Codex 独立复核、并行下探、提供异构第二意见——三者各司其职：**Codex 生产 · 主 AI 编排审核 · 用户裁决**。
 
-## 为什么值得装：让 agent 住进一个「宿主」
-
-单装一个 CLI agent，你得到的是一条命令行；装进 DSH，你得到的是**一个能管它、能看它、能叫醒它、还能让它们互相派活的宿主** —— 本插件真正提供的是**调度与编排层**：
-
-- **有 UI**：设置页就是它的控制台 —— 引擎状态灯、模型提供方管理、模型拉取、会话清理，都在手机上点。
-- **有通知**：工单跑完、Codex 卡点求助，走 App 通知找你，不必守着终端。
-- **能被手机系统调用**：Android 沙箱把 App 切碎、每个 App 各装一套依赖；DSH 的 proot 容器提供一个**共享 Linux 环境**，agent 直接用它现成的 Python / Node / 工具链，插件本体仅 0.3MB —— 它带来的是调度器，不是又一轮部署。
-- **能互相派活**：主 AI 与 Codex 互相下发工单、互审产出、互为备份 —— 主 AI 装插件/写配置出问题时，Codex 有完整 shell 可以接手排查修复；反过来 Codex 卡住走 consult 协议喊救命，主 AI 带建议回来，谁都能救谁。
-
 ## 功能
 
 - **设置面板**（DSH 设置 → 第二引擎）
@@ -36,8 +24,15 @@
 - **异步工单**：面板直接下发任务（后台 `codex exec`），完成经 App 通知提醒，支持取消
 - **双向互审**：把产出交给 Codex 做多轮批判性复核（轮数上限 / 零新增提前收敛 / 分歧打包上交用户 / 任意时刻熔断），轮数在面板设置
 - **卡点求助协议**：插件自动向 `~/.codex/AGENTS.md` 写入协作协议——Codex 连续失败或绕圈时主动调 `/api/consult` 提交卡点并通知，主 AI 带建议接手
-- **本地翻译桥**（实验性）：`responses → chat completions` 协议转换，让仅有 chat 协议的提供方（云知声 / 任意 OpenAI 兼容端点）也能接入 Codex
+- **本地翻译桥**（实验性）：`responses → chat completions` 协议转换，让仅有 chat 协议的提供方（云知声 / 部分中转）也能接入 Codex
 - **知识层**：随包分发 SKILL.md，主 AI 自动获得唤起与协作流程（工单下发、diff 审查、异常速查）
+
+## 环境单例 —— 安卓上的 PC 式双引擎
+
+Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各部署一遍。本插件逆着这个模型，把 DSHA 容器变成**双引擎共用的环境单例**：
+
+- **Codex 不自带依赖**：工单里跑的每条命令直接使用容器现成的 Python / Node / 工具链 / 词库（55 个沉淀脚本即取即用），插件本体仅 0.3MB——它只是环境的调度器，不是又一轮部署；
+- **双引擎互为备份**：主 AI 装插件/写配置出问题时，Codex 有完整 shell 可以接手排查修复；反过来 Codex 卡住走 consult 协议喊救命，主 AI 带建议回来——谁都能救谁。
 
 ## 双引擎分工
 
@@ -47,19 +42,17 @@
 | DSH 主 AI | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
-## 协作看板（dual-board，v1.4 · 2026-10-14）
+## 协作看板（dual-board，v1.3 · 2026-09-27）
 
-长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `trace_search.py` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `<工作目录>/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `<工作目录>/AGENTS.md` 自动注入，无需人工提醒）：
+长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `/root/proj/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `/root/proj/AGENTS.md` 自动注入，无需人工提醒）：
 
 - **写板唯一入口 `board.sh`**（v1.2 起）：CAS + O_EXCL 锁 + 原子写 + 状态机 + JSONL 归档 + `doctor` 体检都在工具里，**手改 `board.json` 视为破坏协议**。退出码即语义（3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。
-- **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit、工作区脏快照与 `write_scopes` 的 sha256 快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
+- **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit 与工作区脏快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
 - **看板**：`board.json` —— 状态 `pending / in_progress / blocked / completed / abandoned`（**无 reopen**，completed 不可复改）；工单三字段：`task`（用户原话，不可变）/ `context`（主 AI 解读）/ `frame`（质疑前提是分内事，由工具自动写入）。
 - **收件箱**：`inbox-codex.md` / `inbox-lead.md` 双向留言（经 `board.sh inbox-append`），已读标注 + 按月 JSONL 转档（`archive/`）；交付必含四段：交付 / **异议位** / 下一步建议 / 自验。
 - **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
 - **可视化**：浏览器聊天桥（3095）的会话列表抽屉 = 成员会话切换，终端/网页/主 AI 三方同链。
-- ✅ **scope 校验（v1.2 起）**：派单时对 `write_scopes` 记 sha256 快照，交付后比对——**「派单前就脏、之后又被改」不再漏报**（协议 §十一 那条限制已解）；workdir 无 git 时降级为哈希校验，不再直接判「未验证」。
-- ✅ **`board.sh ready`（v1.4 起）**：只读列出「前置已满足、现在可开工」的下一步（`--json` 可选；空态打印 `ready: 0` 且**退出码 0**）。`claim` 的依赖门是**拒绝**、`ready` 是**引导**——派单前先跑它，不再靠「想起来」。
-- ✅ **过程级检索 `trace_search.py`（v1.4 起）**：跨会话翻前人的**执行过程**（`list` / `search --exclude-session` / `get --steps`），只读 + 流式 + 纯标准库；协议 §十三，含「不得检索/转述凭证」纪律。
+- ⚠️ **已知限制**：脏工作区下 scope 校验会漏报（协议 §十一）；给 Codex 的 workdir 尽量干净。
 
 ## 前置要求
 
@@ -82,12 +75,12 @@ codex --version   # 验证
 
 ```bash
 # 1. 放置插件实体
-cp -a dsh-second-engine <插件目录>
-cd <插件目录> && npm install --omit=dev
+cp -a dsh-second-engine /root/dsha-second-engine
+cd /root/dsha-second-engine && npm install --omit=dev
 
-# 2. 注册进 profile（link: 方式，指向插件实体目录）
+# 2. 注册进 profile（link: 方式，须指向 /root/dsha-* 实体）
 cd ~/.dsh/profiles/web
-#   package.json: dependencies 加 "dsh-second-engine": "link:<插件目录>"
+#   package.json: dependencies 加 "dsh-second-engine": "link:/root/dsha-second-engine"
 #   dsh.profile.bundles 数组加 "dsh-second-engine"
 pnpm install
 
@@ -105,7 +98,7 @@ pnpm install
 
 | 动作 | 方式 |
 |---|---|
-| **启动** | 终端页敲 `codex-env`（自动注入激活提供方的 Key → 进入 <工作目录> → 拉起 TUI）|
+| **启动** | 终端页敲 `codex-env`（自动注入激活提供方的 Key → 进入 /root/proj → 拉起 TUI）|
 | **退出** | `Ctrl+D` 或输入 `/quit` |
 | **取桥网址** | `codex-env -u`（只打印网址、不进 TUI、不注入 Key）；或 `cat <桥目录>/.url`（桥目录＝运行实例目录，默认 `bridge/web/`） |
 | **网页聊天桥** | 浏览器打开取到的网址（`127.0.0.1:3095`，自带 token 鉴权，等于密码别外传）；终端 TUI 与网页**共享同一批会话** |
@@ -142,7 +135,7 @@ curl -s "$W/second-engine/api/status"                       # 自检: {"ok":true
 
 curl -s -X POST "$W/second-engine/api/task" \
      -H 'Content-Type: application/json' \
-     -d '{"prompt":"<自包含工单>","workdir":"<工作目录>","ephemeral":true}'   # → {"id":"..."} 立即返回
+     -d '{"prompt":"<自包含工单>","workdir":"/root/proj","ephemeral":true}'   # → {"id":"..."} 立即返回
 ```
 
 - ⚠️ **不要用 App 设备桥的端口**（`/app/*`：读屏/点按/截屏/通知那套）去拼插件路由：那不是插件路由，未知路径会被当 shell 命令执行，返回
@@ -151,14 +144,14 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v2.6）
+## 支持能力一览（v1.2.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| 配置保留段（切提供方不丢） | ✅ v1.2.1 修复 | 重写 `config.toml`（切提供方 / 改配置）时，**只排除模板自有的 `[model_providers.*]` 与 `[memories]`，其余段一律原样保留**（黑名单式）；此前白名单式重写会把 `[features]` / `[tui]` / `[projects.*]` 静默抹掉且全程不报错 |
-| 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用，原来只有触屏纵向）+ 松手吸附最近的左右边缘（维持半露圆球形态）+ 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
-| scope-check 脏工作区 | ✅ v1.2 修复 | 派单时对 `write_scopes` 记 sha256 快照，交付后比对——**「派单前就脏、交付后又被改」不再漏报**；workdir 无 git 时降级为哈希校验，而非直接判「未验证」 |
-| Codex 功能表 | ✅ v1.2 | `skills/second-engine/Codex功能表.md`：feature 开关、版本变更日志、升级后检查清单、三条插件已知限制，随包分发 |
+| 配置保留段（切提供方不丢） | ✅ v1.2.1 修复 | 重写 `config.toml` 时改用**黑名单**：只排除模板自有的 `[model_providers.*]` 与 `[memories]`，其余段一律原样保留；此前白名单式重写会把 `[features]` / `[tui]` / `[projects.*]` 静默抹掉且不报错 |
+| 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用）+ 松手吸附最近左右边缘 + 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
+| scope-check 脏工作区 | ✅ v1.2 修复 | 派单时记 `write_scopes` 的 sha256 快照，交付后比对——「派单前就脏、之后又被改」不再漏报；无 git 时降级为哈希校验 |
+| Codex 功能表 | ✅ v1.2 | `skills/second-engine/Codex功能表.md` 随包分发 |
 | 提供方切换 / 工单 / 双向互审 | ✅ | DeepSeek / 智谱直连，云知声经翻译桥；切换不丢用户配置（sandbox、MCP） |
 | AGENTS.md 联网搜索三档降级 | ✅ v2 | 原生 web_search 优先 → Exa MCP 备胎 → 全无则凭已有知识完成任务并标注「未经联网核实」；v1 用户自动原位升级 |
 | tools/t-tool.sh | ✅ 实测 | tmux 交互窗口：屏幕快照、哨兵式等待、`run` 退出码回传、owner 防串台；**依赖 tmux**（`apt install tmux`） |
@@ -167,12 +160,6 @@ curl -s -X POST "$W/second-engine/api/task" \
 | 面板「联网搜索与 MCP」分区 | ✅ v0.3.4 | web_search 开关（live↔disabled）与 MCP 增删直接落 config.toml；八项验收 + 切提供方持久性 + 智谱端到端原生搜索实测通过 |
 | 工单审批策略 | ✅ v0.3.4 修复 | `approval_policy="never"` 固定写入 config；此前字段丢失曾致写工作副本外目录的工单无限挂起 |
 | 面板交互 | ✅ v1.0 | 分区折叠（右上角「展开/收回」带框文字按钮 + 标题行整行可点）、抽屉限高 78vh 内滚、**工单列表固定最近 5 条**（面板高度恒定，头部 × 不被挤掉）——手机实测确认 |
-| 翻译桥期望态对账 tick | ✅ v2.5 | 后台 tick 按期望态对账翻译桥：读 `/proc` 启动时间判活、比对 config 指向、任务丢失即重建 —— 桥静默死掉后工单不再一直挂着 |
-| 互审硬预算 | ✅ v2.5 | 互审在轮数之外再加**墙钟与 token 双上限**（可 env 覆盖），超限即收敛，不再只靠轮数兜底 |
-| `/providers/update` 支持 wireApi | ✅ v2.5 | 切换提供方时可一并写 `wire_api`（responses / chat），经翻译桥的端点不再需要手改 config |
-| 看板 `ready` 查询 | ✅ v2.6 | `board.sh ready` 只读列出「前置已满足、可开工」的 pending 任务（`--json` 可选，空态退出码 0）；与 `claim` 的依赖门互补——一个引导、一个拒绝 |
-| 跨会话过程检索 | ✅ v2.6 | `trace_search.py`：`list` / `search`（`--exclude-session` 排除自己）/ `get --steps`，检索 `~/.codex/sessions/**/rollout-*.jsonl`；只读、流式、纯标准库；实测真实 79 文件 16 MB 全量 3.66 s |
-| 面板滚动条 | ✅ v2.6 | 隐藏第二引擎面板（`.dse-ball-body` / `.dse-wrap`）的 WebView 默认细灰滚动条 |
 
 ## 已知限制
 
@@ -201,13 +188,13 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 ```
 
 优先级：环境变量 `SECOND_ENGINE_EXEC_MODE` > 上述模式文件 > 默认 `exec`。
-验收脚本：`bash $DSH_HOME/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
+验收脚本：`bash /root/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
 
 **实时可见性（怎么判断"到底行动了没"）**：
 - **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
 - **exec 模式**：`GET /api/task?id=` 看 `liveBytes`（过程流字节数，持续增长即在动）；过程流保留在 `<outPath>.live`（最终结果仍以 `-o` 文件为准）。
 - **appserver 模式**：除 `liveBytes` 外还有 `progress` 数组（归一化事件，最近 20 条，可见 reasoning / 文本增量 / 工具调用 / 用量）。
-协议依据：app-server 事件 → 归一化字段映射（源自 app-server 生成的 JSON Schema）。
+协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
 ## 架构
 

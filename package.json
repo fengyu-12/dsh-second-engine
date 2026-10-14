@@ -1,6 +1,6 @@
 {
   "name": "dsh-second-engine",
-  "version": "2.6",
+  "version": "2.5",
   "description": "Second engine plugin for DeepSeek Harness: plug OpenAI Codex CLI in as a second agent — async work orders, adversarial review, a shared terminal/web session bridge, and a file-based task board.",
   "type": "module",
   "main": "src/index.js",
@@ -9,10 +9,14 @@
     "./client": "./lib/client.js"
   },
   "files": [
+    "lib/client.js",
+    "tools/dual-board/board.sh",
+    "tools/dual-board/board_tool.py",
+    "tools/dual-board/dispatch.sh",
+    "tools/dual-board/trace_search.py",
+    "tools/dual-board/PROTOCOL.md",
     "bridge",
-    "tools",
     "src",
-    "lib",
     "skills",
     "cordis.patch.yml",
     "README.md",

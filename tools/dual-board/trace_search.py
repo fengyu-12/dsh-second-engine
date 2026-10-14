@@ -28,6 +28,40 @@ LINE_MAX_CHARS = 20000       # 归一化后的整行可搜索文本上限（防�
 DEFAULT_CONTEXT = 200        # search 默认打印的文本前缀长度
 LONG_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{256,}")  # 疑似 base64 / 长 token
 
+# 凭证模式（协议 §十三.4：命中项疑似凭证只报位置、不复述内容）
+_CRED_PREFIX = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}"),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+)
+_CRED_KV = re.compile(
+    r"(?i)\b(api[_-]?key|apikey|secret|password|passwd|pwd|token|access[_-]?token|"
+    r"refresh[_-]?token|authorization|cookie|credential|private[_-]?key)\b"
+    r"((?:\s*[:=]\s*|\s+))(\"?)([^\s\"',;}，。；：、]{8,})"
+)
+
+
+def redact(text: str) -> str:
+    """把疑似凭证的值打成 ***REDACTED***，保留 key 名与位置。
+
+    口径（与协议 §十三.4 对齐）：只对"看起来是凭证的值"动手，
+    不隐藏 key 名、不隐藏所在行号——检索者需要知道"这里出现过凭证"。
+    """
+    for pat in _CRED_PREFIX:
+        text = pat.sub("***REDACTED***", text)
+    def _kv(m):
+        value = m.group(4)
+        # 只打码"像密钥"的值：ASCII、无空白、长度 >= 8；中文普通词/短语一律放过
+        if len(value) < 8 or not value.isascii():
+            return m.group(0)
+        return "%s%s%s***REDACTED***" % (m.group(1), m.group(2), m.group(3))
+
+    return _CRED_KV.sub(_kv, text)
+
+
 EXIT_OK = 0
 EXIT_USAGE = 2       # 参数错误 / 找不到会话 / 目录不存在
 EXIT_BAD_INPUT = 3   # 目录结构不可读等输入问题
@@ -68,6 +102,7 @@ def norm_text(value: object) -> str:
             if len(s) > FIELD_MAX_CHARS:
                 s = s[:FIELD_MAX_CHARS] + "…[截断,原长%d]" % len(s)
             s = LONG_RUN_RE.sub(lambda m: "<blob:%d chars>" % len(m.group(0)), s)
+            s = redact(s)
             parts.append(s)
         elif isinstance(node, bool):
             parts.append("true" if node else "false")
@@ -88,7 +123,8 @@ def norm_text(value: object) -> str:
     text = " ".join(parts)
     if len(text) > LINE_MAX_CHARS:
         text = text[:LINE_MAX_CHARS] + "…[行截断]"
-    return text
+    # 整段再脱敏一次：key 与 value 在 parts 里是两段，拼接后才相邻（JSON 拍平后即 "password <值>"）
+    return redact(text)
 
 
 def uuid_from_name(path: str) -> str:
@@ -130,6 +166,11 @@ def iter_lines(path: str, max_line: int):
                 if pending:
                     lineno += 1
                     yield lineno, None
+                elif buf:
+                    # 文件末尾没有换行：这一行同样是真实存在的一行，必须计入
+                    # （rollout 被 kill 时最常见就是这种截断尾行；旧版会整行漏掉）
+                    lineno += 1
+                    yield (lineno, None) if len(buf) > max_line else (lineno, buf)
                 break
             buf += chunk
             while "\n" in buf:
@@ -386,7 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("list", help="列出会话：session_id/uuid/起止时间/cwd/路径/行数")
     add_common(p)
-    p.add_argument("--since", metavar="YYYY-MM-DD", help="只列首日时间戳 >= 该日期的会话")
+    p.add_argument("--since", metavar="YYYY-MM-DD", help="只列最后活动日期 >= 该日期的会话")
     p.add_argument("--cwd", metavar="SUBSTR", help="只列 cwd 含该子串的会话")
     p.add_argument("--json", action="store_true", help="以 JSON 打印（便于脚本消费）")
     p.set_defaults(func=cmd_list)
@@ -397,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session", metavar="ID_OR_UUID", help="只检索该会话")
     p.add_argument("--exclude-session", metavar="ID_OR_UUID", action="append",
                    help="排除该会话（可重复；用于自动排除自己当前会话）")
-    p.add_argument("--since", metavar="YYYY-MM-DD")
+    p.add_argument("--since", metavar="YYYY-MM-DD", help="只列最后活动日期 >= 该日期的会话")
     p.add_argument("--cwd", metavar="SUBSTR")
     p.add_argument("--context", type=int, default=DEFAULT_CONTEXT,
                    help="命中行可搜索文本前 N 字符（默认 %d）" % DEFAULT_CONTEXT)
