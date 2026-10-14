@@ -47,9 +47,9 @@
 | DSH 主 AI | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
-## 协作看板（dual-board，v1.3 · 2026-09-27）
+## 协作看板（dual-board，v1.4 · 2026-10-14）
 
-长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `<工作目录>/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `<工作目录>/AGENTS.md` 自动注入，无需人工提醒）：
+长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `trace_search.py` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `<工作目录>/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `<工作目录>/AGENTS.md` 自动注入，无需人工提醒）：
 
 - **写板唯一入口 `board.sh`**（v1.2 起）：CAS + O_EXCL 锁 + 原子写 + 状态机 + JSONL 归档 + `doctor` 体检都在工具里，**手改 `board.json` 视为破坏协议**。退出码即语义（3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。
 - **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit、工作区脏快照与 `write_scopes` 的 sha256 快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
@@ -58,6 +58,8 @@
 - **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
 - **可视化**：浏览器聊天桥（3095）的会话列表抽屉 = 成员会话切换，终端/网页/主 AI 三方同链。
 - ✅ **scope 校验（v1.2 起）**：派单时对 `write_scopes` 记 sha256 快照，交付后比对——**「派单前就脏、之后又被改」不再漏报**（协议 §十一 那条限制已解）；workdir 无 git 时降级为哈希校验，不再直接判「未验证」。
+- ✅ **`board.sh ready`（v1.4 起）**：只读列出「前置已满足、现在可开工」的下一步（`--json` 可选；空态打印 `ready: 0` 且**退出码 0**）。`claim` 的依赖门是**拒绝**、`ready` 是**引导**——派单前先跑它，不再靠「想起来」。
+- ✅ **过程级检索 `trace_search.py`（v1.4 起）**：跨会话翻前人的**执行过程**（`list` / `search --exclude-session` / `get --steps`），只读 + 流式 + 纯标准库；协议 §十三，含「不得检索/转述凭证」纪律。
 
 ## 前置要求
 
@@ -149,7 +151,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v2.5）
+## 支持能力一览（v2.6）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -168,6 +170,9 @@ curl -s -X POST "$W/second-engine/api/task" \
 | 翻译桥期望态对账 tick | ✅ v2.5 | 后台 tick 按期望态对账翻译桥：读 `/proc` 启动时间判活、比对 config 指向、任务丢失即重建 —— 桥静默死掉后工单不再一直挂着 |
 | 互审硬预算 | ✅ v2.5 | 互审在轮数之外再加**墙钟与 token 双上限**（可 env 覆盖），超限即收敛，不再只靠轮数兜底 |
 | `/providers/update` 支持 wireApi | ✅ v2.5 | 切换提供方时可一并写 `wire_api`（responses / chat），经翻译桥的端点不再需要手改 config |
+| 看板 `ready` 查询 | ✅ v2.6 | `board.sh ready` 只读列出「前置已满足、可开工」的 pending 任务（`--json` 可选，空态退出码 0）；与 `claim` 的依赖门互补——一个引导、一个拒绝 |
+| 跨会话过程检索 | ✅ v2.6 | `trace_search.py`：`list` / `search`（`--exclude-session` 排除自己）/ `get --steps`，检索 `~/.codex/sessions/**/rollout-*.jsonl`；只读、流式、纯标准库；实测真实 79 文件 16 MB 全量 3.66 s |
+| 面板滚动条 | ✅ v2.6 | 隐藏第二引擎面板（`.dse-ball-body` / `.dse-wrap`）的 WebView 默认细灰滚动条 |
 
 ## 已知限制
 
