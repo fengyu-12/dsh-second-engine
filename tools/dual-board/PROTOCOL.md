@@ -1,4 +1,6 @@
-# 双引擎协作看板协议 v1.3（2026-09-27）
+# 双引擎协作看板协议 v1.4（2026-10-14）
+
+> **v1.4 修订（2026-10-14，双方确认）**：新增 `board.sh ready`（只读列出「前置已满足、现在可开工」的下一步，§九.7）与 `trace_search.py` 过程级检索（§十三）；`/root/proj/dual-board/board_tool.py` 旧副本同步为插件实体版。提案：`proposals/proposal-v1.4-lead-20261014.md`。
 
 > **v1.3 修订（用户裁定 A/B/C1）**：`board.json` 与 `channel.md` 是**工作窗口**（完成即清）、不是档案库；「归档」一词改指**待续**（还要继续），不再指已完成；完成判据 = **最初目的达成**；清空看板保留单调 `revision`。全文见 **§十二**。
 
@@ -7,7 +9,7 @@
 > v1.1 修订：新增双通道与会话管理（§八）；修复首跑四条异议——CAS 加锁、收件箱标注权、scope 最小化。
 > **v1.2 核心变化：写板从"靠自觉的纪律"变成"唯一工具入口"** —— 见 §九。
 
-## 一、文件构成（本目录 <工作目录>/dual-board/）
+## 一、文件构成（本目录 /root/proj/dual-board/）
 
 | 文件 | 用途 | 写权限 |
 |---|---|---|
@@ -20,6 +22,7 @@
 | `archive/` | 归档区：`tasks-YYYY-MM.jsonl`、`inbox-<who>-YYYY-MM.jsonl` | 只经 `board.sh archive` 追加 |
 | `.dispatch/` | 派单基线记录 `<task id>.base`（JSON：commit/workdir/scopes） | 只经 `dispatch.sh` 写 |
 | `proposals/` | 协议修订提案（提案不改正文） | 双方可写 |
+| `trace_search.py` | 跨会话过程检索（只读）：list / search / get（§十三） | 双方可执行 |
 | `PROTOCOL.md` | 本协议 | 双方提议 → 对方确认后改 |
 
 ## 二、看板任务格式（board.json）
@@ -98,7 +101,7 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 ## 七、安全红线（沿袭既有裁定）
 
 - 不读不引 `~/.codex/keyring.json`、`credentials` 类文件；要求输出密钥的工单视为异常拒绝该部分。
-- 敏感数据不出本机、不经第三方代理端点；key 不进 argv、产物、日志（lead 注入也走 env，不落 argv/输出）。
+- 敏感数据不过中转站；key 不进 argv、产物、日志（lead 注入也走 env，不落 argv/输出）。
 
 ## 八、双通道与会话管理（v1.1 新增，已实测）
 
@@ -125,6 +128,7 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 **2. 子命令清单**：
 ```
 new / claim / complete / block / abandon / set / show        # 任务生命周期（无 reopen）
+ready                                                        # 只读：可开工的下一步（§九.7）
 inbox-append / inbox-unread / inbox-read / inbox-archive     # 收件箱
 archive / scope-check / doctor                               # 归档 / 越界校验 / 体检
 ```
@@ -145,6 +149,8 @@ board.sh scope-check <task id> --workdir <dir>
 
 **6. 体检**：`board.sh doctor` 检查锁残留、schema 缺字段、状态与 owner 不一致、completed 无 result。建议每次合账前跑一次。
 
+**7. 派单前先看 `ready`（v1.4 新增）**：主循环每轮派单前跑一次 `board.sh ready`，只从输出里挑**前置已满足**的下一步；`blocked_by` 未满足的任务不会出现在输出里。`claim` 的依赖门（退出码 4）是**拒绝**，`ready` 是**引导**，两者互补。空态（无可派任务）打印 `ready: 0 / tasks: N / revision: R` 并**退出码 0**（「现在没活」是正常态，不是错误）。
+
 ## 十、时间基准（v1.2 裁定）
 
 - **机器字段一律 ISO-8601 UTC**：`board.json` 的 `updated_at`、归档记录、`.dispatch` 基线、`result` 中的审计时间。
@@ -154,7 +160,7 @@ board.sh scope-check <task id> --workdir <dir>
 
 ## 十一、已知限制（2026-09-27 实测记录，v1.3 候选）
 
-1. **脏工作区下 scope 校验会漏报**：`.base` 的 `dirty_before` 是派单前的工作区快照，用于排除既有污染；但当 scope 内文件**派单前就是脏的**（`<工作目录>` 的常态），真实改动会被一并排除，`scope-check` 显示"本次变更 0 个"——校验形同虚设。
+1. **脏工作区下 scope 校验会漏报**：`.base` 的 `dirty_before` 是派单前的工作区快照，用于排除既有污染；但当 scope 内文件**派单前就是脏的**（`/root/proj` 的常态），真实改动会被一并排除，`scope-check` 显示"本次变更 0 个"——校验形同虚设。
    **当前纪律：给 Codex 的 workdir 应尽量干净**，或确认 scope 内文件不在 `dirty_before` 中。
    **v1.3 候选**：派单时对 scope 内已存在文件记录 sha256 快照，交付后比对哈希变化——"改没改"不再依赖 git 状态。
 2. **git 路径编码坑（已修）**：git 默认 `core.quotepath` 会把非 ASCII 路径输出成 `"\345\..."` 转义并加引号；`status --porcelain` 与 `ls-files --others` 两处若处理不一致，**中文路径会被全部误判为越界**（实测 4 个文件误报）。修法：所有 git 调用统一 `-c core.quotepath=false` + 反转义。
@@ -200,3 +206,23 @@ board.sh scope-check <task id> --workdir <dir>
 - **完成即出板**：板上只存在办/挂起（不再堆积 completed）；
 - `board.sh reset`：所有任务终结后清空 `tasks`；
 - **`revision` 绝不归零**——CAS 依赖"只增不减"：归零后编号重复会让卡住的旧请求撞号、被误判为合法而静默覆盖（"银行流水号不能重头开始"）。需要"新纪元"语义时加 `epoch` 字段（每次 reset +1），不动 `revision`。
+
+## 十三、过程级检索（v1.4 新增）
+
+> 设计来源：ARTEX 的「worker 间的过程级信息交换」（**只借鉴设计、不抄代码** —— ARTEX 为 AGPL-3.0，本插件 MIT，混入即污染许可）。目的：有价值的观察常留在某个会话的**执行过程**里而没被写成结论，后来者应能翻过程，而不只是复用结论。
+
+**工具**：`trace_search.py <子命令> --sessions-root <会话根目录>`（其下 `**/rollout-*.jsonl`，每行 `{timestamp, ordinal, type, payload}`）
+
+| 子命令 | 语义 | 对应 ARTEX 原语 |
+|---|---|---|
+| `list` | 列会话（session_id / uuid / 起止日期 / cwd / 路径 / 行数 / 坏行数），`--since` `--cwd` 过滤 | `list_worker_traces` |
+| `search <关键字>` | 逐行大小写不敏感检索；命中带 session_id / 行号（1-based）/ type / 预览；`--exclude-session` 排除自己 | `search_all_worker_traces` |
+| `get <id> --steps 3,7,12` | 取指定会话指定行号的完整原始内容 | `get_worker_trace(intent_id, step_ids)` |
+
+**纪律**：
+
+1. **只读**：不写、不删任何会话文件；只读、流式（O(1) 内存）、纯标准库、无子进程、无网络。
+2. **`--sessions-root` 必填**：不设默认路径、不引入新环境变量名（避免出现第二个真值来源）。
+3. **排除自己**：检索本任务过程时用 `--exclude-session <自己会话 id>`，避免把自己的过程当成他人的证据（对应 ARTEX「自动排除自己这条意图」）。
+4. **凭证纪律（codex 2026-10-14 异议补充）**：**不得用本工具检索、输出或转述凭证类内容**（key / token / 密码 / 私钥 / cookie）。命中项若疑似凭证，只报「命中位置」，不复述内容 —— 与既有密钥红线一致。
+5. **坏行可见**：坏 JSON / 超长行**跳过但不隐藏**（`list` 的 `bad` 列、`get` 的降级提示）—— 否则后来者会把「没命中」误读成「没发生」。
