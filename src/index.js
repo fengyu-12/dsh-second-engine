@@ -152,8 +152,10 @@ function stopAutoCleanup() {
 // 兜底清理：sessionsBytes 自身绝不抛错，这里再兜一层，绝不影响宿主。
 function runAutoCleanup() {
   try {
-    if (sessionsBytes() <= AUTO_CLEANUP_MAX_BYTES) return
     const stats = { removed: 0, freedBytes: 0 }
+    // C 项：`.live` 独立清理 —— 不受 sessions 体积门槛限制（它俩是两码事）。
+    cleanupLiveFiles(Date.now() - AUTO_CLEANUP_KEEP_DAYS * 24 * 60 * 60 * 1000, stats)
+    if (sessionsBytes() <= AUTO_CLEANUP_MAX_BYTES) return
     cleanupSessions(SESSIONS_DIR, Date.now() - AUTO_CLEANUP_KEEP_DAYS * 24 * 60 * 60 * 1000, stats)
   } catch { /* best effort */ }
 }
@@ -1185,6 +1187,30 @@ function cleanupSessions(dir, cutoff, stats) {
   }
 }
 
+// C 项（2026-10-17 用户定）：过程流 `task-*.out.live` 落在 CODEX_DIR 根下、**不在 sessions/ 内**，
+// 所以 cleanupSessions 的递归永远扫不到它 —— 这里单独按 mtime 清。
+// 跳过 status==='running' 的任务：它可能正在写这个文件（同一 outPath）。
+function cleanupLiveFiles(cutoff, stats) {
+  let names
+  try { names = readdirSync(CODEX_DIR) } catch { return }
+  const running = new Set()
+  for (const t of tasks.values()) {
+    if (t !== null && typeof t === 'object' && t.status === 'running' && typeof t.id === 'string') running.add(t.id)
+  }
+  for (const name of names) {
+    if (typeof name !== 'string' || !name.startsWith('task-') || !name.endsWith('.out.live')) continue
+    if (running.has(name.slice('task-'.length, -'.out.live'.length))) continue
+    const full = join(CODEX_DIR, name)
+    try {
+      const info = statSync(full)
+      if (!info.isFile() || info.mtimeMs >= cutoff) continue
+      unlinkSync(full)
+      stats.removed += 1
+      stats.freedBytes += info.size
+    } catch { /* 跳过无法删除的条目 */ }
+  }
+}
+
 async function handleCleanup(req, res) {
   try {
     const body = await readBody(req)
@@ -1195,6 +1221,7 @@ async function handleCleanup(req, res) {
     }
     const stats = { removed: 0, freedBytes: 0 }
     cleanupSessions(SESSIONS_DIR, Date.now() - keepDays * 24 * 60 * 60 * 1000, stats)
+    cleanupLiveFiles(Date.now() - keepDays * 24 * 60 * 60 * 1000, stats)
     // 把本次使用的保留天数回写到命名空间，使设置页卡片与本页一致（best effort）。
     if (secondEngineSettingsScope !== null) {
       try { void secondEngineSettingsScope.update({ keepDays: Math.floor(keepDays) }).catch(() => {}) } catch { /* settings 不可用时忽略 */ }
@@ -1314,6 +1341,9 @@ function finalizeTask(task, exitCode, status) {
   task.status = status
   try { task.output = readFileSync(task.outPath, 'utf8') } catch { task.output = '' }
   try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成，忽略 */ }
+  // A 方案（2026-10-17 用户定）：过程流 `.live` 同样在收尾时删除 —— ephemeral 工单跑完
+  // 不在磁盘留任何输出。要事后回看过程就勾「保留会话」（ephemeral:false，走 rollout）。
+  try { unlinkSync(`${task.outPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
   task.endedAt = Date.now()
   // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
   // 关联用时间窗口（consults 是内存队列、无 taskId）：at >= startedAt 即属本次任务。

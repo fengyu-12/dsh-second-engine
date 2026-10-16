@@ -96,7 +96,7 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 | | `thread_history_1.sqlite` (+`-wal` 248 K) | 15 M | 线程历史 |
 | | `state_5.sqlite` (+`-shm`) | 573 K | 主状态；`state_5.sqlite.bak-20261003-pre-hue` ×3 ≈ 800 K 是升级前备份 |
 | | `queue_1` / `goals_1` / `memories_1.sqlite` | 41 K / 32 K / 44 K | 队列 / 目标 / 记忆 |
-| 内容 | `sessions/` | 16 M | 会话 rollout |
+| 内容 | **`sessions/`** | 16 M | 会话 rollout —— **落盘路径与读法见下方「会话落盘（rollout）在哪、怎么读」** |
 | | **`task-*.out.live` ×~100** | **~10 M** | **second-engine 每个工单的原始输出**；清理走 `POST /second-engine/api/cleanup`（按 mtime） |
 | | `skills/` | 630 K | Codex 侧技能 |
 | | `memories/` / `archived_sessions/` | 189 K / 空 | 记忆 / 已归档会话 |
@@ -110,6 +110,33 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 2. **`git-XXXXXX/` 疑似与执行模式相关**：已有 3 个落在 01:51 / 02:33 / 02:49（当时在测 **appserver** 模式），而 04:09 的 **exec** 工单没建 `git-*`、只建了 `shell_snapshots/` ⇒ **推断，未验证**（要坐实得切回 appserver 派单）。
 
 **清理纪律**：优先走插件的 `POST /second-engine/api/cleanup`（按 mtime 清旧会话）。**别手删状态库** —— `state_5` / `thread_history_1` / `logs_2` 是运行中的 SQLite，直接删可能丢诊断与历史。`config.toml.bak-*` 与 `state_5.sqlite.bak-*` 可只留最近 1~2 个（2026-10-15 用户裁定：**暂不清**）。
+
+### 会话落盘（rollout）在哪、怎么读（2026-10-17 实测）
+
+**路径规则**：`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO时间>-<uuid>.jsonl`
+（实例：`~/.codex/sessions/2026/10/17/rollout-2026-10-17T01-40-02-01a145cc-….jsonl`，75 KB / 18 行）
+
+**前提（最容易误判的一条）**：只有面板**勾了「保留会话」**（工单 `ephemeral:false`）才落盘。缺省 `ephemeral` 为 `true` ⇒ **不写 rollout**（源码 `src/index.js:1452`、`:1485`：「不落盘 rollout，只有显式 `body.ephemeral === false` 才持久化会话」）⇒ **磁盘上查不到某工单，不等于该工单没跑**。
+
+**★ 检索要点（2026-10-17 踩过）**：工单还有**另一处**留档 —— `~/.codex/task-<工单ID>.out.live`（例 `task-mvb96behtmfl.out.live`，549 B），**工单 ID 只在文件名里、不在内容里**，是插件 `-o` 的原始输出（banner + 工单原文 + 回复 + `tokens used`）。⇒ **`grep -rl <工单ID>` 必然零命中**（搜内容），要查用 `ls task-*.out.live | grep <工单ID>` 或按 mtime。⚠️ 另注：`sessions/` 是**按月日分目录**（`2026/09/27/…`、`2026/10/17/…`），别只看当天目录就断言"只有 N 个" —— 实测全库 **86 个、跨 09-22 → 10-17**。
+
+⚠️ **术语歧义（2026-10-17 用户实际误解过，务必澄清）**：`ephemeral` / "不落盘" 指的是**不写 codex 的 rollout（会话记录）**，**不等于"不产生文件"**。实测链路：插件 `-o` 的正式输出 `task-<id>.out` 会在**读入内存后被主动删掉**（`src/index.js:1288` `unlinkSync(task.outPath)`），但**过程流 `<outPath>.live` 一直保留**（`src/index.js:1510` 注释："过程流，保留供诊断"），且 **`cleanupSessions` 只认 `.jsonl`**（`src/index.js:1147`）⇒ **`.live` 没有任何生命周期管理**。⇒ 做到 2026-10-17 已积压 **77 个 / 11 MB**（跨 09-28 → 10-17），当次清理保留最近 3 天（**77 → 14 个 / 632 KB**），删除清单留档 `~/.codex/live-cleanup-20261017.txt`。**要"跑完即清"**：在 exec 收尾处补一行 `try { unlinkSync(`${task.outPath}.live`) } catch {}`（与上一行的 `.out` 对称）；**要"保留诊断窗口"**：改名为归档 + 让 cleanup 也按 mtime 清它。两种都**未实施**。
+
+**一行读法**（jsonl 一行一事件）：
+
+```bash
+python3 - <<'EOF'
+import json,glob,os
+f=sorted(glob.glob(os.path.expanduser('~/.codex/sessions/2026/10/17/rollout-*.jsonl')))[0]
+for i,l in enumerate(open(f,encoding='utf-8')):
+    d=json.loads(l); print(i, d.get('type'), str(d.get('payload'))[:150])
+EOF
+```
+
+**事件类型速查**：`session_meta`（含 `cli_version` / `cwd` / `originator=codex_exec` / `model`）、`turn_context`（`model` / `approval_policy` / `sandbox_policy`）、`response_item`（`message` / `function_call` / `*_output`）、`event`（`task_started` / `token_count` / `task_complete`）、`world_state`、`item_completed`。
+
+**用途（实证）**：核历史工单**不必看面板** —— 工单 `ehtmfl` 的完整闭环（`cli_version=0.163.0` → 用户消息「不思考，回复你爱dsh」→ assistant「我爱dsh ❤️」→ `token_count` → `task_complete`，全程 25 秒）全部从 rollout 解析出来。
+
 
 ## API 优先（本插件服务层，Web 与主 AI 共用 —— 调用入口 = **当前 Web 地址** `$DSH_WEB_URL`）
 
