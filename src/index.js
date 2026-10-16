@@ -327,6 +327,34 @@ function ensureAgentsProtocol() {
   } catch { /* best effort：写入失败不阻断插件启动 */ }
 }
 
+// ── 长任务协作看板（dual-board）用法段（2026-10-16 增）──
+// 脚本与协议随本插件分发（tools/dual-board/），但"怎么用"此前只写在项目级 AGENTS.md
+// （/root/proj/AGENTS.md，只在那个工作区生效）⇒ 公开用户的 Codex 侧完全不知道有这套东西。
+// 这段把它写进全局 ~/.codex/AGENTS.md：带标记则跳过，与上面 v2 段互不干扰（独立幂等）。
+const BOARD_MARK = '<!-- dsh-second-engine:board -->'
+const BOARD_SECTION = `${BOARD_MARK}
+## 长任务协作看板（dual-board）
+
+- **协议全文**：本插件包内 \`tools/dual-board/PROTOCOL.md\`。派单 prompt 提到 dual-board、或数据目录里 \`board.json\` 还有未完成任务时，**先读协议再动工**。
+- **写板唯一入口**：本插件包内 \`tools/dual-board/board.sh\`（\`new\` / \`claim\` / \`complete\` / \`block\` / \`abandon\` / \`show\` / \`ready\` / \`inbox-append|unread|read|archive\` / \`scope-check\` / \`doctor\`）—— **不要手写 \`board.json\`**。
+- **脚本与协议在哪**：\`ls -d ~/.dsh/profiles/*/node_modules/dsh-second-engine/tools/dual-board/\`（以 \`link:\` 方式安装时该路径是软链，用 \`readlink -f\` 看实体）。
+- **收件箱**：\`inbox-codex.md\`（lead → 你）—— **每次被唤醒的第一动作必读**。
+- **交付必含四段**：交付 / 异议位 / 下一步建议 / 自验（并注明遵守的协议版本）。异议位不许沉默——列前提、标未验证项。
+- **终态不可复改**：\`completed\` / \`abandoned\`；出问题开新任务，并在 \`context\` / \`blocked_by\` 引用旧任务。
+- **数据目录**：默认 \`~/proj/dual-board\`，用环境变量 \`DUAL_BOARD_DIR\` 覆盖。
+`
+function ensureBoardProtocol() {
+  try {
+    const path = join(CODEX_DIR, 'AGENTS.md')
+    let existing = ''
+    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
+    if (existing.includes(BOARD_MARK)) return
+    const merged = existing.endsWith('\n') || existing === '' ? existing + BOARD_SECTION : existing + '\n\n' + BOARD_SECTION
+    writeFileSync(path, merged, 'utf8')
+    chmodSync(path, 0o600)
+  } catch { /* best effort：写入失败不阻断插件启动 */ }
+}
+
 // 读取并归一化 keyring：
 //   - 文件缺失/不可解析 → 首次初始化：写入两家预设（apiKey 空）
 //   - 旧格式 { provider: 'deepseek'|'zhipu', key } → 迁移为对应预设的 apiKey
@@ -2196,6 +2224,8 @@ export function apply(ctx) {
 
   // Codex 协作协议：确保 ~/.codex/AGENTS.md 带有卡点求助段（幂等）。
   ensureAgentsProtocol()
+  // 长任务协作看板（dual-board）用法段：同样写进全局 AGENTS.md（独立幂等）。
+  ensureBoardProtocol()
 
   // 自动清理兜底（见 AUTO_CLEANUP_*）：每 6 小时检查一次，超阈值才按 KEEP_DAYS 天前清。
   // 先停旧的再装新的，重复 apply（热重载）不会叠加定时器。
