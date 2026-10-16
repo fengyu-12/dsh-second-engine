@@ -42,7 +42,35 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 1. **任务永不结束**（它卡死、`finalizeTask` 不跑）→ 追加不上；此时看 `GET /api/task` 的 **`stuckSuspect: true`**（看门狗 300s 无输出更新置位）就**去查 `consults`** 拿求助内容。
 2. **review 内部循环** → 已补 `finalizeReview`；若在旧版插件上跑互审，仍按上面两条兜底。
 
-> 🔴 **升级后第一件事：维护旧结论**（本机私有判据 · **勿同步发布树**）—— 跑完破坏性检验只是第一步，**真正的腐化源是"旧结论还挂在新版本号旁边"**。每次升级后必须回扫本文件与 `Codex功能表.md` 的**状态性结论**（开关态、能力对照、扩展表、CLI 速查），逐条二选一：
+### C. 用哪条通道派（2026-10-15 新增 · 官方原生工具 vs 本插件）
+
+DSH 侧现在**两条路都能叫到 Codex**，别混：
+
+| | `subagent_codex`（DSH 原生工具） | 本插件（second-engine API） |
+|---|---|---|
+| 怎么调 | 直接调工具，一行 | `curl $DSH_WEB_URL/second-engine/api/task` |
+| 形态 | **进程内**一次委派，结果直接回到我的上下文 | **进程外**任务通道，有队列 / 历史 / output 留存 |
+| 异步 | 支持（`run_in_background`），用 `job_output` 收 | 支持（完成弹 App 通知） |
+| 取消 | `job_kill` | `/api/task/cancel` |
+| 人能不能看见 | **看不见**（没有面板） | **能**（设置页面板 + `/api/tasks`） |
+| 换 provider / 模型 | **不能**，只能吃 `config.toml` 里 active 的那份 | **能**（keyring 多 provider；切 active 时自动重写 config.toml） |
+| 多轮批判互审 | 无 | `/api/review` |
+| Codex 主动求助 | 无 | `/api/consult` |
+| MCP / web_search / 会话清理 / 版本检查 | 无 | 有 |
+| 跨工单连续性 | 无 | 无 |
+
+**判据（一句话）**：
+
+- **一件自包含的活，只要它把答案带回来给我** ⇒ `subagent_codex`（最短路径；默认等结果，`run_in_background` 才转后台）
+- **要人看得见 / 要留痕 / 要换模型 / 要多轮互审 / 要它主动来找我** ⇒ 走本插件 API
+
+**共同点**：两条都是「**一 run 一进程一 thread，无 resume**」（官方 README 原话 "one fresh process, thread, and turn per run … no continuation, resume, or pooling"，本机两条都已实测）⇒ **要连续性只能靠 dual-board 文本看板**，别指望引擎。
+
+⚠️ **`subagent_codex` 的工具描述里完全没提 Codex** —— 与通用 `subagent` 的描述**前半段逐字相同**，只有末句不同（一个"默认后台 + 可续"，一个"默认等结果"）。所以新会话的 AI **不会自动知道**该用它干 Codex 的活，也读不出它没有连续性、`permissionMode` 默认 `never`。**这条判据正是本 skill 存在的意义之一。**
+
+⚠️ 它的凭据由 provider 的 `env` 显式喂（**形似凭据的环境变量会被先剥离**，放 `~/.dsh/.env` 也没用）；本机做法是 `!!js` 现场从 `~/.codex/keyring.json` 读 active provider 的 key，凭据不落明文。装法/坑位见 skill `dsh-plugin-discipline` 第五节。
+
+> 🔴 **升级后第一件事：维护旧结论**（本机私有判据）—— 跑完破坏性检验只是第一步，**真正的腐化源是"旧结论还挂在新版本号旁边"**。每次升级后必须回扫本文件与 `Codex功能表.md` 的**状态性结论**（开关态、能力对照、扩展表、CLI 速查），逐条二选一：
 > **① 已复验 → 改成新版本 + 新日期**；**② 没验 → 明确标「<旧版本> 观察，未复验」**（不许搭着新版本号假装验过）。
 > 判据：`grep -nE '0\.[0-9]{3}'` 的每一处都要能回答这句 —— **"这是历史事实（保留），还是现状标注（必须维护）？"**
 > **历史事实永不改**（事故档案、版本变更日志、"某版实测"的记录）；**现状标注必须跟上**。
@@ -53,6 +81,35 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 - 预设三家均实测直连：DeepSeek（responses）/ 智谱（responses，Coding 端点）/ 云知声（chat，经本地翻译桥自动挂接）
 - 🔴 **wireApi 怎么选（2026-10-03 实证，接任何第三方端点前必做）**：判据只有一条 —— 直接 `POST {base}/responses` 发个最小请求，**200 = 原生支持 Responses，就标 `responses` 直连**；只有它 404/400 时才标 `completions` 走桥。**别默认套 `completions`**：桥（`src/bridge.js`）只保证**文本**往返，**工具调用循环会断** —— 同模型（glm-5.3）同工单，经桥两次都是 `exit 0 + 零产物 + 只回一句计划`（17.6s / 空 output），改直连后**同一工单立刻** `exec /bin/bash -lc '...' succeeded` 且文件真落盘。**判据："工单 exit 0 但工作目录没有新文件" = 假完成**，第一件事就是查它是不是走了桥。
 - ✅ **`/providers/update` 现已支持 `wireApi`**（2026-10-03 补齐；源码：字段白名单含 `wireApi`、该提供方为 active 且值有变化时连带重写 `config.toml`，见 `src/index.js:945-973`）→ 原地把 `completions` 改成 `responses` 即可，**不必再"新增一个提供方再切 active"绕行**。⚠️ 两条前提：① 改完**重启 Web** 新代码才生效——未重启时旧代码仍会忽略它，`updated:[]` + `configRegenerated:false` 就是这个信号；② 换成 `responses` 前先按上一条验过端点原生支持，否则工具调用循环会断。
+
+## `~/.codex/`（CODEX_HOME）目录地图（2026-10-15 实测，共 185 M）
+
+Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `keyring.json` 与 `config.toml`**；其余在明确知道用途后可处理。
+
+| 类别 | 项 | 大小 | 用途 |
+|---|---|---|---|
+| 配置 | `config.toml` | 1.2 K | `model_provider` / `model` / `sandbox_mode` / `web_search` / `[mcp_servers.*]`。**不手改** —— 插件切 active 时重写它 |
+| | `config.toml.bak-*` ×7 | 各 ~450 B | 历史备份（`-20261001` `-pre-memories` `-pre-switch` `-ma2` `-recplug` `-before-ma2-recplug` `-se`） |
+| | `keyring.json` | 1.4 K | 多提供方与 key。**不手改** |
+| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `~/proj/AGENTS.md` 同源的那份） |
+| 状态库 | **`logs_2.sqlite`** | **41 M** | 运行日志 —— **整个目录最大的一块**（能否清**未验证**） |
+| | `thread_history_1.sqlite` (+`-wal` 248 K) | 15 M | 线程历史 |
+| | `state_5.sqlite` (+`-shm`) | 573 K | 主状态；`state_5.sqlite.bak-20261003-pre-hue` ×3 ≈ 800 K 是升级前备份 |
+| | `queue_1` / `goals_1` / `memories_1.sqlite` | 41 K / 32 K / 44 K | 队列 / 目标 / 记忆 |
+| 内容 | `sessions/` | 16 M | 会话 rollout |
+| | **`task-*.out.live` ×~100** | **~10 M** | **second-engine 每个工单的原始输出**；清理走 `POST /second-engine/api/cleanup`（按 mtime） |
+| | `skills/` | 630 K | Codex 侧技能 |
+| | `memories/` / `archived_sessions/` | 189 K / 空 | 记忆 / 已归档会话 |
+| 运行时 | `.tmp/` | **102 M** | `plugins/` 缓存 + `git-XXXXXX/`（**裸仓库**，只有 `HEAD`/`objects`/`refs`，各 15 K） |
+| | `shell_snapshots/` | 3.5 K | **exec 模式**工单会建 |
+| | `thread-writer-locks/` `app-server-control/` `app-server-daemon/` `mcp-oauth-locks/` `tui-thread-reference-capabilities/` `packages/` `log/` `tmp/` | 都极小 | 锁 / 守护 / 包 / 日志 —— ⚠️ **`tmp/`（7 K）与 `.tmp/`（102 M）是两个不同目录** |
+
+**两条实测判据（2026-10-15）**：
+
+1. **Codex 的 `TMPDIR` 就是 `/tmp`**（实测 `TMPDIR=/tmp`）—— 与主 AI **共用同一个临时区**；`~/.codex/.tmp/` 是它**另外主动写**的地方，**不是 TMPDIR 指过去的**。（探针工单 `mv8jnfzcmsrh`：两处都建文件都成功 ⇒ 只证明"都可写"，**不证明它默认往哪写**；默认行为以 `TMPDIR` 为准。）
+2. **`git-XXXXXX/` 疑似与执行模式相关**：已有 3 个落在 01:51 / 02:33 / 02:49（当时在测 **appserver** 模式），而 04:09 的 **exec** 工单没建 `git-*`、只建了 `shell_snapshots/` ⇒ **推断，未验证**（要坐实得切回 appserver 派单）。
+
+**清理纪律**：优先走插件的 `POST /second-engine/api/cleanup`（按 mtime 清旧会话）。**别手删状态库** —— `state_5` / `thread_history_1` / `logs_2` 是运行中的 SQLite，直接删可能丢诊断与历史。`config.toml.bak-*` 与 `state_5.sqlite.bak-*` 可只留最近 1~2 个（2026-10-15 用户裁定：**暂不清**）。
 
 ## API 优先（本插件服务层，Web 与主 AI 共用 —— 调用入口 = **当前 Web 地址** `$DSH_WEB_URL`）
 
@@ -112,7 +169,7 @@ echo appserver > ~/.dsh/second-engine-mode.txt   # 切 app-server
 echo exec      > ~/.dsh/second-engine-mode.txt   # 切回
 ```
 优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。
-验收：`bash <DSH 脚本目录>/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
+验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
 
 **实时可见性（怎么判断"到底行动了没"）**：
 - **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
@@ -210,6 +267,10 @@ codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI�
 -c 'model_providers.relay.env_key="RELAY_API_KEY"'
 ```
 
+**中转站速查**：Base `<你的中转站 base_url>`；key 在 `<你的 keyring 目录>/*.txt`（只读取、不写产物）；模型名以 `GET /v1/models` 实拉为准；一账号 5 并发；**敏感数据不过中转**。详见 `中转站/接入档案.md`。
+
+**中转站选型判据**（延迟方差 / 按次摊薄 / 成功率按分组）**属翻译线，已归 skill `rpgmaker-intl-pipeline`**（2026-10-15 从此处挪走，避免两头各写一份）；想验某条线的注入量，按 skill `relay-forensics` 测。
+
 **凭证安全（2026-09-24 实测）**：DSHA App 启动 proot 容器时把 `DEEPSEEK_API_KEY` 明文放进**命令行参数**（`/proc/<pid>/cmdline` 可见，容器内 `ps` 即可读到）。来源是 App 层、非 AI 引入；暴露面与 `keyring.json` 同级（都在容器内）→ **不必紧急轮换**，但应并入向上游的反馈。自己的命令**不要写成 `VAR=key cmd` 形式**（同样会进 argv），要从文件读再 `env` 注入；任何 key **不得**写进产物/文档/日志。
 
 ## CLI 能力速查（官方文档 + 本机实测对照；exec / app-server 路径 2026-10-08 在 0.161.0 下已复验）
@@ -278,36 +339,6 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 
 **纪律**：派单一律 `--workdir ~/proj`，别省。
 
-## 2026-09-25 新增能力（第二引擎侧，已实测）
-
-### 中转站算力：探测与并发咨询
-
-- **技能 `relay-probe`**（Codex 侧 `<Codex 技能目录>/relay-probe/`，
-  脚本 `scripts/relay_probe.py`，5 个子命令）：
-  `fingerprint`（协议指纹+模型清单）/ `inject-size`（静默注入量基线）/ `extract`（系统提示词提取）/
-  `footer`（备案号等资质取证）/ **`consult`（把同一个问题并发丢给 N 个模型收第二意见）**。
-  `consult` 的 key 位置传 `env` 即读 `$RELAY_KEYS`（逗号分隔可多把轮用），**不落盘、不改任何文件**。
-  本机实测案例（含伪造备案号取证）：`.../references/case-mcpwlaq.md`。
-- **管线 `~/proj/relay-forge/`**：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
-  模型发 `tool_calls` → `forge.py` 本地 `fetch_url` → 回灌。铁律：产出只落 `out/<时间戳>/`，
-  **绝不自动改目标文件**；要"整文件重写"会得 0 字符，只喂"定位锚点 → 替换为"的补丁。
-  用法与踩坑见 `relay-forge/README.md`。
-
-### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `~/proj/backup/`）
-
-- 会话列表**搜索框**（`Ctrl+K` 唤起）、**会话 ID 芯片**（点一下复制完整 36 位 ID，显示只给前 8 位）、
-  **深浅主题切换**（浅色为默认，选择存 localStorage）、被占用时**显示写锁持有者**
-  （`GET /api/lock-info`，扫 `/proc` 不用 `pgrep -f`）。
-- 改动明细与回滚命令：插件内 `bridge/CHANGELOG.md` 顶部三条（2026-09-25；2026-09-30 自 `~/proj/second-engine-bridge/` 收编，桥组件自述见同目录 `README.md`）。
-- **2026-09-28 取址便利改动**：① `ctl.sh url` 把网址同时落盘 `bridge/.url`（0600）——TUI 全屏会刷掉启动输出，随时 `cat` 取回；② `codex-env -u` / `--url` 只打印桥网址就退出（不进 TUI、不注入 key）；③ `codex-env` 默认桥路径由旧 `web-bridge/` 更正为 `second-engine-bridge/bridge/` —— 两目录各持独立 `.token`，旧 token 在 `/api/threads` 实测 **401**，混用会拿到打不开的网址。
-
-### ⚠️ 会话 ID 必须给完整 36 位（当次实测的坑）
-
-`codex resume` 的 id 参数是「UUID **或会话名**」。8 位前缀两者都不是 → 解析成"按名字找" → 找不到 →
-**不报错，直接新建一条会话**（实测 `codex exec resume 01a0d8ad "hi"` 新建了 `01a0d930-…`）。
-`codex-env -a <id>` 内部就是 `codex resume --remote`，同样中招。`codex delete` 无 TTY 时要
-`--force` 且必须完整 UUID。复现步骤：`<本机私有记录>`。
-
 ## 异常速查
 
 | 症状 | 处置 |
@@ -322,10 +353,9 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 | `wire_api` 报错 | config 被手改（应 responses）→ 面板重新「启用」即由生成器重写 |
 | bwrap/sandbox 报错 | 沙箱模式被改回 → 同上，切 active 重写 config |
 | 任务**秒退**且过程流尾部是 `exceeded retry limit, last status: 429 Too Many Requests` | **先分清是「本地限速」还是「上游侧拒绝」—— 两者都报 429**。⚠️ **别用小请求探活当判据**：几个 token 的探针能返回 200，而 Codex 每次 40K+ token 上下文会被直接拒 —— 2026-10-03 我据此误判成"限速窗口很长"，还多灌了 55 个请求。**判据 = 看面板**；确属限速才冷却重派，否则换 provider |
-| **选模型的成本坑（同日实测）** | 实测数字：3.44M tokens / 246 请求 → **9.926 墨点**（≈34.7 万 tokens/墨点）；而面板口径「**1 墨点最多抵扣 5000 万 tokens**，以 DeepSeek-V4-Flash 为例」→ 两者按字面推算差约 **144 倍**。⚠️ **该倍数是推算，平台未公开逐模型折算规则**（缓存命中、模型权重、上下文长度都可能参与计费），**别当定论**。可操作结论不变：跑 agent 长任务优先 flash / pro 档，别默认挑最贵的 |
 | 工具全灭 approval never | 同上 |
 
-## Codex 升级姿势 + 升级后破坏性检验（本机私有 · **勿同步发布树**；2026-10-08 定）
+## Codex 升级姿势 + 升级后破坏性检验
 
 **升级姿势（0.161.0 实测）**：取 npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`，用其 `dist.integrity` 校 sha512（157MB tgz / 23.2s）；解包得主二进制 253MB + sidecar `codex-code-mode-host`（**须与主二进制同目录**）+ `codex-path/rg`（PATH 已有 `/usr/bin/rg`，**免装**）。**先跑包内 `bin/codex --version` 验活，再 `cp -a` 备份旧二进制（`<Codex 安装目录>/*.bak-<旧版>`）后替换**；回滚＝换回该备份文件。
 
@@ -333,9 +363,9 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 
 | # | 检验什么 | 命令 | 通过判据 | 不过怎么办 |
 |---|---|---|---|---|
-| 1 | 工具面 | `node <DSH 脚本目录>/se-tool-probe.mjs` | 工具**名字集合**与上一版基线一致（**只看名字，不看字节数**——整份请求体本来就不逐字节一致） | 工具名增删 ⇒ 上游改了工具面，复核插件对工具名的假设 |
-| 2 | 执行链 | `bash <DSH 脚本目录>/se-appserver-verify.sh` | 5/5（appserver 派单+流式进度 / cancel 打断无残留 / exec 回归） | **插件必须动**：先切 `exec` 模式兜底，再修 |
-| 3 | DSH 依赖点 | `python3 <DSH 脚本目录>/dsh-dep-check.py` | 全 OK | 与 codex 版本无关，属 DSH 侧问题 |
+| 1 | 工具面 | `node ~/.dsh/scripts/dsh/se-tool-probe.mjs` | 工具**名字集合**与上一版基线一致（**只看名字，不看字节数**——整份请求体本来就不逐字节一致） | 工具名增删 ⇒ 上游改了工具面，复核插件对工具名的假设 |
+| 2 | 执行链 | `bash ~/.dsh/scripts/dsh/se-appserver-verify.sh` | 5/5（appserver 派单+流式进度 / cancel 打断无残留 / exec 回归） | **插件必须动**：先切 `exec` 模式兜底，再修 |
+| 3 | DSH 依赖点 | `python3 ~/.dsh/scripts/dsh/dsh-dep-check.py` | 全 OK | 与 codex 版本无关，属 DSH 侧问题 |
 | 4 | **版本锚点** | 手工：改本文件首节「当前 x.y.z」+ `Codex功能表.md` 顶部「当前版本」 | 两处都等于 `codex --version` | 漏改 ⇒ 下次照着旧版本号做判断 |
 
 **「维护 skill」的完整含义 = 上面第 4 行（改两处版本锚点）**；只有第 2 条判不过，才需要动插件代码。
