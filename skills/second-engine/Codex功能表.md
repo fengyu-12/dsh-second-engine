@@ -2,7 +2,7 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.161.0`（2026-10-08 升级）
+> **当前版本**：`0.163.0`（2026-10-17 升级；回滚物 `/root/codex/*.bak-0.162.1`）
 > **二进制**：musl 静态单文件，软链进 PATH 即可（本插件不依赖固定安装路径）。
 > **升级方式**：走 npmmirror 的 npm 平台包 `@openai/codex@<版本>-linux-arm64`（带官方 sha512）；
 > GitHub 直连易超时、部分镜像站内容可能损坏，装前务必核对 sha512。
@@ -74,36 +74,35 @@ codex doctor                                  # 一站式环境诊断：OS/provi
 
 ---
 
-## 3. 版本变更日志（只记和我们相关的）
+## 3. Codex 现版本功能（`0.163.0` · 2026-10-17 拉取）
 
-### 0.161.0（2026-10-08 安装；上游 10-07 发布）
+> **本节的维护方式：主 AI 自己拉** —— **不逐版累积变更日志**（那是无底洞，永远追着上游跑）。每次升级后用 `codex features list` / `codex --help` / 官方 release notes **重新拉一遍整节覆盖**即可。
 
-- **修复（与 Codex 集成直接相关）**：**Responses 重试与 WebSocket→HTTP 回退改为遵循服务端重试指引**（#49441）—— 减少上游过载时的过早失败（对应过程流里出现过的 `Reconnecting / stream disconnected`）；**thread resume 现在包含最新已提交历史**，且启动时更早发现可恢复的 SQLite 损坏、把损坏库留成备份（#49599 / #49701）—— 关系长链成员会话的可用性
-- **新增**：终端内 `/mcp login <name>` 登录 MCP 服务器（#49290）；语音设备与输入声道选择；`Daybreak` / Cyber access program 收紧为**显式 opt-in**（`--enable cli_daybreak`，只写 `daybreak=true` 不再够）—— 属"默认收紧了行为"，升级后别照抄旧文档
-- **与本机无关**：GPT-6.1 Sol 再次列为内置与 Bedrock 目录默认模型（#49318 / #49339）；Bedrock multi-agent V2 / GovCloud 区域；Windows 提权会话与 PowerShell 沙箱修复
-- **升级后实测**：`codex --version` = 0.161.0；`features list` 里 `memories` / `multi_agent_v2` / `network_proxy` / `recommended_plugins` 仍为 true（`[features]` 段无损）
+**交互面**
+- `/config` 搜索式设置：跨类别搜索偏好，部分项即时生效并标注哪些需重启
+- 响应中可发 follow-up **立即转向**（steer）；中断 turn 会一并停掉活动的 Code Mode cells 及其嵌套工具调用
+- `/keymap` 配 leader key（默认 `Ctrl+X`）；语音静音移到 `F9`
+- `/daemon` 重启托管后台服务（先警告可能被打断的工作，随后自动重连）
+- `/side` 切换线程后回到已有侧会话
 
-### 0.160.0（2026-10-01）
+**执行面**
+- `codex exec` 非交互单发：**不再在无关命令后重复打印同一文件 diff**；本地命令在子进程持有输出管道时及时结束，远程命令保留迟到输出
+- **只读工具可并行执行**（含 skill / memory / 会话历史查询）
+- `codex queue <消息>` 给已有会话排队 · `codex resume` / `fork`（picker 或 `--last`）
+- `codex agents` 浏览本地 app-server 守护上的全部会话
+- `codex archive` / `unarchive` / `delete`（delete 永久）· `codex migrate-rollouts` 旧会话迁移到分页历史
+- `codex app-server` · `exec-server` · `remote-control` · `cloud`（实验）
 
-- **新增**：Guardian review 可检索更早用户指令 + 纳入 agent handoff 上下文；agent command center 历史分页；项目外启动会话（策略允许时）+ resume 恢复已保存权限；X11 中键粘贴
-- **修复**：未发送的排队消息在重连后恢复（不再重复发送）；TUI 保留 server provider / reasoning-summary / verbosity 设置；resume/fork 历史显示正确会话；**显式 provider 模型目录不再塞入不支持的 bundled 模型**、刷新失败不再复用陈旧条目；**SQLite 连接与日志卡顿**；子代理保留仍在启动的环境并收到失败原因
-- **其他**：缓存 plugin manifest + 复用 HTTP 连接；后台回收日志数据库空间
+**权限与网络**
+- 恢复 thread 时**恢复其权限与网络审批**（尊重显式覆盖与当前 managed policy）
+- 网络代理：**DNS 查询前**检权限、拒绝重复 `Host` 头、防凭据别名绕过检查钩子
 
-### 0.159.x（2026-09-29 ~ 30）
+**诊断**
+- `codex doctor` 一站式环境体检 · `codex features list|enable|disable` · `codex sandbox` / `debug` / `apply` / `completion`
 
-- **0.159.0 新增**：`instant_interrupt`（opt-in，可打断并转向）；紧凑欢迎屏；警告查看器关闭即清已读（按 `k` 保留）；决定是否应用计划时可滚动 transcript；Mermaid 渲染支持更多图形/标签/节点组；app-server 可按指定 item 分页 thread 历史
-- **0.159.0 修复**：复制 transcript 保留 Markdown 表格与格式；空白会话切换任务保留草稿；已批准命令保留文件系统拒绝
-- **0.159.0 安全**：`.aws` 目录默认受保护
-- **0.159.0 移除**：自动 follow-up 提示建议 + `tui.prompt_suggestions` 设置；内置 `plugin-creator` skill ← **升级后要检查老配置里有无这些残留**
-- **0.159.1**：GPT-6.1 Sol 成为内置目录默认模型
-- **0.159.2**：Windows 控制台窗口抑制（backport）
-- **0.159.3**：ChatGPT 账号安全设置提醒（backport）
+**模型元数据（第三方 provider 必看）**：codex 内置模型表只含自家模型，第三方模型会退回**兜底窗口**（实测 `glm-5.3-flash` 的 `model_context_window` = `258400`，真值 1M）。用 `config.toml` 顶层的 `model_context_window` / `model_max_output_tokens` 覆盖。
 
-### 0.158.0（2026-09-28）
-
-上一个使用版本，未单独整理 release notes。
-
----
+- 主 AI 自己拉
 
 ## 4. 升级后检查清单
 
