@@ -42,7 +42,7 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 | DSH 主 AI | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
-## 协作看板（dual-board，v1.3 · 2026-09-27）
+## 协作看板（dual-board，v1.4）
 
 长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `/root/proj/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `/root/proj/AGENTS.md` 自动注入，无需人工提醒）：
 
@@ -50,6 +50,8 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 - **派单一律走 `dispatch.sh`**：自动注入收件箱未读段、附派单纪律、在派单**前**记基线 commit 与工作区脏快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
 - **看板**：`board.json` —— 状态 `pending / in_progress / blocked / completed / abandoned`（**无 reopen**，completed 不可复改）；工单三字段：`task`（用户原话，不可变）/ `context`（主 AI 解读）/ `frame`（质疑前提是分内事，由工具自动写入）。
 - **收件箱**：`inbox-codex.md` / `inbox-lead.md` 双向留言（经 `board.sh inbox-append`），已读标注 + 按月 JSONL 转档（`archive/`）；交付必含四段：交付 / **异议位** / 下一步建议 / 自验。
+- **可开工引导 `board.sh ready`**（v1.4 起）：只读列出「前置已满足」的下一步，与 `claim` 的依赖门互补（claim 是拒绝、ready 是引导；空态退出码 0）。
+- **过程级检索 `trace_search.py`**（v1.4 起）：`list` / `search` / `get` 三档，在历史会话 rollout 里按关键词找**过程证据**（不只找结论），`--exclude-session` 可排除自己。
 - **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
 - **可视化**：浏览器聊天桥（3095）的会话列表抽屉 = 成员会话切换，终端/网页/主 AI 三方同链。
 - ⚠️ **已知限制**：脏工作区下 scope 校验会漏报（协议 §十一）；给 Codex 的 workdir 尽量干净。
@@ -144,10 +146,14 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v1.2.1）
+## 支持能力一览（v3.0.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **首 token 看门狗（180s）** | ✅ 3.0.0 | app-server 模式迟迟不回第一个事件时不再无限挂起——超时即判失败并报错，工单不会静默卡死 |
+| **终态方法集合** | ✅ 3.0.0 | 过滤迟到的旧 turn 事件，避免上一轮结果覆盖当前工单 |
+| **上下文占用率多版本兜底** | ✅ 3.0.0 | `contextUsageRatio` 在多种 app-server 版本上都能算出（取不到时降级，不报错） |
+| **会话内切模型** | ✅ 3.0.0 | `thread/settings/update`：不重启即可在会话里换模型 |
 | 配置保留段（切提供方不丢） | ✅ v1.2.1 修复 | 重写 `config.toml` 时改用**黑名单**：只排除模板自有的 `[model_providers.*]` 与 `[memories]`，其余段一律原样保留；此前白名单式重写会把 `[features]` / `[tui]` / `[projects.*]` 静默抹掉且不报错 |
 | 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用）+ 松手吸附最近左右边缘 + 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
 | scope-check 脏工作区 | ✅ v1.2 修复 | 派单时记 `write_scopes` 的 sha256 快照，交付后比对——「派单前就脏、之后又被改」不再漏报；无 git 时降级为哈希校验 |
@@ -160,6 +166,15 @@ curl -s -X POST "$W/second-engine/api/task" \
 | 面板「联网搜索与 MCP」分区 | ✅ v0.3.4 | web_search 开关（live↔disabled）与 MCP 增删直接落 config.toml；八项验收 + 切提供方持久性 + 智谱端到端原生搜索实测通过 |
 | 工单审批策略 | ✅ v0.3.4 修复 | `approval_policy="never"` 固定写入 config；此前字段丢失曾致写工作副本外目录的工单无限挂起 |
 | 面板交互 | ✅ v1.0 | 分区折叠（右上角「展开/收回」带框文字按钮 + 标题行整行可点）、抽屉限高 78vh 内滚、**工单列表固定最近 5 条**（面板高度恒定，头部 × 不被挤掉）——手机实测确认 |
+
+## 版本记录（择要）
+
+| 版本 | 关键点 |
+|---|---|
+| **3.0.0** | 首 token 看门狗 180s · 终态方法集合（防迟到旧 turn）· `contextUsageRatio` 多版本兜底 · `thread/settings/update` 会话内切模型 |
+| v2.6 | dual-board **v1.4**（`ready` 引导 + `trace_search.py` 过程级检索）· 面板滚动条修复 · Codex 侧 dual-board 用法写入全局 `~/.codex/AGENTS.md` |
+| v2.5 | 编排层口径 · 翻译桥对账 tick · 互审硬预算 · `/providers/update` 支持 `wireApi` |
+| v1.2.1 | 配置保留段改用黑名单（切提供方不再丢 `[features]` / `[tui]` / `[projects.*]`） |
 
 ## 已知限制
 
@@ -188,13 +203,13 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 ```
 
 优先级：环境变量 `SECOND_ENGINE_EXEC_MODE` > 上述模式文件 > 默认 `exec`。
-验收脚本：`bash /root/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
+验收判据（三条，可自行复跑）：流式进度（`progress` 持续增长）/ 打断（`cancel` 后百毫秒级结束）/ exec 回归（切回 exec 仍能出结果）。
 
 **实时可见性（怎么判断"到底行动了没"）**：
 - **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
 - **exec 模式**：`GET /api/task?id=` 看 `liveBytes`（过程流字节数，持续增长即在动）；过程流保留在 `<outPath>.live`（最终结果仍以 `-o` 文件为准）。
 - **appserver 模式**：除 `liveBytes` 外还有 `progress` 数组（归一化事件，最近 20 条，可见 reasoning / 文本增量 / 工具调用 / 用量）。
-协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
+协议依据：事件 → 归一化字段的映射，源自 `codex app-server` 自己生成的 JSON Schema（照 Schema 对字段，别凭记忆猜事件名）。
 
 ## 架构
 
