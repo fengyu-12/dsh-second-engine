@@ -76,31 +76,29 @@ codex doctor                                  # 一站式环境诊断：OS/provi
 
 ## 3. Codex 现版本功能（`0.163.0` · 2026-10-17 拉取）
 
-> **本节的维护方式：主 AI 自己拉** —— **不逐版累积变更日志**（那是无底洞，永远追着上游跑）。每次升级后用 `codex features list` / `codex --help` / 官方 release notes **重新拉一遍整节覆盖**即可。
+> **维护方式：主 AI 自己拉 · 不留存历史版本** —— 不逐版累积（没完没了、永远追着上游跑）。每次升级后重新拉一遍**整节覆盖**，只留**当下版本的具体变更与修复**。
 
-**交互面**
-- `/config` 搜索式设置：跨类别搜索偏好，部分项即时生效并标注哪些需重启
-- 响应中可发 follow-up **立即转向**（steer）；中断 turn 会一并停掉活动的 Code Mode cells 及其嵌套工具调用
-- `/keymap` 配 leader key（默认 `Ctrl+X`）；语音静音移到 `F9`
-- `/daemon` 重启托管后台服务（先警告可能被打断的工作，随后自动重连）
-- `/side` 切换线程后回到已有侧会话
+**本版变更（0.163.0）**
 
-**执行面**
-- `codex exec` 非交互单发：**不再在无关命令后重复打印同一文件 diff**；本地命令在子进程持有输出管道时及时结束，远程命令保留迟到输出
-- **只读工具可并行执行**（含 skill / memory / 会话历史查询）
-- `codex queue <消息>` 给已有会话排队 · `codex resume` / `fork`（picker 或 `--last`）
-- `codex agents` 浏览本地 app-server 守护上的全部会话
-- `codex archive` / `unarchive` / `delete`（delete 永久）· `codex migrate-rollouts` 旧会话迁移到分页历史
-- `codex app-server` · `exec-server` · `remote-control` · `cloud`（实验）
+- **新增**：`/config` 搜索式设置（跨类别搜偏好，部分即时生效并标注哪些需重启）· 响应中可发 follow-up **立即转向**（中断会一并停掉活动的 Code Mode cells 及其嵌套工具调用）· `/keymap` 配 leader key（默认 `Ctrl+X`，语音静音移到 `F9`）· `/daemon` 重启托管后台服务（先警告可能被打断的工作，随后自动重连）· **只读工具可并行执行**（含 skill / memory / 会话历史查询）· `Daybreak` 对符合条件账号默认启用
+- **修复**：恢复 thread 时**恢复其权限与网络审批**（尊重显式覆盖与当前 managed policy）· 网络代理**改在 DNS 查询前检权限**、拒绝重复 `Host` 头、防凭据别名绕过检查钩子 · `/side` 切换线程后回到已有侧会话 · **`codex exec` 不再在无关命令后重复打印同一文件 diff** · 本地命令在子进程持有输出管道时及时结束，远程命令保留迟到输出
+- **app-server**：新增 prompt prefix 兼容测试 · **全局 config 与启动目录解耦**
+- **本机仍未验证**：exec 的 diff 改动在"多文件 / 多轮"下的表现；`Daybreak` 默认启用对本机（走第三方 provider）有无影响
 
-**权限与网络**
-- 恢复 thread 时**恢复其权限与网络审批**（尊重显式覆盖与当前 managed policy）
-- 网络代理：**DNS 查询前**检权限、拒绝重复 `Host` 头、防凭据别名绕过检查钩子
+**当前命令面（`codex --help` 实测，供速查）**
 
-**诊断**
-- `codex doctor` 一站式环境体检 · `codex features list|enable|disable` · `codex sandbox` / `debug` / `apply` / `completion`
+```bash
+codex exec | resume | fork | queue "<消息>"    # 单发 / 续会话 / 分叉 / 排队
+codex agents                                  # 浏览本地 app-server 守护上的全部会话
+codex archive | unarchive | delete <id|name>  # 会话归档 / 恢复 / 永久删除
+codex migrate-rollouts                        # 旧会话迁移到分页线程历史
+codex app-server | exec-server | remote-control | cloud    # 实验
+codex doctor                                  # 一站式环境体检
+codex features list | enable <名> | disable <名>   # ⚠️ 一次只能给一个名字
+codex sandbox | debug | apply | completion
+```
 
-**模型元数据（第三方 provider 必看）**：codex 内置模型表只含自家模型，第三方模型会退回**兜底窗口**（实测 `glm-5.3-flash` 的 `model_context_window` = `258400`，真值 1M）。用 `config.toml` 顶层的 `model_context_window` / `model_max_output_tokens` 覆盖。
+**模型元数据（第三方 provider 必看）**：codex 内置模型表只含自家模型，第三方模型会退回**兜底窗口**（实测 `glm-5.3-flash` 的 `model_context_window` = `258400`，而真值 1M）。用 `config.toml` 顶层的 `model_context_window` / `model_max_output_tokens` 覆盖。
 
 - 主 AI 自己拉
 
