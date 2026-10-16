@@ -146,7 +146,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.0.0）
+## 支持能力一览（v3.1.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -171,6 +171,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
+| **3.1.0** | exec 工单过程流 `.live` 跑完即删（不再积压磁盘）· `cleanup` 覆盖 `.live`（并跳过运行中的任务）· dual-board 用法段回灌 · SKILL 增「会话落盘路径与读法」 |
 | **3.0.0** | 首 token 看门狗 180s · 终态方法集合（防迟到旧 turn）· `contextUsageRatio` 多版本兜底 · `thread/settings/update` 会话内切模型 |
 | v2.6 | dual-board **v1.4**（`ready` 引导 + `trace_search.py` 过程级检索）· 面板滚动条修复 · Codex 侧 dual-board 用法写入全局 `~/.codex/AGENTS.md` |
 | v2.5 | 编排层口径 · 翻译桥对账 tick · 互审硬预算 · `/providers/update` 支持 `wireApi` |
