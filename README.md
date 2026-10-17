@@ -73,14 +73,44 @@ codex --version   # 验证
 
 > GitHub 直连慢/失败：在下载 URL 前加镜像前缀（如 `https://ghproxy.net/https://github.com/...`）。资产文件名以 Releases 页实际列表为准。
 
-## 安装
+### 用 GPT 系模型：还要装 `codex-code-mode-host`（必读）
+
+Codex 自 0.144 起把命令执行拆到独立 sidecar。用 `gpt-5.6-*` / `gpt-6-*` / `codex-auto-review` 这类 **`code_mode_only`** 模型时，缺了它模型能正常回话、但**工具一个都执行不了**（报 `failed to spawn code-mode host ... host executable was not found`）；内置目录里只有 `gpt-5.5` 不受影响，降版本也躲不开。
+
+取与 CLI **同版本**的 sidecar，解压后放到 **codex 主二进制同目录**（无需进 PATH）：
 
 ```bash
-# 1. 放置插件实体
-cp -a dsh-second-engine /root/dsha-second-engine
-cd /root/dsha-second-engine && npm install --omit=dev
+VER=$(codex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+curl -fL -o /tmp/cmh.tar.gz \
+  "https://ghproxy.net/https://github.com/openai/codex/releases/download/rust-v${VER}/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz"
+tar -xzf /tmp/cmh.tar.gz -C /tmp
+install -m 0755 /tmp/codex-code-mode-host-* \
+  "$(dirname "$(readlink -f "$(command -v codex)")")/codex-code-mode-host"
+```
 
-# 2. 注册进 profile（link: 方式，须指向 /root/dsha-* 实体）
+> 备选通道：npmmirror 的 `@openai/codex@<版本>-linux-arm64` 平台包（`vendor/<arch>/bin/` 内含它）。
+> 验收判据：让它「建一个文件并运行」——回复像不像不算数，看文件是否真落盘。回复正确但目录为空＝host 没装上。
+
+## 安装
+
+两种方式二选一。**不要跳过依赖安装**：插件用 `link:` 注册时，宿主不会替你装插件自己的依赖；缺依赖的表现是「装完重启，设置页没有第二引擎」，而且没有报错。
+
+### 方式 A：tgz 安装（推荐，无需改配置文件）
+
+1. 下载 Releases 里的 `dsh-second-engine-3.1.1.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.1.1.tgz`）；
+3. 重启 Web，设置页出现「第二引擎」即成功。
+
+tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
+
+### 方式 B：源码安装（需要终端）
+
+```bash
+# 1. 解压源码到实体目录（目录与路径随你，下文以 /root/dsha-second-engine 为例）
+cd /root/dsha-second-engine
+npm install --omit=dev          # ★ 必做：link: 不会替你装依赖，跳过这步插件会静默不加载
+
+# 2. 注册进 profile
 cd ~/.dsh/profiles/web
 #   package.json: dependencies 加 "dsh-second-engine": "link:/root/dsha-second-engine"
 #   dsh.profile.bundles 数组加 "dsh-second-engine"
@@ -146,7 +176,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.1.0）
+## 支持能力一览（v3.1.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -171,6 +201,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
+| **3.1.1** | 文档补全：安装分「tgz / 源码」两种方式并标明 link: 必装依赖 · 用 GPT 系模型需另装 `codex-code-mode-host`（含镜像下载与「文件真落盘」验收判据） |
 | **3.1.0** | exec 工单过程流 `.live` 跑完即删（不再积压磁盘）· `cleanup` 覆盖 `.live`（并跳过运行中的任务）· dual-board 用法段回灌 · SKILL 增「会话落盘路径与读法」 |
 | **3.0.0** | 首 token 看门狗 180s · 终态方法集合（防迟到旧 turn）· `contextUsageRatio` 多版本兜底 · `thread/settings/update` 会话内切模型 |
 | v2.6 | dual-board **v1.4**（`ready` 引导 + `trace_search.py` 过程级检索）· 面板滚动条修复 · Codex 侧 dual-board 用法写入全局 `~/.codex/AGENTS.md` |
