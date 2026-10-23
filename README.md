@@ -97,8 +97,8 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 
 ### 方式 A：tgz 安装（推荐，无需改配置文件）
 
-1. 下载 Releases 里的 `dsh-second-engine-3.1.1.tgz`；
-2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.1.1.tgz`）；
+1. 下载 Releases 里的 `dsh-second-engine-3.1.2.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.1.2.tgz`）；
 3. 重启 Web，设置页出现「第二引擎」即成功。
 
 tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
@@ -176,7 +176,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.1.1）
+## 支持能力一览（v3.1.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
