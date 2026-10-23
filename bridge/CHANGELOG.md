@@ -8,6 +8,27 @@
 
 ---
 
+# 2026-10-23 — 3.1.2 适配 DSH 0.2.1
+
+## 1. 做了什么
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| 兼容声明 | `package.json` | 新增 `engines.dsh: ">=0.2.1-alpha.5"`；DSH 0.2.1 的兼容检查按它判定，不再显示 unknown |
+| 版本 | `package.json`、`README.md` | 3.1.1 → 3.1.2 |
+| 文档 | `skills/second-engine/SKILL.md` | Codex 锚点更新到 0.163.0，补 0.2.1 实测结论 |
+
+## 2. 实测
+
+- DSH 0.2.1-rc.2 / DSHA build190：插件 host `loaded`，设置页「第二引擎」入口正常，无 `ERR_MODULE_NOT_FOUND`。
+- 依赖不变：`@deepseek-ai/schemastery` 由宿主提供，未新增第三方依赖。
+
+## 3. 未验
+
+- 桌面壳未实测；dual-board 与聊天桥的端到端未在 0.2.1 重跑。
+
+---
+
 # 2026-09-29（续）— 浏览器聊天桥并入插件：4 透传路由 + 面板桥卡 + MCP 启用/禁用
 
 ## 1. 做了什么
