@@ -19,6 +19,8 @@
   - 引擎状态灯：Codex 二进制 / config.toml / API Key（纯本地探测，不上报）
   - **模型提供方管理**：预设 DeepSeek / 智谱（端点均经实测），支持添加任意自定义提供方（Provider ID / 名称 / API 地址 / 协议 / 模型），可编辑、填 Key、切换激活
   - **模型获取与选择**：一键从提供方拉取可用模型列表，下拉切换
+  - **模型与思考**：`/api/config` 写 `config.toml` 顶层 `model` / `model_reasoning_effort` / `model_reasoning_summary` / `sandbox_mode` / `approval_policy` / `web_search`（键白名单 + 写前备份 + 原子替换）
+  - **插件自身版本提示**：`/api/plugin-version` 读自身 `package.json` 与 GitHub releases 比对（成功缓存 1h / 失败 10min）；**无更新时界面完全不出现**，有更新才在设置卡与浮动球提示，只提示不自动装
   - 会话清理：按保留天数清理 Codex 会话文件
 - **浮动球**：会话界面常驻半露小球，点开即达状态摘要与工单入口
 - **异步工单**：面板直接下发任务（后台 `codex exec`），完成经 App 通知提醒，支持取消
@@ -180,6 +182,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| 插件自身版本提示 | ✅ 3.1.2 | `/api/plugin-version` 读自身 `package.json` 与 GitHub releases 比对（成功缓存 1h / 失败 10min）；**无更新时界面完全不出现**，有更新才在设置卡徽标与浮动球红点提示，只提示不自动装 |
 | **首 token 看门狗（180s）** | ✅ 3.0.0 | app-server 模式迟迟不回第一个事件时不再无限挂起——超时即判失败并报错，工单不会静默卡死 |
 | **终态方法集合** | ✅ 3.0.0 | 过滤迟到的旧 turn 事件，避免上一轮结果覆盖当前工单 |
 | **上下文占用率多版本兜底** | ✅ 3.0.0 | `contextUsageRatio` 在多种 app-server 版本上都能算出（取不到时降级，不报错） |
@@ -201,6 +204,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
+| **3.1.2** | 插件自身版本提示（`/api/plugin-version`，默认完全静默）· 面板「模型与思考」`/api/config`（键白名单 + 写前备份 + 原子替换）· 设置页改分区制（说明收进「?」、provider 主行只留名称/徽标/模型、会话清理折起）· 悬浮球面板重排（标题行状态点+模型名、版本与占用并一行、空态去框）· 面板高度跟随 `visualViewport`（键盘弹出不再慢半拍） |
 | **3.1.1** | 文档补全：安装分「tgz / 源码」两种方式并标明 link: 必装依赖 · 用 GPT 系模型需另装 `codex-code-mode-host`（含镜像下载与「文件真落盘」验收判据） |
 | **3.1.0** | exec 工单过程流 `.live` 跑完即删（不再积压磁盘）· `cleanup` 覆盖 `.live`（并跳过运行中的任务）· dual-board 用法段回灌 · SKILL 增「会话落盘路径与读法」 |
 | **3.0.0** | 首 token 看门狗 180s · 终态方法集合（防迟到旧 turn）· `contextUsageRatio` 多版本兜底 · `thread/settings/update` 会话内切模型 |
