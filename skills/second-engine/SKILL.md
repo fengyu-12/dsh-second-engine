@@ -72,7 +72,7 @@ DSH 侧现在**两条路都能叫到 Codex**，别混：
 ## 引擎现状（2026-09-21 发布版实测）
 - 二进制 `/usr/local/bin/codex`（**当前 0.163.0**，2026-10-23 实测；工具面/执行链/依赖点在 0.162.1 时三条全过，升 0.163.0 后未重跑全套；musl 静态）；**升级姿势 + 升级后破坏性检验见本文末节**；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**
 - 提供方与 key 由插件统一管理：`~/.codex/keyring.json`（0600，**不要手改**），激活提供方切换时自动重写 `~/.codex/config.toml`（**不要手改**，sandbox_mode 已自动保留）
-- 预设三家均实测直连：DeepSeek（responses）/ 智谱（responses，Coding 端点）/ 云知声（chat，经本地翻译桥自动挂接）
+- 预设两家均实测直连：DeepSeek（responses）/ 智谱（responses，Coding 端点）；chat 协议上游（中转 / 自建）经本地翻译桥自动挂接
 - 🔴 **wireApi 怎么选（2026-10-03 实证，接任何第三方端点前必做）**：判据只有一条 —— 直接 `POST {base}/responses` 发个最小请求，**200 = 原生支持 Responses，就标 `responses` 直连**；只有它 404/400 时才标 `completions` 走桥。**别默认套 `completions`**：桥（`src/bridge.js`）只保证**文本**往返，**工具调用循环会断** —— 同模型（glm-5.3）同工单，经桥两次都是 `exit 0 + 零产物 + 只回一句计划`（17.6s / 空 output），改直连后**同一工单立刻** `exec /bin/bash -lc '...' succeeded` 且文件真落盘。**判据："工单 exit 0 但工作目录没有新文件" = 假完成**，第一件事就是查它是不是走了桥。
 - ✅ **`/providers/update` 现已支持 `wireApi`**（2026-10-03 补齐；源码：字段白名单含 `wireApi`、该提供方为 active 且值有变化时连带重写 `config.toml`，见 `src/index.js:945-973`）→ 原地把 `completions` 改成 `responses` 即可，**不必再"新增一个提供方再切 active"绕行**。⚠️ 两条前提：① 改完**重启 Web** 新代码才生效——未重启时旧代码仍会忽略它，`updated:[]` + `configRegenerated:false` 就是这个信号；② 换成 `responses` 前先按上一条验过端点原生支持，否则工具调用循环会断。
 
