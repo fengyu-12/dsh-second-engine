@@ -2453,26 +2453,28 @@ async function handleVersion(_req, res) {
 const PLUGIN_RELEASES_URL = 'https://api.github.com/repos/fengyu-12/dsh-second-engine/releases/latest'
 const PLUGIN_FAIL_CACHE_TTL_MS = 10 * 60 * 1000   // 失败也缓存，别让设置页反复打 GitHub
 let pluginVersionCache = { at: 0, latest: '', htmlUrl: '' }
-let ownVersionMemo = null
+// 按 package.json 的 mtime 缓存：文件没变不重复解析，改了立即生效（不再需要重启才认新版本号）。
+let ownVersionCache = { mtime: -1, version: '' }
 
 // 插件自身版本：package.json 相对模块文件往上找（最多两级），并校验包名防止误吃别的 package.json。
 // 不写死绝对路径——插件可能被装到任意目录。找不到回 ''（后续比较恒为 false，静默）。
 function ownPluginVersion() {
-  if (ownVersionMemo !== null) return ownVersionMemo
   try {
     const self = dirname(fileURLToPath(import.meta.url))
     for (const base of [self, join(self, '..')]) {
       const pkgPath = join(base, 'package.json')
       if (!existsSync(pkgPath)) continue
+      const mt = statSync(pkgPath).mtimeMs
+      if (mt === ownVersionCache.mtime) return ownVersionCache.version
       const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
       if (pkg && pkg.name === 'dsh-second-engine') {
-        ownVersionMemo = parseVersion(pkg.version) || ''
-        return ownVersionMemo
+        ownVersionCache = { mtime: mt, version: parseVersion(pkg.version) || '' }
+        return ownVersionCache.version
       }
     }
   } catch { /* 解析失败按找不到处理 */ }
-  ownVersionMemo = ''
-  return ownVersionMemo
+  ownVersionCache = { mtime: -1, version: '' }
+  return ''
 }
 
 // 远端最新 release：成功缓存 1 小时（复用 VERSION_CACHE_TTL_MS），失败缓存 10 分钟。
