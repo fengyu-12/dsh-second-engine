@@ -75,7 +75,6 @@ const PRESET_PROVIDERS = [
   // DeepSeek 官方文档实证的上下文/输出上限，写 config.toml 顶层（见 writeCodexConfig）。
   { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'responses', model: 'deepseek-flash', contextWindow: 1048576, maxOutput: 393216 },
   { id: 'zhipu', name: '智谱', baseUrl: 'https://open.bigmodel.cn/api/v1', wireApi: 'responses', model: 'glm-4.6' },
-  { id: 'yun', name: '云知声', baseUrl: 'https://maas-api.unisound.com/v1', wireApi: 'completions', model: 'u2-flash' },
 ]
 const PRESET_IDS = new Set(PRESET_PROVIDERS.map((p) => p.id))
 const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
@@ -1034,7 +1033,7 @@ async function handleProviderActive(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-// POST /providers/delete：核心默认（deepseek/zhipu）不可删；云知声与自定义项可删。删除 active 时回落并同步 config.toml。
+// POST /providers/delete：核心默认（deepseek/zhipu）不可删；自定义提供方均可删。删除 active 时回落并同步 config.toml。
 const PROTECTED_IDS = new Set(['deepseek', 'zhipu'])
 async function handleProviderDelete(req, res) {
   try {
@@ -1042,7 +1041,7 @@ async function handleProviderDelete(req, res) {
     const id = typeof body.id === 'string' ? body.id.trim() : ''
     if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
     if (PROTECTED_IDS.has(id)) {
-      return send(res, { ok: false, error: `核心默认提供方 '${id}' 不允许删除（云知声与自定义项均可删）` }, 400)
+      return send(res, { ok: false, error: `核心默认提供方 '${id}' 不允许删除（自定义提供方均可删）` }, 400)
     }
     const doc = loadKeyring()
     const index = doc.providers.findIndex((p) => p.id === id)

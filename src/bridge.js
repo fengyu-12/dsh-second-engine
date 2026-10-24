@@ -1,7 +1,7 @@
 // dsha-second-engine —— Responses → Chat 翻译桥核心模块。
 //
 // 背景：Codex 0.155.1 只会说 Responses 协议（POST /responses，SSE 回放），
-// 而上游（云知声 maas-api.unisound.com/v1 等）只说 Chat Completions。
+// 而上游（只提供 Chat Completions 的厂商 / 中转 / 自建网关）不会说 Responses。
 // 本模块提供两块可单测的能力：
 //   1. 纯函数转换器：responsesToChat / chatToResponses（无 IO，无副作用）
 //   2. createBridgeServer：本地 node:http 桥，收 Responses 请求 → 转 Chat →
@@ -460,7 +460,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const bridge = createBridgeServer({
     upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}`,
     apiKey: 'test-key',
-    getModel: () => 'unisound-test-model',
+    getModel: () => 'test-model',
   })
   await once(bridge, 'listening')
 
@@ -485,7 +485,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'unisound-test-model',
+        model: 'test-model',
         instructions: 'You are a helper.',
         input: [
           { type: 'message', role: 'user', content: [{ type: 'input_text', text: '上海天气？' }] },

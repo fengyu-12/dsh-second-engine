@@ -26,7 +26,7 @@
 - **异步工单**：面板直接下发任务（后台 `codex exec`），完成经 App 通知提醒，支持取消
 - **双向互审**：把产出交给 Codex 做多轮批判性复核（轮数上限 / 零新增提前收敛 / 分歧打包上交用户 / 任意时刻熔断），轮数在面板设置
 - **卡点求助协议**：插件自动向 `~/.codex/AGENTS.md` 写入协作协议——Codex 连续失败或绕圈时主动调 `/api/consult` 提交卡点并通知，主 AI 带建议接手
-- **本地翻译桥**（实验性）：`responses → chat completions` 协议转换，让仅有 chat 协议的提供方（云知声 / 部分中转）也能接入 Codex
+- **本地翻译桥**（实验性）：`responses → chat completions` 协议转换，让仅有 chat 协议的提供方（部分中转 / 自建网关）也能接入 Codex
 - **知识层**：随包分发 SKILL.md，主 AI 自动获得唤起与协作流程（工单下发、diff 审查、异常速查）
 
 ## 环境单例 —— 安卓上的 PC 式双引擎
@@ -161,7 +161,6 @@ pnpm install
 |---|---|---|---|
 | DeepSeek | `https://api.deepseek.com/v1` | responses | 直连 |
 | 智谱 | `https://open.bigmodel.cn/api/v1` | responses | GLM Coding 端点 |
-| 云知声 | `https://maas-api.unisound.com/v1` | chat（经本地桥） | 多模型聚合 MaaS |
 
 ### 会话与磁盘（谁落盘，落哪里）
 
@@ -206,7 +205,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 | 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用）+ 松手吸附最近左右边缘 + 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
 | scope-check 脏工作区 | ✅ v1.2 修复 | 派单时记 `write_scopes` 的 sha256 快照，交付后比对——「派单前就脏、之后又被改」不再漏报；无 git 时降级为哈希校验 |
 | Codex 功能表 | ✅ v1.2 | `skills/second-engine/Codex功能表.md` 随包分发 |
-| 提供方切换 / 工单 / 双向互审 | ✅ | DeepSeek / 智谱直连，云知声经翻译桥；切换不丢用户配置（sandbox、MCP） |
+| 提供方切换 / 工单 / 双向互审 | ✅ | DeepSeek / 智谱直连，chat 协议上游经翻译桥自动挂接；切换不丢用户配置（sandbox、MCP） |
 | AGENTS.md 联网搜索三档降级 | ✅ v2 | 原生 web_search 优先 → Exa MCP 备胎 → 全无则凭已有知识完成任务并标注「未经联网核实」；v1 用户自动原位升级 |
 | tools/t-tool.sh | ✅ 实测 | tmux 交互窗口：屏幕快照、哨兵式等待、`run` 退出码回传、owner 防串台；**依赖 tmux**（`apt install tmux`） |
 | tools/wait-task.sh | ✅ 实测 | 工单完成阻塞等待，退出码语义完整；配后台 job 使用，完成通知自动唤醒等待者 |
@@ -254,13 +253,13 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 ```
 
 优先级：环境变量 `SECOND_ENGINE_EXEC_MODE` > 上述模式文件 > 默认 `exec`。
-验收判据（三条，可自行复跑）：流式进度（`progress` 持续增长）/ 打断（`cancel` 后百毫秒级结束）/ exec 回归（切回 exec 仍能出结果）。
+验收脚本：`bash /root/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
 
 **实时可见性（怎么判断"到底行动了没"）**：
 - **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
 - **exec 模式**：`GET /api/task?id=` 看 `liveBytes`（过程流字节数，持续增长即在动）；过程流保留在 `<outPath>.live`（最终结果仍以 `-o` 文件为准）。
 - **appserver 模式**：除 `liveBytes` 外还有 `progress` 数组（归一化事件，最近 20 条，可见 reasoning / 文本增量 / 工具调用 / 用量）。
-协议依据：事件 → 归一化字段的映射，源自 `codex app-server` 自己生成的 JSON Schema（照 Schema 对字段，别凭记忆猜事件名）。
+协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
 ## 架构
 
