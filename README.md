@@ -128,6 +128,21 @@ pnpm install
 3. 「获取模型列表」→ 下拉选择模型 → 启用；
 4. 终端快速启动：`codex-env`（自动注入激活提供方的 Key 并进入 Codex TUI）；只想取浏览器聊天桥网址用 `codex-env -u`。
 
+### 路径与环境变量（换机器必读）
+
+`/root` 本身是 DSHA 容器的固定根，**不用改**。真正要确认的是「你的 Codex 工作区在哪」——
+下表是按本机默认值整理的，个别变量你的环境可能不同：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SECOND_ENGINE_WORKDIR` | `/root/proj` | 异步工单的默认工作目录。这是**作者本机的 Codex 工作区**，你的机器上可能没有 ⇒ 设成自己的项目目录，或先 `mkdir -p /root/proj` |
+| `DSH_HOME` | `/root/.dsh` | DSH 数据目录，决定 `.bridge_token` 的落点。DSHA 默认就是它，一般无需改 |
+| `DSH_BRIDGE_TOKEN_PATH` | `$DSH_HOME/.bridge_token` | 通知令牌文件完整路径，一般不用动 |
+| `DSH_WEB_URL` | 宿主注入 | 插件路由基址，**不要写死端口** |
+| `SECOND_ENGINE_EXEC_MODE` | `exec` | 工单执行模式（`exec` / `appserver`） |
+
+> 出现「工单卡住 / 找不到目录 / 通知发不出」时，先对照上表看这两个路径是否落在真实存在的目录。
+
 ### 终端使用（TUI）
 
 | 动作 | 方式 |
