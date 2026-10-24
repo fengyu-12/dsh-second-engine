@@ -268,6 +268,8 @@ export function createBridgeServer({ upstreamBaseUrl, apiKey, getModel } = {}) {
 const errMsg = (e) => (e && e.message) ? e.message : String(e)
 
 async function handleRequest(req, res, { base, apiKey, getModel }) {
+  // 客户端中途断开后，对 res 的后续写会触发 error 事件；挂空监听避免击穿进程。
+  res.on('error', () => { /* 对端已断开：无事可做 */ })
   const url = (req.url || '').split('?')[0]
   if (req.method !== 'POST' || url !== '/responses') {
     res.statusCode = 404
@@ -299,6 +301,8 @@ async function handleRequest(req, res, { base, apiKey, getModel }) {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
       body: JSON.stringify(chatReq),
+      // 上游挂死保护：长生成用不到 10 分钟，超时走 catch 的 SSE error 路径。
+      signal: AbortSignal.timeout(600_000),
     })
 
     if (!upstream.ok) {
@@ -315,12 +319,27 @@ async function handleRequest(req, res, { base, apiKey, getModel }) {
   }
 }
 
+// 请求体上限：Responses 请求携带全量历史可达数 MB；64MB 封顶防 OOM。
+// 客户端半途中断（只触发 close、无 error/end）时兜底 reject，请求不至于永久挂起占连接。
+const BRIDGE_MAX_BODY_BYTES = 64 * 1024 * 1024
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', reject)
+    let received = 0
+    let settled = false
+    const fail = (err) => { if (!settled) { settled = true; reject(err) } }
+    req.on('data', (c) => {
+      received += c.length
+      if (received > BRIDGE_MAX_BODY_BYTES) {
+        try { req.destroy() } catch { /* best effort */ }
+        fail(new Error('request body too large'))
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).toString('utf8')) } })
+    req.on('error', fail)
+    req.on('close', () => fail(new Error('client aborted')))
   })
 }
 

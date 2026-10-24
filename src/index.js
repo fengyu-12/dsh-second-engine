@@ -23,6 +23,7 @@
 //   POST   /second-engine/api/consult           Codex 卡点求助入队（内存 20 条 + 弹 App 通知）
 //   GET    /second-engine/api/consults          求助列表（不脱敏，给主 AI 收卷）
 //   GET    /second-engine/api/version           本机 codex 版本 vs GitHub 最新 release（updateAvailable）
+//   GET    /second-engine/api/plugin-version    插件自身版本 vs GitHub 最新 release（失败静默，无更新不提示）
 //   GET    /second-engine/api/websearch         读 config.toml 顶层 web_search（无则 disabled）
 //   POST   /second-engine/api/websearch         写 web_search { value: disabled|cached|indexed|live }
 //   GET    /second-engine/api/mcp               config.toml 全部 [mcp_servers.*] 段
@@ -32,16 +33,17 @@
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, appendFileSync } from 'node:fs'
-import { spawn, execSync, execFile } from 'node:child_process'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, renameSync, openSync, fstatSync, readSync, closeSync, createWriteStream } from 'node:fs'
+import { spawn, execFile } from 'node:child_process'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import http from 'node:http'
 import { join, resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
 import { startAppServerTurn } from './app-server-client.js'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 
 export const name = 'second-engine'
 
@@ -96,6 +98,14 @@ const tasks = new Map()
 const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || '/root/proj'
 const TASK_LIST_LIMIT = 10
 const TASK_KEEP_LIMIT = 50
+// 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
+const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
+
+// 任务/复核/求助 ID：时间前缀可读可排序 + 8 字节强随机。
+// （旧式 4 字符随机段在并发提交时会碰撞，tasks.set 直接覆盖既有条目。）
+function newId() {
+  return `${Date.now().toString(36)}-${randomBytes(8).toString('hex')}`
+}
 
 // ── Codex 卡点求助（consult）──
 // 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
@@ -181,18 +191,34 @@ function send(res, data, status = 200) {
   res.end(JSON.stringify(data))
 }
 
+// 请求体上限：设置页 API 的 payload 都很小，但 /api/review 的 content 可能承载
+// 整份交付文档，取 4MB 兼顾两者；超限直接断开按空体处理，防超大包全量缓冲进内存。
+const MAX_BODY_BYTES = 4 * 1024 * 1024
 function readBody(req) {
   return new Promise((resolve) => {
     const chunks = []
-    req.on('data', (c) => chunks.push(c))
+    let received = 0
+    let settled = false
+    const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
+    req.on('data', (c) => {
+      received += c.length
+      if (received > MAX_BODY_BYTES) {
+        try { req.destroy() } catch { /* best effort */ }
+        finish({})
+        return
+      }
+      chunks.push(c)
+    })
     req.on('end', () => {
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
+        finish(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
       } catch {
-        resolve({})
+        finish({})
       }
     })
-    req.on('error', () => resolve({}))
+    req.on('error', () => finish({}))
+    // 客户端半途中断且只触发 close（无 error/end）时兜底，handler 不至于永久挂起。
+    req.on('close', () => finish({}))
   })
 }
 
@@ -228,6 +254,16 @@ function sessionsBytes(dir = SESSIONS_DIR) {
   return total
 }
 
+// status 轮询缓存：递归 stat 整棵 sessions 树不便宜（设置页/浮球会反复刷），
+// TTL 内复用上次结果；runAutoCleanup 仍用新鲜的 sessionsBytes()。
+const SESSIONS_BYTES_TTL_MS = 10000
+let sessionsBytesCache = { at: 0, value: 0 }
+function sessionsBytesCached() {
+  if (Date.now() - sessionsBytesCache.at < SESSIONS_BYTES_TTL_MS) return sessionsBytesCache.value
+  sessionsBytesCache = { at: Date.now(), value: sessionsBytes() }
+  return sessionsBytesCache.value
+}
+
 // 脱敏预览：前 6 后 4；过短的 key 只留首尾各 2 位
 function maskKey(key) {
   if (key.length <= 10) return `${key.slice(0, 2)}****${key.slice(-2)}`
@@ -258,10 +294,24 @@ function normalizeProvider(raw) {
   return provider
 }
 
+// 原子落盘：同目录临时文件 + rename 顶替。直接 writeFileSync 目标路径，进程中途
+// 崩溃/断电会留下半截文件（keyring.json / config.toml 随之解析失败）；mode 在创建
+// 临时文件时即生效，0600 没有「先建后 chmod」的 world-readable 窗口。
+function atomicWriteFileSync(path, text, mode = 0o600) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
+  writeFileSync(tmp, text, { encoding: 'utf8', mode })
+  chmodSync(tmp, mode)
+  try {
+    renameSync(tmp, path)
+  } catch (e) {
+    try { unlinkSync(tmp) } catch { /* best effort */ }
+    throw e
+  }
+}
+
 function saveKeyring(doc) {
   mkdirSync(CODEX_DIR, { recursive: true })
-  writeFileSync(KEYRING_PATH, `${JSON.stringify(doc, null, 2)}\n`, 'utf8')
-  chmodSync(KEYRING_PATH, 0o600)
+  atomicWriteFileSync(KEYRING_PATH, `${JSON.stringify(doc, null, 2)}\n`)
 }
 
 // 复核轮数：只认 1/3/5，其余（含缺失、非法、字符串数字以外的垃圾值）一律回落默认 3。
@@ -366,7 +416,14 @@ function loadKeyring() {
   let doc = null
   try {
     doc = JSON.parse(readFileSync(KEYRING_PATH, 'utf8'))
-  } catch { doc = null }
+  } catch {
+    doc = null
+    // 「文件在但读不了/解析不了」= 损坏：先把坏文件改名留证再重置，
+    // 否则用户的全部自定义提供方与 apiKey 会被静默抹掉且无从恢复。
+    if (existsSync(KEYRING_PATH)) {
+      try { renameSync(KEYRING_PATH, `${KEYRING_PATH}.corrupt-${Date.now().toString(36)}`) } catch { /* best effort */ }
+    }
+  }
 
   if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
     const fresh = { providers: presetProviders(), active: DEFAULT_ACTIVE, reviewRounds: REVIEW_DEFAULT_ROUNDS, reviewWallMs: REVIEW_DEFAULT_WALL_MS, reviewTokenLimit: REVIEW_DEFAULT_TOKEN_LIMIT }
@@ -488,6 +545,31 @@ function extractPreservedSections() {
   } catch { /* 原文件不存在：无可保留 */ return [] }
 }
 
+// 模板自己生成的顶层键（每次重写重新生成）；其余顶层键值行重写时原样带回。
+// 原先只显式保留 sandbox_mode/web_search，用户手写的其它顶层键（如
+// disable_response_storage）在切换提供方时被静默丢弃。
+const TEMPLATE_OWNED_TOP_LEVEL = new Set([
+  'model_provider', 'model', 'sandbox_mode', 'web_search', 'approval_policy',
+  'model_context_window', 'model_max_output_tokens',
+])
+
+// 首个段头之前的非模板顶层 key = value 行（原样保留；TOML 顶层键必须在首个 [table] 前）。
+function extractPreservedTopLevelLines() {
+  try {
+    const raw = readFileSync(CONFIG_PATH, 'utf8')
+    const lines = raw.split('\n')
+    const firstTable = lines.findIndex((l) => /^\s*\[/.test(l))
+    const head = firstTable === -1 ? lines : lines.slice(0, firstTable)
+    const kept = []
+    for (const line of head) {
+      const m = /^\s*([A-Za-z0-9_.-]+)\s*=/.exec(line)
+      if (m === null || TEMPLATE_OWNED_TOP_LEVEL.has(m[1])) continue
+      kept.push(line.trim())
+    }
+    return kept
+  } catch { /* 原文件不存在：无可保留 */ return [] }
+}
+
 // ── config.toml 读写（web_search / mcp_servers）──
 // 与 extractMcpServerBlocks 同口径：读不到就当下不存在，绝不抛错。
 function readConfigRaw() {
@@ -497,8 +579,7 @@ function readConfigRaw() {
 // 落盘统一走这里：目录先建、权限 0600（config.toml 里有 apiKey 引用等敏感信息）。
 function writeConfigRaw(text) {
   mkdirSync(CODEX_DIR, { recursive: true })
-  writeFileSync(CONFIG_PATH, text, 'utf8')
-  chmodSync(CONFIG_PATH, 0o600)
+  atomicWriteFileSync(CONFIG_PATH, text)
 }
 
 // 读顶层字符串字段（无该字段/文件缺失 → fallback）。与 sandbox_mode 保留同一写法。
@@ -818,14 +899,15 @@ async function writeCodexConfig(provider) {
       `consolidation_model = ${tomlString(provider.model)}`,
     )
   }
+  // 顶层兜底保留：非模板顶层键（见 extractPreservedTopLevelLines）原样带回。
+  lines.push(...extractPreservedTopLevelLines())
   // 保留模板外的用户/工具配置段：mcp_servers.*、features、tui、projects.* 等。
   // 同 sandbox_mode 的保留逻辑 —— 不在重写时丢失。
   // （2026-10-02 修正：原先只保留 mcp_servers，切提供方时 [features] 被丢，
   //   feature 开关被静默重置为默认值，见 extractPreservedSections 注释。）
   const keptBlocks = extractPreservedSections()
   if (keptBlocks.length > 0) lines.push(...keptBlocks, '')
-  writeFileSync(CONFIG_PATH, lines.join('\n'), 'utf8')
-  chmodSync(CONFIG_PATH, 0o600)
+  atomicWriteFileSync(CONFIG_PATH, lines.join('\n'))
   return envKey
 }
 
@@ -837,7 +919,7 @@ async function handleStatus(_req, res) {
       codexBinary: existsSync(CODEX_BINARY),
       configExists: existsSync(CONFIG_PATH),
       keyConfigured: keyConfigured(),
-      sessionsBytes: sessionsBytes(),
+      sessionsBytes: sessionsBytesCached(),
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -935,9 +1017,19 @@ async function handleProviderActive(req, res) {
     const doc = loadKeyring()
     const target = doc.providers.find((p) => p.id === id)
     if (target === undefined) return send(res, { ok: false, error: `未找到提供方 '${id}'` }, 404)
+    // 先落 keyring，config 重写失败时回滚 active：避免「active 已持久化、
+    // config.toml 还指着旧提供方」的两处不一致（对账 tick 只自愈桥，不自愈直连配置）。
+    const previousActive = doc.active
     doc.active = id
     saveKeyring(doc)
-    const envKey = await writeCodexConfig(target)
+    let envKey = ''
+    try {
+      envKey = await writeCodexConfig(target)
+    } catch (e) {
+      doc.active = previousActive
+      try { saveKeyring(doc) } catch { /* 回滚失败：用户重试兜底 */ }
+      throw e
+    }
     send(res, { ok: true, active: id, configPath: CONFIG_PATH, backupPath: CONFIG_BACKUP_PATH, envKey })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -956,19 +1048,21 @@ async function handleProviderDelete(req, res) {
     const index = doc.providers.findIndex((p) => p.id === id)
     if (index === -1) return send(res, { ok: false, error: `未找到提供方 '${id}'` }, 404)
     doc.providers.splice(index, 1)
-
     let configRegenerated = false
+    let fallback = null
     if (doc.active === id) {
       doc.active = DEFAULT_ACTIVE
-      const fallback = doc.providers.find((p) => p.id === DEFAULT_ACTIVE)
-      if (fallback !== undefined) {
-        await writeCodexConfig(fallback)
-        configRegenerated = true
-      }
+      fallback = doc.providers.find((p) => p.id === DEFAULT_ACTIVE) ?? null
     }
-  saveKeyring(doc)
-  send(res, { ok: true, active: doc.active, configRegenerated })
-} catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    // 先落 keyring 再重写 config.toml：saveKeyring 一旦放到 await 之后，
+    // 窗口期内其它 handler（如 /providers/key）落盘的修改会被这份旧 doc 整体覆盖（丢 key）。
+    saveKeyring(doc)
+    if (fallback !== null) {
+      await writeCodexConfig(fallback)
+      configRegenerated = true
+    }
+    send(res, { ok: true, active: doc.active, configRegenerated })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
 // POST /providers/update：编辑既有提供方。apiKey 省略 = 不改，其余字段只更新出现的。
@@ -1002,7 +1096,9 @@ async function handleProviderUpdate(req, res) {
       const wireApi = typeof body.wireApi === 'string' ? body.wireApi.trim() : ''
       const wireErr = wireApiError(wireApi)
       if (wireErr !== null) return send(res, { ok: false, error: wireErr, ignored }, 400)
-      patch.wireApi = wireApi
+      // 空串 = 未指定（与 wireApiError 的放行语义一致），不写进 patch：
+      // 否则原为 completions 的提供方会被空串切成直连，错误还随 saveKeyring 固化。
+      if (wireApi !== '') patch.wireApi = wireApi
     }
     if (body.model !== undefined) {
       const model = typeof body.model === 'string' ? body.model.trim() : ''
@@ -1198,8 +1294,18 @@ function cleanupLiveFiles(cutoff, stats) {
     if (t !== null && typeof t === 'object' && t.status === 'running' && typeof t.id === 'string') running.add(t.id)
   }
   for (const name of names) {
-    if (typeof name !== 'string' || !name.startsWith('task-') || !name.endsWith('.out.live')) continue
-    if (running.has(name.slice('task-'.length, -'.out.live'.length))) continue
+    if (typeof name !== 'string') continue
+    // 三类过程产物按同一 mtime 策略清：live 过程流、工单 -o 落点、互审轮次 -o 落点。
+    // （原来只清 *.live —— finalize 没跑成（崩溃/被 kill）时 task-*.out / review-*.out 会永久残留。）
+    let id = ''
+    if (name.startsWith('task-') && name.endsWith('.out.live')) id = name.slice('task-'.length, -'.out.live'.length)
+    else if (name.startsWith('task-') && name.endsWith('.out')) id = name.slice('task-'.length, -'.out'.length)
+    else {
+      const m = /^review-(.+)-r\d+\.out$/.exec(name)
+      if (m !== null) id = m[1]
+      else continue
+    }
+    if (id !== '' && running.has(id)) continue
     const full = join(CODEX_DIR, name)
     try {
       const info = statSync(full)
@@ -1268,6 +1374,8 @@ function taskView(task) {
   // ① 对账 tick 判失联的原因（'process-gone' | 'pid-reused'）——不暴露就没法验收探活。
   if (typeof task.reconcileLost === 'string' && task.reconcileLost !== '') view.reconcileLost = task.reconcileLost
   if (typeof task.error === 'string' && task.error !== '') view.error = task.error
+  // appserver 模式的失败原因记在 appError（原先不外发，外部无从诊断）。
+  if (view.error === undefined && typeof task.appError === 'string' && task.appError !== '') view.error = task.appError
   return view
 }
 
@@ -1333,13 +1441,40 @@ function startWatchdog(task) {
   if (typeof task.watchdog.unref === 'function') task.watchdog.unref()
 }
 
+// 超长 -o 输出只留头尾（各半）：output 会整段进内存并随 GET /task 全量外发，
+// 不设限时长任务的输出可达数百 MB（OOM + 响应体爆炸）。
+const TASK_OUTPUT_CLIP = 2 * 1024 * 1024
+function readHeadTail(path, maxBytes) {
+  const fd = openSync(path, 'r')
+  try {
+    const size = fstatSync(fd).size
+    const readChunk = (buf, position) => {
+      let off = 0
+      while (off < buf.length) {
+        const n = readSync(fd, buf, off, buf.length - off, position + off)
+        if (n <= 0) break
+        off += n
+      }
+      return buf.toString('utf8')
+    }
+    if (size <= maxBytes) return readChunk(Buffer.alloc(size), 0)
+    const half = Math.floor(maxBytes / 2)
+    const head = readChunk(Buffer.alloc(half), 0)
+    const tailLen = Math.min(half, size)
+    const tail = readChunk(Buffer.alloc(tailLen), size - tailLen)
+    return `${head}\n…[second-engine 截断：全文 ${size} 字节，仅保留头尾各 ${half} 字节]…\n${tail}`
+  } finally {
+    try { closeSync(fd) } catch { /* best effort */ }
+  }
+}
+
 // 首次落定即返回 true（后续重复调用是 no-op），保证通知只发一次。
 function finalizeTask(task, exitCode, status) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
   stopWatchdog(task)
   task.exitCode = exitCode
   task.status = status
-  try { task.output = readFileSync(task.outPath, 'utf8') } catch { task.output = '' }
+  try { task.output = readHeadTail(task.outPath, TASK_OUTPUT_CLIP) } catch { task.output = '' }
   try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成，忽略 */ }
   // A 方案（2026-10-17 用户定）：过程流 `.live` 同样在收尾时删除 —— ephemeral 工单跑完
   // 不在磁盘留任何输出。要事后回看过程就勾「保留会话」（ephemeral:false，走 rollout）。
@@ -1370,7 +1505,7 @@ function notify(text, title = '第二引擎') {
     const url = `${NOTIFY_URL}?token=${encodeURIComponent(token)}`
       + `&title=${encodeURIComponent(title)}`
       + `&text=${encodeURIComponent(text)}`
-    const req = http.get(url, (resp) => { resp.resume() })
+    const req = http.get(url, (resp) => { resp.on('error', () => { /* 响应中途断开：静默 */ }); resp.resume() })
     req.setTimeout(NOTIFY_TIMEOUT_MS, () => { try { req.destroy() } catch { /* best effort */ } })
     req.on('error', () => { /* 桥没开或拒绝连接：静默 */ })
   } catch { /* best effort */ }
@@ -1417,22 +1552,28 @@ function queryParam(url, key) {
 // diff / 回滚都无从下手。幂等（已有 .git 直接跳过）、静默（git 缺失或提交失败都不阻断工单）。
 // 提交身份：本机实证 root 无 ~/.gitconfig（`git commit` 报 Author identity unknown），
 // 那样基线只剩 .git + 暂存区、等于没打成，所以缺身份时用 env 兜底（不覆盖宿主已配的身份）。
-function gitCommitEnv(workdir) {
-  try {
-    execSync('git config --get user.email', { cwd: workdir, stdio: 'ignore' })
-    return process.env
-  } catch {
-    return {
-      ...process.env,
-      GIT_AUTHOR_NAME: 'second-engine',
-      GIT_AUTHOR_EMAIL: 'second-engine@localhost',
-      GIT_COMMITTER_NAME: 'second-engine',
-      GIT_COMMITTER_EMAIL: 'second-engine@localhost',
-    }
+// git 全部走异步 execFile（带超时）：execSync 在大目录下可把整个 Web 宿主卡住
+// 数秒到分钟级（期间全部 HTTP 请求、看门狗、对账 tick 停摆）。退出码 0 → true。
+function gitOk(args, opts = {}) {
+  return new Promise((resolve) => {
+    try {
+      execFile('git', args, { timeout: 60000, ...opts }, (err) => { resolve(err === null) })
+    } catch { resolve(false) }
+  })
+}
+
+async function gitCommitEnv(workdir) {
+  const hasEmail = await gitOk(['config', '--get', 'user.email'], { cwd: workdir, timeout: 15000 })
+  return hasEmail ? process.env : {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'second-engine',
+    GIT_AUTHOR_EMAIL: 'second-engine@localhost',
+    GIT_COMMITTER_NAME: 'second-engine',
+    GIT_COMMITTER_EMAIL: 'second-engine@localhost',
   }
 }
 
-function ensureGitBaseline(workdir) {
+async function ensureGitBaseline(workdir) {
   try {
     const wd = resolve(workdir)
     const home = homedir()
@@ -1442,7 +1583,10 @@ function ensureGitBaseline(workdir) {
     if (wd === home || wd === dirname(home) || wd === '/') return
     if (/(^|\/)(\.ssh|\.dsh|\.codex|\.gnupg|\.config)(\/|$)/.test(wd)) return
     if (existsSync(join(wd, '.git'))) return
-    execSync('git init && git add -A && git commit --allow-empty -m "second-engine 基线"', { cwd: wd, env: gitCommitEnv(wd) })
+    if (!(await gitOk(['init'], { cwd: wd, timeout: 30000 }))) return
+    const env = await gitCommitEnv(wd)
+    await gitOk(['add', '-A'], { cwd: wd, env })
+    await gitOk(['commit', '--allow-empty', '-m', 'second-engine 基线'], { cwd: wd, env })
   } catch { /* best effort：基线失败不影响任务本身 */ }
 }
 
@@ -1523,7 +1667,7 @@ async function handleTaskCreate(req, res) {
     const active = doc.providers.find((p) => p.id === doc.active)
     if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
 
-    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0')
+    const id = newId()
     const outPath = join(CODEX_DIR, `task-${id}.out`)
     if (execMode() === 'appserver') {
       startAppServerTask({
@@ -1550,26 +1694,40 @@ async function handleTaskCreate(req, res) {
     ]
     // 与面板写 key 时同一套 env_key 约定：<PROVIDER_ID 大写>_API_KEY。
     const envKey = `${active.id.toUpperCase()}_API_KEY`
-    ensureGitBaseline(workdir)
-    const live = { bytes: 0, path: `${outPath}.live` }
+    await ensureGitBaseline(workdir)
+    const live = { bytes: 0, path: `${outPath}.live`, rotatedAt: 0 }
     const child = spawn('codex', args, {
       cwd: workdir,
       env: { ...process.env, [envKey]: active.apiKey },
       // stdin 改 pipe：写入提示词后立即 end()，EOF 自然到达（codex exec 等 stdin EOF 开始干活）。
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+    // stdin EPIPE 兜底：codex 启动失败/早退时写 stdin 触发的是异步 error 事件，
+    // 不挂监听器即 uncaughtException，整个 Web 宿主跟着崩。
+    child.stdin?.on('error', () => { /* codex 已退出：exit/error 回调收尾 */ })
     child.stdin?.write(prompt)
     child.stdin?.end()
     // stdout/stderr 必须持续排空：长任务过程流写满管道缓冲（~64KB）后 codex 被写阻塞、永不退出
     // → 看门狗 300s 误杀（2026-09-24 三单复现实证）。
     // 同时**实时落盘到 <outPath>.live** 并计数：这样 exec 模式也能"直观看到有没有在动"
     // （最终结果仍以 -o 文件为准；live 文件是过程流，保留供诊断）。
+    // 2026-10-24 改异步 WriteStream：逐块 appendFileSync 是同步系统调用，高频输出时反复阻塞事件循环。
     const livePath = `${outPath}.live`
+    const openLiveStream = (flags) => {
+      const stream = createWriteStream(livePath, { flags })
+      stream.on('error', () => { /* 磁盘满等：丢这一段过程流，不影响任务本身 */ })
+      return stream
+    }
+    let liveStream = openLiveStream('a')
     const writeLive = (buf) => {
-      try {
-        appendFileSync(livePath, buf)
-        live.bytes += buf.length
-      } catch { /* best effort */ }
+      live.bytes += buf.length
+      // 轮转：live 只作近期诊断，超限重开（'w' 从头写），不让长任务把它膨胀到 GB 级。
+      if (live.bytes - live.rotatedAt > LIVE_ROTATE_BYTES) {
+        live.rotatedAt = live.bytes
+        try { liveStream.end() } catch { /* best effort */ }
+        liveStream = openLiveStream('w')
+      }
+      liveStream.write(buf)
     }
     child.stdout?.on('data', writeLive)
     child.stderr?.on('data', writeLive)
@@ -1600,9 +1758,13 @@ async function handleTaskCreate(req, res) {
       if (signal) task.lastSignal = signal
       // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
       if (finalizeTask(task, exitCode, status) && !cancelled) void notifyTask(task)
+      try { liveStream.end() } catch { /* best effort */ }
     })
-    // spawn 失败（如二进制缺失）不触发 exit，这里兜底收尾。
-    child.on('error', () => {
+    // spawn 失败（如二进制缺失）不触发 exit，这里兜底收尾；错误原因记进 task.error，
+    // 外部才能诊断（原先 err 被丢弃，只剩 status:'error' 与空 output）。
+    child.on('error', (e) => {
+      task.error = errMsg(e)
+      try { liveStream.end() } catch { /* best effort */ }
       if (finalizeTask(task, -1, 'error')) void notifyTask(task)
     })
 
@@ -1650,12 +1812,13 @@ async function handleTaskCancel(req, res) {
     task.exitCode = -1
     // T5：app-server 模式先发 turn/interrupt（优雅结束当前 turn），kill 作为兜底。
     if (task.app !== undefined && typeof task.app.interrupt === 'function') {
-      void task.app.interrupt()
+      // interrupt 可能 reject（连接已断等）：吞掉，取消路径靠 SIGTERM/SIGKILL 兜底。
+      void Promise.resolve(task.app.interrupt()).catch(() => {})
     }
     try { task.child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
     // 兜底（2026-09-27 实测：codex 子进程偶有 SIGTERM 后残留）：3s 后仍未退出则 SIGKILL。
     const child = task.child
-    setTimeout(() => {
+    const killTimer = setTimeout(() => {
       try {
         if (child !== null && child !== undefined && child.exitCode === null && child.signalCode === null) {
           child.kill('SIGKILL')
@@ -1663,6 +1826,7 @@ async function handleTaskCancel(req, res) {
         }
       } catch { /* best effort */ }
     }, 3000)
+    if (typeof killTimer.unref === 'function') killTimer.unref()
     send(res, { ok: true, id, status: task.status, exitCode: task.exitCode })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -1759,6 +1923,8 @@ function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
     // stdin 写入提示词后 end()，EOF 自然到达。
     stdio: ['pipe', 'pipe', 'pipe'],
   })
+  // stdin EPIPE 兜底：codex 早退后写 stdin 触发的是异步 error 事件，无监听器会击穿宿主进程。
+  child.stdin?.on('error', () => { /* codex 已退出：exit/error 回调收尾 */ })
   child.stdin?.write(prompt)
   child.stdin?.end()
   // 同 handleTaskCreate：pipe 无人消费会被长输出塞满 → codex 写阻塞假死，必须持续排空。
@@ -1851,12 +2017,38 @@ async function runReview(task, active) {
       task.activityAt = Date.now()
       const { child, wait, getUsage } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
       task.child = child
+      // 互审的探活身份：startWatchdog 在首轮 spawn 前就启动（那时 child 还是 null）记不到
+      // pid —— 每轮 spawn 后补记；轮间空窗（child 已退、下一轮未起）清掉，
+      // 否则对账 tick 会把已退出的旧 pid 误判成失联、误杀多轮复核。
+      task.childPid = Number.isInteger(child.pid) ? child.pid : null
+      task.childStart = task.childPid === null ? null : readProcStartTime(task.childPid)
+      // 单轮墙钟兜底：硬预算只在循环顶部检查，若首轮 codex 挂死（进程活着不退出），
+      // await wait 永不返回 → 30 分钟硬预算形同虚设。到点强杀本轮子进程。
+      const roundWallMs = wallMs - (Date.now() - startedAt)
+      let wallTimer = null
+      if (roundWallMs > 0) {
+        wallTimer = setTimeout(() => {
+          task.wallHit = true
+          try { child.kill('SIGKILL') } catch { /* best effort */ }
+        }, roundWallMs)
+        if (typeof wallTimer.unref === 'function') wallTimer.unref()
+      }
       const code = await wait
+      if (wallTimer !== null) clearTimeout(wallTimer)
       // 本轮 codex 自报用量累加进总账（抽不到记 0 —— 宁可少算也不误停）。
       tokensUsed += getUsage()
       task.child = null
+      task.childPid = null
+      task.childStart = null
       task.exitCode = task.cancelled === true ? -1 : code
       const raw = readReviewOut(outPath)
+      // 墙钟到点被强杀：按 wallclock 正常收尾（而非落进下面的 unparsed 解析失败分支）。
+      if (task.wallHit === true) {
+        task.stopReason = 'wallclock'
+        finalizeReview(task, 'done', 'wallclock')
+        void notifyTask(task)
+        return
+      }
       if (task.status === 'cancelled' || task.cancelled === true) break
       const parsed = parseReviewJson(raw)
       if (!parsed.ok) {
@@ -1923,7 +2115,7 @@ async function handleReviewCreate(req, res) {
     const workdir = existsSync(DEFAULT_TASK_WORKDIR) ? DEFAULT_TASK_WORKDIR : CODEX_DIR
     mkdirSync(CODEX_DIR, { recursive: true })
 
-    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0')
+    const id = newId()
     const task = {
       id,
       kind: 'review',
@@ -1973,6 +2165,13 @@ async function handleReviewCancel(req, res) {
     const child = task.child
     if (child !== null && child !== undefined) {
       try { child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+      // 同 /task/cancel：codex 偶有 SIGTERM 后残留，3s 兜底 SIGKILL，防子进程泄漏。
+      const killTimer = setTimeout(() => {
+        try {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        } catch { /* best effort */ }
+      }, 3000)
+      if (typeof killTimer.unref === 'function') killTimer.unref()
     }
     send(res, { ok: true, id, status: task.status })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
@@ -2046,7 +2245,7 @@ async function handleConsultCreate(req, res) {
     if (stuckContext === '') return send(res, { ok: false, error: 'stuckContext 不能为空' }, 400)
 
     const entry = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6).padEnd(4, '0'),
+      id: newId(),
       from,
       task,
       stuckContext,
@@ -2151,7 +2350,14 @@ async function handleMcpToggle(req, res, name) {
 
 // prefix 分发：'' → GET 列表 / POST 新增；'/<name>' → DELETE 删除 / POST 启用·禁用。
 async function handleMcpRoot(req, res) {
-  const pathname = new URL(req.url === undefined ? '/' : req.url, 'http://127.0.0.1').pathname
+  // 防御：req.url 非法（如 '*'）时 new URL 抛 TypeError —— 本函数是 async，
+  // 不接住就是 unhandledRejection（queryParam 对同样操作包了 try/catch，这里补齐）。
+  let pathname = ''
+  try {
+    pathname = new URL(req.url === undefined ? '/' : req.url, 'http://127.0.0.1').pathname
+  } catch {
+    return send(res, { ok: false, error: 'bad request url' }, 400)
+  }
   const rest = pathname.slice(MCP_ROUTE_PREFIX.length)
   const method = req.method === undefined ? 'GET' : req.method
   if (rest !== '' && rest !== '/') {
@@ -2241,6 +2447,76 @@ async function handleVersion(_req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
+// ── /plugin-version：插件自身（dsh-second-engine）的版本检查 ──
+// 与 /version 的区别：那个查 Codex CLI；这个查本插件仓库。
+// 契约：远端查不到不算错误（ok:true、latest:''、updateAvailable:false、无 error 字段），
+// 界面端「没有更新就一个像素都不渲染」，所以失败必须静默。
+const PLUGIN_RELEASES_URL = 'https://api.github.com/repos/fengyu-12/dsh-second-engine/releases/latest'
+const PLUGIN_FAIL_CACHE_TTL_MS = 10 * 60 * 1000   // 失败也缓存，别让设置页反复打 GitHub
+let pluginVersionCache = { at: 0, latest: '', htmlUrl: '' }
+let ownVersionMemo = null
+
+// 插件自身版本：package.json 相对模块文件往上找（最多两级），并校验包名防止误吃别的 package.json。
+// 不写死绝对路径——插件可能被装到任意目录。找不到回 ''（后续比较恒为 false，静默）。
+function ownPluginVersion() {
+  if (ownVersionMemo !== null) return ownVersionMemo
+  try {
+    const self = dirname(fileURLToPath(import.meta.url))
+    for (const base of [self, join(self, '..')]) {
+      const pkgPath = join(base, 'package.json')
+      if (!existsSync(pkgPath)) continue
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+      if (pkg && pkg.name === 'dsh-second-engine') {
+        ownVersionMemo = parseVersion(pkg.version) || ''
+        return ownVersionMemo
+      }
+    }
+  } catch { /* 解析失败按找不到处理 */ }
+  ownVersionMemo = ''
+  return ownVersionMemo
+}
+
+// 远端最新 release：成功缓存 1 小时（复用 VERSION_CACHE_TTL_MS），失败缓存 10 分钟。
+async function latestPluginVersion() {
+  const now = Date.now()
+  const ttl = pluginVersionCache.latest !== '' ? VERSION_CACHE_TTL_MS : PLUGIN_FAIL_CACHE_TTL_MS
+  if (pluginVersionCache.at !== 0 && now - pluginVersionCache.at < ttl) return pluginVersionCache
+  try {
+    const resp = await fetch(PLUGIN_RELEASES_URL, {
+      headers: { 'User-Agent': 'dsh-second-engine', Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(VERSION_FETCH_TIMEOUT_MS),
+    })
+    if (!resp.ok) throw new Error(`GitHub releases 返回 ${resp.status}`)
+    const json = await resp.json()
+    const version = parseVersion(json?.tag_name)
+    if (version === null) throw new Error('release 里没有 x.y.z 版本号')
+    pluginVersionCache = { at: Date.now(), latest: version, htmlUrl: String(json?.html_url || '') }
+    return pluginVersionCache
+  } catch (e) {
+    pluginVersionCache = { at: Date.now(), latest: '', htmlUrl: '' }   // 失败缓存，10 分钟内不再打
+    throw e
+  }
+}
+
+// GET /plugin-version：{ current, latest, updateAvailable, htmlUrl, checkedAt }。
+async function handlePluginVersion(_req, res) {
+  const current = ownPluginVersion()
+  try {
+    const hit = await latestPluginVersion()
+    send(res, {
+      ok: true,
+      current,
+      latest: hit.latest,
+      updateAvailable: compareVersions(hit.latest, current) > 0,
+      htmlUrl: hit.htmlUrl,
+      checkedAt: hit.at,
+    })
+  } catch {
+    // 离线/限流 = 「当没有更新」，不带 error —— 静默是本端点的语义
+    send(res, { ok: true, current, latest: '', updateAvailable: false, checkedAt: Date.now() })
+  }
+}
+
 export function apply(ctx) {
   // 桥清理：插件卸载/热重载时关掉本地桥，避免 server 句柄与端口残留。
   // 宿主用 cordis fiber：ctx.effect 回调返回的函数即卸载时的 disposer（同 guard 写法）；
@@ -2300,6 +2576,7 @@ export function apply(ctx) {
       { kind: 'exact', path: '/second-engine/api/consult', handler: handleConsultCreate },
       { kind: 'exact', path: '/second-engine/api/consults', handler: handleConsultsList },
       { kind: 'exact', path: '/second-engine/api/version', handler: handleVersion },
+      { kind: 'exact', path: '/second-engine/api/plugin-version', handler: handlePluginVersion },
       { kind: 'exact', path: '/second-engine/api/websearch', handler: handleWebSearchRoot },
       // prefix：'prefix' 同时命中 /mcp 与 /mcp/<name>，DELETE 的名字从 URL 尾巴取。
       { kind: 'prefix', path: '/second-engine/api/mcp', handler: handleMcpRoot },

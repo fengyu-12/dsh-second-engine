@@ -1,7 +1,7 @@
 /**
  * app-server 客户端（stdio JSON-RPC，零依赖）—— second-engine 的 app-server 执行模式。
  *
- * 协议事实来源：app-server 协议实测记录（Codex T4，2026-09-27）
+ * 协议事实来源：/root/proj/appserver-spike/FINDINGS.md + run1.log（Codex T4 实测，2026-09-27）
  *   initialize → initialized → thread/start → turn/start → 事件流 → turn/completed
  *   interrupt: turn/interrupt {threadId, turnId}
  *
@@ -111,6 +111,9 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
   // codexArgs：可选的 codex 全局参数（如 -c model_provider=... ），便于离线/多 provider 测试；
   // 生产路径留空，走 ~/.codex/config.toml 的 active provider。
   const child = spawn('codex', [...codexArgs, 'app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  // stdin EPIPE 兜底：app-server 早退后 write() 触发的 error 是异步事件，try/catch
+  // 接不住；不挂监听器就是 uncaughtException（write() 外层的 try/catch 防不了这个）。
+  child.stdin.on('error', () => { /* 已退出：exit/error 回调负责收尾 */ })
   let buffer = ''
   let nextId = 1
   let threadId = null
@@ -141,6 +144,15 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
     for (const it of itemText.values()) parts.push(it.text)
     try { writeFileSync(outPath, parts.join('')) } catch { /* best effort */ }
   }
+  // delta 高频到达（逐 token）：每次全量重写 outPath 是 O(n²) 同步 IO，按 200ms
+  // 节流合并；权威替换（item/completed、终态、finish）仍即时落盘。
+  let flushScheduled = false
+  const flushOutSoon = () => {
+    if (flushScheduled) return
+    flushScheduled = true
+    const timer = setTimeout(() => { flushScheduled = false; flushOut() }, 200)
+    timer.unref?.()
+  }
   const write = (obj) => { try { child.stdin.write(JSON.stringify(obj) + '\n') } catch { /* 已退出 */ } }
 
   const request = (method, params) => new Promise((resolve, reject) => {
@@ -161,7 +173,11 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
       p.reject(new Error('turn 已结束'))
     }
     pending.clear()
+    flushOut()
     try { child.kill('SIGTERM') } catch { /* 可能已退出 */ }
+    // SIGTERM 兜底：app-server 偶有不理 TERM 的挂死，3s 后强杀，防子进程残留。
+    const killTimer = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* 已退出 */ } }, 3000)
+    killTimer.unref?.()
     if (err) doneReject(err)
     else doneResolve({ threadId, turnId, status })
   }
@@ -218,7 +234,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
     }
     sawEvent = true
     if (firstEventTimer) { clearTimeout(firstEventTimer); firstEventTimer = null }
-    // 归一化 envelope 按 T6 的 映射表：{kind,text,tool,usage,done,meta}
+    // 归一化 envelope 按 T6 的 appserver-spike/MAPPING.md：{kind,text,tool,usage,done,meta}
     const base = {
       threadId: p.threadId ?? threadId,
       turnId: p.turnId ?? turnId,
@@ -236,7 +252,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
           const cur = itemText.get(key) ?? { text: '', done: false }
           cur.text += p.delta
           itemText.set(key, cur)
-          flushOut()   // 实时预览
+          flushOutSoon()   // 实时预览（节流）
           emit({ kind: 'text', text: p.delta, done: false, meta: { ...base, itemId: p.itemId } })
         }
         break
@@ -321,6 +337,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
         // 我方一个 turn 一个线程，不需要 compaction 事务闭环，只需投影 + 清零用量记账。
         contextTokens = 0
         emit({ kind: 'status', text: 'context compacted', done: false, meta: base })
+        break
       case 'thread/status/changed':
         emit({ kind: 'status', text: String(p.status?.type ?? p.status ?? ''), done: false,
           meta: { ...base, status: p.status?.type } })
@@ -423,6 +440,10 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
     firstEventTimer.unref?.()
     return { threadId, turnId }
   })()
+  // initialize / thread/start / turn/start 失败或超时时 run 拒绝 —— 原来 child 不会
+  // 被杀（firstEventTimer 只在 turn/start 之后才装），codex app-server 进程就此泄漏。
+  // 这里接住并走 finish（SIGTERM + SIGKILL 兜底 + done reject）。
+  void run.catch((e) => { if (!settled) finish(e, 'error') })
 
   return {
     child,

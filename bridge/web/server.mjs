@@ -20,6 +20,7 @@
 
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile, readdir, readlink } from 'node:fs/promises';
+import { copyFileSync, writeFileSync, renameSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -410,7 +411,10 @@ function readBody(req) {
     req.setEncoding('utf8');
     req.on('data', (chunk) => {
       data += chunk;
-      if (data.length > 1_000_000) reject(new Error('请求体过大'));
+      if (data.length > 1_000_000) {
+        try { req.destroy(); } catch { /* best effort */ }
+        reject(new Error('请求体过大'));
+      }
     });
     req.on('end', () => resolve(data));
     req.on('error', reject);
@@ -421,6 +425,147 @@ function requireReady(res) {
   if (as.ready) return true;
   json(res, 503, { error: `app-server 未连接（${AS_URL}）。终端里跑 ./ctl.sh start 或 ./ctl.sh restart` });
   return false;
+}
+
+// ── /api/config：读写 codex 的 config.toml（模型 / 思考等级等） ───────────────
+// 只碰顶层平键；注释、空行、所有 [section] 原样保留。写前备份 + 临时文件原子替换。
+const CODEX_CONFIG = process.env.BRIDGE_CODEX_CONFIG || path.join(os.homedir(), '.codex', 'config.toml');
+
+// 枚举键：值域来自 codex-cli 0.163.0（binary grep 核实过 model_reasoning_effort）
+const CONFIG_ENUMS = {
+  model_reasoning_effort: new Set(['minimal', 'low', 'medium', 'high', 'xhigh']),
+  model_reasoning_summary: new Set(['auto', 'none', 'concise', 'detailed']),
+  sandbox_mode: new Set(['read-only', 'workspace-write', 'danger-full-access']),
+  approval_policy: new Set(['untrusted', 'on-failure', 'on-request', 'never']),
+};
+// 字符串键：不给死白名单（模型名/URL 会随 provider 增长），做格式与长度约束
+const CONFIG_FREE_KEYS = new Set(['model', 'model_provider', 'web_search']);
+const CONFIG_KEYS = new Set([...Object.keys(CONFIG_ENUMS), ...CONFIG_FREE_KEYS]);
+
+function stripTomlValue(raw) {
+  const s = String(raw).trim();
+  const m = s.match(/^(["'])([\s\S]*)\1$/);
+  return m ? m[2] : s.replace(/\s+#.*$/, '').trim();
+}
+
+// 顶层平键 + [model_providers.<id>] 的 name/base_url/env_key（env_key 只是变量名，绝不含密钥值）
+function parseConfigToml(text) {
+  const top = {};
+  const providers = {};
+  let section = '';
+  for (const line of text.split('\n')) {
+    const sm = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (sm) { section = sm[1].trim(); continue; }
+    const km = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!km) continue;
+    if (!section) top[km[1]] = stripTomlValue(km[2]);
+    else if (section.startsWith('model_providers.')) {
+      const p = section.slice('model_providers.'.length);
+      providers[p] = providers[p] || {};
+      providers[p][km[1]] = stripTomlValue(km[2]);
+    }
+  }
+  return { top, providers };
+}
+
+// 行级改写：顶层区里键存在就替换那一行；不存在就插到最后一个顶层键行之后（没有则插到第一个 [section] 前）。
+// 段内同名的键（如 [features] model = …）一律不碰。
+function updateConfigToml(text, kv) {
+  const lines = text.split('\n');
+  const replaced = new Set();
+  let lastTopIdx = -1;
+  let firstSectionIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*\[/.test(line)) { if (firstSectionIdx < 0) firstSectionIdx = i; continue; }
+    const m = line.match(/^(\s*)([A-Za-z0-9_.-]+)\s*=/);
+    if (!m) continue;
+    if (firstSectionIdx >= 0) continue;               // 已经进段了，后面的 key=value 都不属于顶层
+    lastTopIdx = i;
+    if (Object.prototype.hasOwnProperty.call(kv, m[2])) {
+      lines[i] = `${m[2]} = ${JSON.stringify(String(kv[m[2]]))}`;
+      replaced.add(m[2]);
+    }
+  }
+  const missing = Object.keys(kv).filter((k) => !replaced.has(k));
+  if (missing.length) {
+    const add = missing.map((k) => `${k} = ${JSON.stringify(String(kv[k]))}`);
+    const insertAt = lastTopIdx >= 0 ? lastTopIdx + 1 : (firstSectionIdx >= 0 ? firstSectionIdx : lines.length);
+    lines.splice(insertAt, 0, ...add);
+  }
+  return lines.join('\n');
+}
+
+async function handleGetConfig(res) {
+  let text;
+  try {
+    text = await readFile(CODEX_CONFIG, 'utf8');
+  } catch (err) {
+    return json(res, 500, { error: `读不到 ${CODEX_CONFIG}：${err.message}` });
+  }
+  const { top, providers } = parseConfigToml(text);
+  const provOut = {};
+  for (const [id, p] of Object.entries(providers)) {
+    provOut[id] = { name: p.name || '', base_url: p.base_url || '', env_key: p.env_key || '' };
+  }
+  return json(res, 200, {
+    model: top.model || '',
+    model_provider: top.model_provider || '',
+    model_reasoning_effort: top.model_reasoning_effort || '',
+    model_reasoning_summary: top.model_reasoning_summary || '',
+    sandbox_mode: top.sandbox_mode || '',
+    approval_policy: top.approval_policy || '',
+    web_search: top.web_search || '',
+    providers: provOut,
+  });
+}
+
+async function handlePostConfig(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse((await readBody(req)) || '{}');
+  } catch (err) {
+    return json(res, 400, { error: `请求体不是 JSON：${err.message}` });
+  }
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return json(res, 400, { error: '请求体必须是 JSON 对象' });
+  }
+  const unknown = Object.keys(payload).filter((k) => !CONFIG_KEYS.has(k));
+  if (unknown.length) return json(res, 400, { error: `未知配置键：${unknown.join(', ')}` });
+
+  const kv = {};
+  for (const [key, val] of Object.entries(payload)) {
+    if (typeof val !== 'string' || !val.trim()) return json(res, 400, { error: `${key} 必须是非空字符串` });
+    if (CONFIG_ENUMS[key] && !CONFIG_ENUMS[key].has(val)) {
+      return json(res, 400, { error: `${key} 只能取：${[...CONFIG_ENUMS[key]].join(' / ')}` });
+    }
+    if (CONFIG_FREE_KEYS.has(key) && !/^[\w:./+-]{1,200}$/.test(val)) {
+      return json(res, 400, { error: `${key} 的值不合法（限字母数字与 :/.+- ，最长 200）` });
+    }
+    kv[key] = val.trim();
+  }
+  if (!Object.keys(kv).length) return json(res, 400, { error: '没有可写的键' });
+
+  let text;
+  try {
+    text = await readFile(CODEX_CONFIG, 'utf8');
+  } catch (err) {
+    return json(res, 500, { error: `读不到 ${CODEX_CONFIG}：${err.message}` });
+  }
+  const stamp = new Date().toISOString().replace(/[:T]/g, '').slice(0, 14);
+  const backup = `${CODEX_CONFIG}.bak.${stamp}`;
+  const tmp = `${CODEX_CONFIG}.tmp`;
+  try {
+    copyFileSync(CODEX_CONFIG, backup);          // 写前先备份
+    writeFileSync(tmp, updateConfigToml(text, kv), 'utf8');
+    renameSync(tmp, CODEX_CONFIG);               // 原子替换
+  } catch (err) {
+    try { renameSync(tmp, CODEX_CONFIG); } catch { /* tmp 可能根本没写出来 */ }
+    return json(res, 500, { error: `写配置失败（原文件未动，备份在 ${backup}）：${err.message}` });
+  }
+  const { top } = parseConfigToml(await readFile(CODEX_CONFIG, 'utf8'));
+  log(`config.toml 已更新：${Object.keys(kv).join(', ')}（备份 ${path.basename(backup)}）`);
+  return json(res, 200, { ok: true, applied: kv, now: top, backup: path.basename(backup) });
 }
 
 async function handleSend(req, res, payload) {
@@ -505,7 +650,15 @@ async function handleSend(req, res, payload) {
 }
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  // 客户端中途断开后对 res 的写会触发 error 事件：挂空监听，避免击穿进程。
+  res.on('error', () => { /* 对端已断开：无事可做 */ });
+  // req.url 非法（如 '*'）时 new URL 会抛；async 回调里没人兜底就是 unhandledRejection。
+  let url;
+  try {
+    url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  } catch {
+    return json(res, 400, { error: 'bad request url' });
+  }
 
   if (!ALLOWED_HOSTS.has(req.headers.host ?? '')) {
     return json(res, 403, { error: `Host 不在白名单：${req.headers.host}` });
@@ -528,13 +681,24 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-    const page = await readFile(PAGE, 'utf8');
+    let page;
+    try {
+      page = await readFile(PAGE, 'utf8');
+    } catch {
+      return json(res, 500, { error: `首页读取失败：${PAGE}` });
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     return res.end(page);
   }
 
   if (url.pathname.startsWith('/api/')) {
     if (!authed(req, url)) return json(res, 401, { error: 'token 无效，请用启动时打印的完整网址打开' });
+
+    // /api/config 只读写本地 config.toml，不依赖 app-server：放在 requireReady 之前，
+    // 上游挂了的时候设置面板也还能看到/改模型配置。
+    if (req.method === 'GET' && url.pathname === '/api/config') return handleGetConfig(res);
+    if (req.method === 'POST' && url.pathname === '/api/config') return handlePostConfig(req, res);
+
     if (!requireReady(res)) return;
 
     // 会话列表直接问 app-server（真源），所以终端那边的对话也能在这里切
