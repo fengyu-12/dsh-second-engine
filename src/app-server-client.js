@@ -1,7 +1,7 @@
 /**
  * app-server 客户端（stdio JSON-RPC，零依赖）—— second-engine 的 app-server 执行模式。
  *
- * 协议事实来源：/root/proj/appserver-spike/FINDINGS.md + run1.log（Codex T4 实测，2026-09-27）
+ * 协议事实来源：作者本机 appserver 实测笔记（不随包分发，2026-09-27 Codex T4）
  *   initialize → initialized → thread/start → turn/start → 事件流 → turn/completed
  *   interrupt: turn/interrupt {threadId, turnId}
  *
@@ -106,11 +106,13 @@ const terminalFromResponse = (value, tid) => {
 const PROVIDER_DEFAULT_MODELS = new Set(['', 'default', 'auto', 'codex-default', 'provider-default'])
 const isProviderDefaultModel = (m) => m === undefined || m === null || PROVIDER_DEFAULT_MODELS.has(String(m).trim().toLowerCase())
 
-export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexArgs = [], model }) {
+export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexArgs = [], model, codexBinary = 'codex' }) {
   const desiredModel = typeof model === 'string' ? model.trim() : ''
   // codexArgs：可选的 codex 全局参数（如 -c model_provider=... ），便于离线/多 provider 测试；
   // 生产路径留空，走 ~/.codex/config.toml 的 active provider。
-  const child = spawn('codex', [...codexArgs, 'app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  // codexBinary：由调用方（src/index.js 的 resolveCodexBinary）注入，保证与 exec 模式
+  // spawn 的是同一个二进制；缺省 'codex' 保持本模块独立可用。
+  const child = spawn(codexBinary, [...codexArgs, 'app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
   // stdin EPIPE 兜底：app-server 早退后 write() 触发的 error 是异步事件，try/catch
   // 接不住；不挂监听器就是 uncaughtException（write() 外层的 try/catch 防不了这个）。
   child.stdin.on('error', () => { /* 已退出：exit/error 回调负责收尾 */ })

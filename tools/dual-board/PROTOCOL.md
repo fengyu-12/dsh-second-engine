@@ -160,7 +160,7 @@ board.sh scope-check <task id> --workdir <dir>
 
 ## 十一、已知限制（2026-09-27 实测记录，v1.3 候选）
 
-1. **脏工作区下 scope 校验会漏报**：`.base` 的 `dirty_before` 是派单前的工作区快照，用于排除既有污染；但当 scope 内文件**派单前就是脏的**（`/root/proj` 的常态），真实改动会被一并排除，`scope-check` 显示"本次变更 0 个"——校验形同虚设。
+1. **脏工作区下 scope 校验会漏报**：`.base` 的 `dirty_before` 是派单前的工作区快照，用于排除既有污染；但当 scope 内文件**派单前就是脏的**（`$HOME/proj` 的常态），真实改动会被一并排除，`scope-check` 显示"本次变更 0 个"——校验形同虚设。
    **当前纪律：给 Codex 的 workdir 应尽量干净**，或确认 scope 内文件不在 `dirty_before` 中。
    **v1.3 候选**：派单时对 scope 内已存在文件记录 sha256 快照，交付后比对哈希变化——"改没改"不再依赖 git 状态。
 2. **git 路径编码坑（已修）**：git 默认 `core.quotepath` 会把非 ASCII 路径输出成 `"\345\..."` 转义并加引号；`status --porcelain` 与 `ls-files --others` 两处若处理不一致，**中文路径会被全部误判为越界**（实测 4 个文件误报）。修法：所有 git 调用统一 `-c core.quotepath=false` + 反转义。
