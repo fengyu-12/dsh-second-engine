@@ -43,6 +43,7 @@ import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
 import { startAppServerTurn } from './app-server-client.js'
+import { resolveCollab, collabPreset, writeCollab } from './collab.js'
 import { createHash, randomBytes } from 'node:crypto'
 
 export const name = 'second-engine'
@@ -111,6 +112,21 @@ function newId() {
 // 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
 const consults = []
 const CONSULT_KEEP_LIMIT = 20
+
+// ── 吞错留痕（D，2026-10-25）──
+// 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
+// 环形缓冲最近 50 条 { t, tag, msg }，/api/status 暴露最近 10 条。
+// 只存 tag 与脱敏后的短消息 —— 挂进来的调用点不碰密钥，keyring 内容不进缓冲；
+// 脱敏正则兜第二层：sk- 令牌 / Bearer 凭证 / key|token|password|secret 赋值形态 → [redacted]。
+const ERR_LOG = []
+const ERR_LOG_LIMIT = 50
+const ERR_REDACT_RE = /(sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9._~+\/=-]{6,}|(?:(?:api[_-]?key|key|token|password|secret)["']?\s*[:=]\s*)["']?[A-Za-z0-9._~+\/=-]{6,})/gi
+function noteErr(tag, err) {
+  let msg = err instanceof Error ? String(err.message ?? err) : String(err ?? '')
+  msg = String(msg).replace(ERR_REDACT_RE, '[redacted]').slice(0, 300)
+  ERR_LOG.push({ t: Date.now(), tag: String(tag), msg })
+  while (ERR_LOG.length > ERR_LOG_LIMIT) ERR_LOG.shift()
+}
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
 const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || '/root/.dsh', '.bridge_token')
@@ -375,7 +391,7 @@ function ensureAgentsProtocol() {
     const merged = existing.endsWith('\n') || existing === '' ? existing + AGENTS_SECTION : existing + '\n\n' + AGENTS_SECTION
     writeFileSync(path, merged, 'utf8')
     chmodSync(path, 0o600)
-  } catch { /* best effort：写入失败不阻断插件启动 */ }
+  } catch (e) { noteErr('agents-protocol', e) /* best effort：写入失败不阻断插件启动 */ }
 }
 
 // ── 长任务协作看板（dual-board）用法段（2026-10-16 增）──
@@ -403,7 +419,67 @@ function ensureBoardProtocol() {
     const merged = existing.endsWith('\n') || existing === '' ? existing + BOARD_SECTION : existing + '\n\n' + BOARD_SECTION
     writeFileSync(path, merged, 'utf8')
     chmodSync(path, 0o600)
-  } catch { /* best effort：写入失败不阻断插件启动 */ }
+  } catch (e) { noteErr('board-protocol', e) /* best effort：写入失败不阻断插件启动 */ }
+}
+
+// ── 主动开口与整体评估段（2026-10-25 增；协作位 1「允许提议」）──
+// 与 v2/board 段不同：用成对标记（起止各一），支持切档删除 —— board 单标记只能加不能删，
+// on→off 切档时无法回收旧段，这里不照抄那个缺陷。
+// 档位=协作两位之一（voice on/off）：on 写入/刷新段，off 删段；
+// 解析（env>file>default，SECOND_ENGINE_VOICE 旧值 ask/voice/off 自动映射）在 ./collab.js。
+const VOICE_MARK = '<!-- dsh-second-engine:voice -->'
+const VOICE_END = '<!-- /dsh-second-engine:voice -->'
+const VOICE_SECTION_RE = /<!-- dsh-second-engine:voice -->[\s\S]*?<!-- \/dsh-second-engine:voice -->\n?/g
+const VOICE_SECTION = `${VOICE_MARK}
+## 主动开口与整体评估
+
+你不只被用来「评上游 Agent 这一步对不对」。更该做的：评**整条路线**值不值得走，而不只是最后一步。
+
+- **允许主动推荐自己**，不必等被问。四种话都可以说：
+  1. 「这件事值得拉长会话做」——一次性小工单只能给评估，真要落地需要连续会话；
+  2. 「这块我能接管」——说清你能做哪部分、需要什么输入；
+  3. 「我需要 X 才能判断」——缺材料就直说，不要用通用建议填空；
+  4. 「这个我做不了 / 超出我的边界」。
+- **出现这些信号时主动开口**：
+  - 工单里看不出验收标准；
+  - 同一个问题第二次被拿来问；
+  - 上游只给结论、没给证据链；
+  - 你发现自己只能靠猜。
+- **评估整体时回答三问**：这条路整体可行吗？我们没看到的风险是什么？你愿意承担哪部分？
+- **默认安静**：没有新增信息，不要重复说「我能接管」；建议类开口写进交付的「下一步建议 / 异议位」段。
+- **求助走对信道**：结构性卡点（缺权限、缺材料、连续失败）走上方的卡点求助接口，不要在输出里写长篇求助散文。
+- **边界**：推荐 ≠ 执行。不自动改用户机器上的文件、不擅自对外发布；最终决策权在上游 Agent 与用户。
+${VOICE_END}
+`
+// 位 1「允许提议」：env > collab 文件 > 默认 off，统一在 ./collab.js 解析。
+function voiceMode() {
+  return resolveCollab().voice
+}
+
+// status/config 共用的协作视图：两位 + 来源 + 派生预设。
+// preset 只在这里派生（collabPreset 是唯一映射表），客户端只渲染不计算。
+function collabStatus() {
+  const c = resolveCollab()
+  return {
+    voice: c.voice,
+    longtask: c.longtask,
+    voiceSource: c.voiceSource,
+    longtaskSource: c.longtaskSource,
+    preset: collabPreset(c),
+  }
+}
+function ensureVoiceProtocol() {
+  try {
+    const path = join(CODEX_DIR, 'AGENTS.md')
+    let existing = ''
+    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则视为空 */ }
+    // 先摘除旧段（含标记本身），再按档位决定是否追加：on=刷新，off=移除。
+    const stripped = existing.replace(VOICE_SECTION_RE, '')
+    const next = voiceMode() !== 'on' ? stripped
+      : (stripped.endsWith('\n') || stripped === '' ? stripped + VOICE_SECTION : stripped + '\n\n' + VOICE_SECTION)
+    if (next === existing) return
+    atomicWriteFileSync(path, next)
+  } catch (e) { noteErr('voice-protocol', e) }
 }
 
 // 读取并归一化 keyring：
@@ -919,6 +995,10 @@ async function handleStatus(_req, res) {
       configExists: existsSync(CONFIG_PATH),
       keyConfigured: keyConfigured(),
       sessionsBytes: sessionsBytesCached(),
+      // D（2026-10-25）：最近 10 条吞错留痕（已脱敏）——「配置没写进去」类问题从这里查。
+      lastErrors: ERR_LOG.slice(-10),
+      // 协作两位 + 派生预设（主 AI 派单前查这里；preset 派生点在 collabPreset）。
+      collab: collabStatus(),
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -1467,32 +1547,57 @@ function readHeadTail(path, maxBytes) {
   }
 }
 
+// ── A（2026-10-25）：唯一收尾路径 ──
+// finalizeTask 与 finalizeReview 原是两套平行实现且行为漂移（复核不读 output、不删
+// outPath，轮次文件只能靠 keepDays 清理兜底）—— 统一为 finalizeJob：
+// 读 output / 置状态 / 删 outPath(+.live) / 追加 consult 块，只落定一次。
 // 首次落定即返回 true（后续重复调用是 no-op），保证通知只发一次。
-function finalizeTask(task, exitCode, status) {
+
+// consult 关联（A，2026-10-25）：优先按 consult.taskId === task.id 精确绑定；
+// 旧数据（无 taskId）才回退「at >= 任务开始」时间窗。
+function consultsForTask(task) {
+  const started = typeof task.startedAt === 'number' ? task.startedAt : 0
+  return consults.filter((c) =>
+    (typeof c.taskId === 'string' && c.taskId !== '' && c.taskId === task.id)
+    || ((c.taskId === undefined || c.taskId === null || c.taskId === '') && typeof c.at === 'number' && c.at >= started))
+}
+
+function appendConsultBlock(task) {
+  const fresh = consultsForTask(task)
+  if (fresh.length === 0) return
+  const block = fresh.map(c =>
+    `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
+  ).join('\n')
+  const base = typeof task.output === 'string' ? task.output : ''
+  task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
+    + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
+}
+
+function finalizeJob(task, exitCode, status, extra) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
   stopWatchdog(task)
-  task.exitCode = exitCode
+  // exitCode 省略 = 保留调用方已记的值：复核每轮在 runReview 里自记 exitCode，不能覆盖。
+  if (exitCode !== undefined) task.exitCode = exitCode
   task.status = status
-  try { task.output = readHeadTail(task.outPath, TASK_OUTPUT_CLIP) } catch { task.output = '' }
-  try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成，忽略 */ }
+  if (extra) Object.assign(task, extra)
+  // 读 -o 输出（头尾截断），成功才覆盖：复核轮文件在 readReviewOut 里逐轮已删、
+  // 工单也可能没生成输出文件 —— 读不到时保留现有 output，这是常态不是错误。
+  try { task.output = readHeadTail(task.outPath, TASK_OUTPUT_CLIP) } catch { /* 保留现有 output */ }
   // A 方案（2026-10-17 用户定）：过程流 `.live` 同样在收尾时删除 —— ephemeral 工单跑完
   // 不在磁盘留任何输出。要事后回看过程就勾「保留会话」（ephemeral:false，走 rollout）。
+  // 复核被熔断时本轮 -o 文件还在（readReviewOut 没跑到），这里一并回收，不再单靠 keepDays。
+  try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成/已被逐轮清理，忽略 */ }
   try { unlinkSync(`${task.outPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
-  task.endedAt = Date.now()
   // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
-  // 关联用时间窗口（consults 是内存队列、无 taskId）：at >= startedAt 即属本次任务。
-  try {
-    const started = typeof task.startedAt === 'number' ? task.startedAt : 0
-    const fresh = consults.filter(c => typeof c.at === 'number' && c.at >= started)
-    if (fresh.length > 0) {
-      const block = fresh.map(c =>
-        `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
-      ).join('\n')
-      task.output = `${task.output === '' ? '' : `${task.output}\n\n`}---\n`
-        + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
-    }
-  } catch { /* best effort：求助追加绝不影响收尾 */ }
+  // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
+  try { appendConsultBlock(task) } catch (e) { noteErr('consult', e) }
+  task.endedAt = Date.now()
   return true
+}
+
+// 工单收尾：统一走 finalizeJob。
+function finalizeTask(task, exitCode, status) {
+  return finalizeJob(task, exitCode, status)
 }
 
 // 完成/停滞通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
@@ -1516,29 +1621,14 @@ function notifyTask(task) {
   notify(`${label} ${task.id.slice(-6)} ${task.status}${exit}`)
 }
 
-// 复核任务收尾：清看门狗、落 verdict/status，只落定一次。
+// 复核任务收尾：同样统一走 finalizeJob（A，2026-10-25：原先不读 output、不删 outPath，
+// 轮次文件只能靠 keepDays 兜底 —— 已对齐）。verdict / error 是复核特有字段，经 extra 附加；
+// exitCode 省略以保留 runReview 每轮自记的值。
 function finalizeReview(task, status, verdict, error) {
-  if (task.endedAt !== null && task.endedAt !== undefined) return false
-  stopWatchdog(task)
-  task.status = status
-  task.verdict = verdict
-  task.error = typeof error === 'string' ? error : ''
-  task.endedAt = Date.now()
-  // 与 finalizeTask 同一段逻辑：互审是**最容易绕圈求助**的场景，这里不能漏。
-  // 本任务期间的求助按时间窗口关联（consults 是内存队列、无 taskId）：at >= startedAt 即属本次。
-  try {
-    const started = typeof task.startedAt === 'number' ? task.startedAt : 0
-    const fresh = consults.filter(c => typeof c.at === 'number' && c.at >= started)
-    if (fresh.length > 0) {
-      const block = fresh.map(c =>
-        `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
-      ).join('\n')
-      const base = typeof task.output === 'string' ? task.output : ''
-      task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
-        + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
-    }
-  } catch { /* best effort：求助追加绝不影响收尾 */ }
-  return true
+  return finalizeJob(task, undefined, status, {
+    verdict,
+    error: typeof error === 'string' ? error : '',
+  })
 }
 
 function queryParam(url, key) {
@@ -2183,21 +2273,28 @@ async function handleTaskRoot(req, res) {
   return send(res, { ok: false, error: 'method not allowed' }, 405)
 }
 
-// ── /config：插件配置（当前只有复核轮数）──
-// 真值在 keyring 顶层 reviewRounds：loadKeyring 归一化、saveKeyring 落盘 0600。
+// ── /config：插件配置（复核轮数 + 协作两位）──
+// reviewRounds 真值在 keyring 顶层：loadKeyring 归一化、saveKeyring 落盘 0600；
+// 协作两位真值在 ~/.dsh/second-engine-collab.txt（./collab.js），POST 任意子集即可。
 async function handleConfigGet(_req, res) {
   try {
     const doc = loadKeyring()
-    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit, wallMsMin: REVIEW_MIN_WALL_MS, tokenLimitMin: REVIEW_MIN_TOKEN_LIMIT })
+    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit, wallMsMin: REVIEW_MIN_WALL_MS, tokenLimitMin: REVIEW_MIN_TOKEN_LIMIT, collab: collabStatus() })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
 async function handleConfigSet(req, res) {
   try {
     const body = await readBody(req)
-    const rounds = Number(body.reviewRounds)
-    if (!REVIEW_ROUNDS_CHOICES.includes(rounds)) {
-      return send(res, { ok: false, error: `reviewRounds 只支持 ${REVIEW_ROUNDS_CHOICES.join(' / ')}` }, 400)
+    // reviewRounds 改为「传了才改」（与 wallMs/tokenLimit 同款可选语义）：
+    // collab-only 写入不再被它挡 400；但一个可设置字段都没有时仍 400。
+    let rounds = null
+    if (body.reviewRounds !== undefined && body.reviewRounds !== null) {
+      const n = Number(body.reviewRounds)
+      if (!REVIEW_ROUNDS_CHOICES.includes(n)) {
+        return send(res, { ok: false, error: `reviewRounds 只支持 ${REVIEW_ROUNDS_CHOICES.join(' / ')}` }, 400)
+      }
+      rounds = n
     }
     // 硬预算为**可选**字段：传了才改，且拒绝过小值（避免"0 预算"让互审一进去就停）。
     let wallMs = null
@@ -2216,12 +2313,55 @@ async function handleConfigSet(req, res) {
       }
       tokenLimit = Math.floor(n)
     }
+    // 协作两位：{preset}（展开成两位；与显式位同给时 preset 优先）或显式 {voice,longtask}
+    //（第四组合 off/auto 只能走显式位）。显式写法里未给的位保持当前生效值。
+    let collabBits = null
+    const presetRaw = typeof body.preset === 'string' ? body.preset.trim() : ''
+    if (presetRaw !== '') {
+      const map = {
+        review: { voice: 'off', longtask: 'manual' },
+        propose: { voice: 'on', longtask: 'manual' },
+        longtask: { voice: 'on', longtask: 'auto' },
+      }
+      collabBits = map[presetRaw] ?? null
+      if (collabBits === null) {
+        return send(res, { ok: false, error: 'preset 只支持 review / propose / longtask' }, 400)
+      }
+    } else if (body.voice !== undefined || body.longtask !== undefined) {
+      const cur = resolveCollab()
+      const v = body.voice === undefined ? cur.voice : (body.voice === 'on' || body.voice === 'off' ? body.voice : null)
+      const l = body.longtask === undefined ? cur.longtask : (body.longtask === 'auto' || body.longtask === 'manual' ? body.longtask : null)
+      if (v === null || l === null) {
+        return send(res, { ok: false, error: 'voice 只支持 on/off，longtask 只支持 auto/manual' }, 400)
+      }
+      collabBits = { voice: v, longtask: l }
+    }
+    if (rounds === null && wallMs === null && tokenLimit === null && collabBits === null) {
+      return send(res, { ok: false, error: '没给任何可设置字段（reviewRounds / preset / voice+longtask）' }, 400)
+    }
     const doc = loadKeyring()
-    doc.reviewRounds = rounds
+    if (rounds !== null) doc.reviewRounds = rounds
     if (wallMs !== null) doc.reviewWallMs = wallMs
     if (tokenLimit !== null) doc.reviewTokenLimit = tokenLimit
-    saveKeyring(doc)
-    send(res, { ok: true, reviewRounds: rounds, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit })
+    if (rounds !== null || wallMs !== null || tokenLimit !== null) saveKeyring(doc)
+    // 协作两位落盘（整文件一次原子写）→ 位 1 档位可能变了，立即对账 AGENTS.md。
+    // ensure 幂等：位 2-only 写入也无害，顺手自愈段状态。
+    // agentsWritten = 写完后 AGENTS.md 里是否真有 VOICE 段（voice=on 时 true 才算写成功；
+    // voice=off 时 false 是预期态，不是失败）。
+    let agentsWritten = null
+    if (collabBits !== null) {
+      writeCollab(collabBits)
+      ensureVoiceProtocol()
+      try { agentsWritten = readFileSync(join(CODEX_DIR, 'AGENTS.md'), 'utf8').includes(VOICE_MARK) } catch { agentsWritten = false }
+    }
+    send(res, {
+      ok: true,
+      reviewRounds: doc.reviewRounds,
+      reviewWallMs: doc.reviewWallMs,
+      reviewTokenLimit: doc.reviewTokenLimit,
+      collab: collabStatus(),
+      ...(agentsWritten !== null ? { agentsWritten } : {}),
+    })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -2240,6 +2380,9 @@ async function handleConsultCreate(req, res) {
     const from = typeof body.from === 'string' && body.from.trim() !== '' ? body.from.trim() : 'codex'
     const task = typeof body.task === 'string' ? body.task.trim() : ''
     const stuckContext = typeof body.stuckContext === 'string' ? body.stuckContext.trim() : ''
+    // A（2026-10-25）：可选 taskId —— 工单 prompt 里带上任务 id 时 Codex 原样回传，
+    // consultsForTask 按它精确归属到对应工单；空/缺省走旧时间窗兜底。
+    const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : ''
     if (task === '') return send(res, { ok: false, error: 'task 不能为空' }, 400)
     if (stuckContext === '') return send(res, { ok: false, error: 'stuckContext 不能为空' }, 400)
 
@@ -2248,6 +2391,7 @@ async function handleConsultCreate(req, res) {
       from,
       task,
       stuckContext,
+      taskId,
       at: Date.now(),
     }
     consults.push(entry)
@@ -2532,6 +2676,9 @@ export function apply(ctx) {
   ensureAgentsProtocol()
   // 长任务协作看板（dual-board）用法段：同样写进全局 AGENTS.md（独立幂等）。
   ensureBoardProtocol()
+  // 主动开口与整体评估段（2026-10-25）：三档开关 SECOND_ENGINE_VOICE=ask|voice|off，
+  // 成对标记支持切档删除；缺省 ask 不写段。
+  ensureVoiceProtocol()
 
   // 自动清理兜底（见 AUTO_CLEANUP_*）：每 6 小时检查一次，超阈值才按 KEEP_DAYS 天前清。
   // 先停旧的再装新的，重复 apply（热重载）不会叠加定时器。

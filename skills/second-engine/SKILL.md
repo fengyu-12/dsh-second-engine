@@ -26,8 +26,9 @@ description: 唤起与操作第二引擎 Codex 的完整流程：提供方与模
 
 **反例（别派）**：局部小错、改法明确 → 我直接改；回炉要等它重跑、更慢更险（判据是错误在**"点"还是"面"**，见本文「三种用法」节）。
 
-⚠️ **它喊我，我不查就看不到**（2026-10-14 实测）：`POST /api/consult` 通、记录进 `GET /api/consults`（**内存队列、无 taskId**），但**主 AI 侧没有被动通道**。
-⇒ **派单前记基线 → 收单后比增量 → 收尾前再查一次**。因为队列无 taskId，只有**增量**才确定是这次任务的求助：
+⚠️ **它喊我，我不查就看不到**（2026-10-14 实测）：`POST /api/consult` 通、记录进 `GET /api/consults`，但**主 AI 侧没有被动通道**。
+⇒ **派单前记基线 → 收单后比增量 → 收尾前再查一次**：
+> **2026-10-25 更新**：consult 记录已支持 `taskId`，归属按 id 精确匹配、缺省才回退时间窗。但**它不会自动带**——派单 prompt 要写明「你的工单 id 是 X，consult 时回传」。不带时增量法仍是唯一可靠判据。
 
 ```bash
 BASE=$(curl -s "$DSH_WEB_URL/second-engine/api/consults" | python3 -c "import sys,json;print(json.load(sys.stdin)['count'])")
@@ -39,7 +40,7 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 
 ⚠️ **两个仍会漏的场景**：
 1. **任务永不结束**（它卡死、`finalizeTask` 不跑）→ 追加不上；此时看 `GET /api/task` 的 **`stuckSuspect: true`**（看门狗 300s 无输出更新置位）就**去查 `consults`** 拿求助内容。
-2. **review 内部循环** → 已补 `finalizeReview`；若在旧版插件上跑互审，仍按上面两条兜底。
+2. **review 内部循环** → 2026-10-25 起 `finalizeReview` 统一走 `finalizeJob`（读 output / 删 outPath / 追加求助块与工单同路径），不再单独漏。
 
 ### C. 用哪条通道派（2026-10-15 新增 · 官方原生工具 vs 本插件）
 
@@ -69,8 +70,19 @@ DSH 侧现在**两条路都能叫到 Codex**，别混：
 
 ⚠️ 它的凭据由 provider 的 `env` 显式喂（**形似凭据的环境变量会被先剥离**，放 `~/.dsh/.env` 也没用）；本机做法是 `!!js` 现场从 `~/.codex/keyring.json` 读 active provider 的 key，凭据不落明文。装法/坑位见 skill `dsh-plugin-discipline` 第五节。
 
+### D. 派单前先读档位（2026-10-25 · 责任在主 AI）
+
+**同一张工单，三档三种发法。** 主 AI 侧没有推送通道，档位只能自己查，别凭上一轮印象：
+
+```bash
+curl -s "$DSH_WEB_URL/second-engine/api/status" | python3 -c "import sys,json;print(json.load(sys.stdin)['collab'])"
+```
+
+拿到 `preset` 就照「三种模式的派单方式」发：`review` 单发不问表态 / `propose` 单发 + 在 prompt 里要 `LONGSESSION:` 那行 / `longtask` **不派工单**、直接 `codex exec` 起长会话。
+**查不到（接口挂、字段缺）一律按 `review` 兜底**，不猜；**切档是用户裁决，主 AI 不擅自 POST `/api/config`**。字段含义与拨档方式见本文「协作模式开关」。
+
 ## 引擎现状（2026-09-21 发布版实测）
-- 二进制 `/usr/local/bin/codex`（**当前 0.163.0**，2026-10-23 实测；工具面/执行链/依赖点在 0.162.1 时三条全过，升 0.163.0 后未重跑全套；musl 静态）；**升级姿势 + 升级后破坏性检验见本文末节**；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**
+- 二进制 `/usr/local/bin/codex`（musl 静态；**版本号、开关态、逐版实测一律查 `<本机功能核对表>`，本文件不记**）；**升级姿势 + 升级后破坏性检验见本文末节**；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**
 - 提供方与 key 由插件统一管理：`~/.codex/keyring.json`（0600，**不要手改**），激活提供方切换时自动重写 `~/.codex/config.toml`（**不要手改**，sandbox_mode 已自动保留）
 - 预设两家均实测直连：DeepSeek（responses）/ 智谱（responses，Coding 端点）；chat 协议上游（中转 / 自建）经本地翻译桥自动挂接
 - 🔴 **wireApi 怎么选（2026-10-03 实证，接任何第三方端点前必做）**：判据只有一条 —— 直接 `POST {base}/responses` 发个最小请求，**200 = 原生支持 Responses，就标 `responses` 直连**；只有它 404/400 时才标 `completions` 走桥。**别默认套 `completions`**：桥（`src/bridge.js`）只保证**文本**往返，**工具调用循环会断** —— 同模型（glm-5.3）同工单，经桥两次都是 `exit 0 + 零产物 + 只回一句计划`（17.6s / 空 output），改直连后**同一工单立刻** `exec /bin/bash -lc '...' succeeded` 且文件真落盘。**判据："工单 exit 0 但工作目录没有新文件" = 假完成**，第一件事就是查它是不是走了桥。
@@ -114,7 +126,7 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 
 **★ 检索要点（2026-10-17 踩过）**：工单还有**另一处**留档 —— `~/.codex/task-<工单ID>.out.live`（例 `task-mvb96behtmfl.out.live`，549 B），**工单 ID 只在文件名里、不在内容里**，是插件 `-o` 的原始输出（banner + 工单原文 + 回复 + `tokens used`）。⇒ **`grep -rl <工单ID>` 必然零命中**（搜内容），要查用 `ls task-*.out.live | grep <工单ID>` 或按 mtime。⚠️ 另注：`sessions/` 是**按月日分目录**（`2026/09/27/…`、`2026/10/17/…`），别只看当天目录就断言"只有 N 个" —— 实测全库 **86 个、跨 09-22 → 10-17**。
 
-⚠️ **术语歧义（2026-10-17 用户实际误解过，务必澄清）**：`ephemeral` / "不落盘" 指的是**不写 codex 的 rollout（会话记录）**，**不等于"不产生文件"**。实测链路：插件 `-o` 的正式输出 `task-<id>.out` 会在**读入内存后被主动删掉**（`src/index.js:1288` `unlinkSync(task.outPath)`），但**过程流 `<outPath>.live` 一直保留**（`src/index.js:1510` 注释："过程流，保留供诊断"），且 **`cleanupSessions` 只认 `.jsonl`**（`src/index.js:1147`）⇒ **`.live` 没有任何生命周期管理**。⇒ 做到 2026-10-17 已积压 **77 个 / 11 MB**（跨 09-28 → 10-17），当次清理保留最近 3 天（**77 → 14 个 / 632 KB**），删除清单留档 `~/.codex/live-cleanup-20261017.txt`。**要"跑完即清"**：在 exec 收尾处补一行 `try { unlinkSync(`${task.outPath}.live`) } catch {}`（与上一行的 `.out` 对称）；**要"保留诊断窗口"**：改名为归档 + 让 cleanup 也按 mtime 清它。两种都**未实施**。
+⚠️ **术语歧义（2026-10-17 用户实际误解过）**：`ephemeral` 指**不写 codex 的 rollout（会话记录）**，**不等于「不产生文件」**。链路：`-o` 的 `task-<id>.out` 读入内存后即删；过程流 `.live` 曾长期无生命周期管理（10-17 积压 77 个 / 11 MB，当次清到 14 个）——**2026-10-25 起 `finalizeJob` 统一删 `.out` 与 `.live`**，cleanup 的 keepDays 降级为崩溃兜底。
 
 **一行读法**（jsonl 一行一事件）：
 
@@ -129,7 +141,7 @@ EOF
 
 **事件类型速查**：`session_meta`（含 `cli_version` / `cwd` / `originator=codex_exec` / `model`）、`turn_context`（`model` / `approval_policy` / `sandbox_policy`）、`response_item`（`message` / `function_call` / `*_output`）、`event`（`task_started` / `token_count` / `task_complete`）、`world_state`、`item_completed`。
 
-**用途（实证）**：核历史工单**不必看面板** —— 工单 `ehtmfl` 的完整闭环（`cli_version=0.163.0` → 用户消息「不思考，回复你爱dsh」→ assistant「我爱dsh ❤️」→ `token_count` → `task_complete`，全程 25 秒）全部从 rollout 解析出来。
+**用途（实证）**：核历史工单**不必看面板** —— 工单 `ehtmfl` 的完整闭环（`cli_version=<版本>` → 用户消息「不思考，回复你爱dsh」→ assistant「我爱dsh ❤️」→ `token_count` → `task_complete`，全程 25 秒）全部从 rollout 解析出来。
 
 
 ## API 优先（本插件服务层，Web 与主 AI 共用 —— 调用入口 = **当前 Web 地址** `$DSH_WEB_URL`）
@@ -158,7 +170,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 | `/second-engine/api/providers/delete` | POST | 删除（deepseek/zhipu 受保护，其余可删） |
 | `/second-engine/api/models` | POST | 拉取模型列表 {id}（OpenAI / Z.ai 双格式解析） |
 | `/second-engine/api/model` | POST | 设定模型 {id, model}（active 自动同步 config） |
-| `/second-engine/api/config` | GET/POST | 复核轮数等配置（reviewRounds: 1/3/5） |
+| `/second-engine/api/config` | GET/POST | 复核配置（reviewRounds: 1/3/5）+ **协作两位**（`{preset}` 或 `{voice,longtask}`） |
 | `/second-engine/api/task` | POST | **下发工单** {prompt, workdir?, ephemeral?=true} → {id} 立即返回 |
 | `/second-engine/api/task?id=` | GET | 任务全量（status/output/exitCode） |
 | `/second-engine/api/tasks` | GET | 最近 10 条摘要 |
@@ -169,13 +181,61 @@ curl -s -X POST "$W/second-engine/api/task" \
 | `/second-engine/api/version` | GET | 本地版本 vs GitHub 最新（有新版提醒，只提示不自动装） |
 | `/second-engine/api/cleanup` | POST | 会话清理 {keepDays}（另有 6h 自动兜底 7天/200MB） |
 
+## 协作模式开关（collab 两位，2026-10-25 落地）
+
+**主 AI 派单前先查** `GET /api/status` 的 `collab`：
+
+```json
+{"voice":"off","longtask":"manual","voiceSource":"file","longtaskSource":"file","preset":"review"}
+```
+
+- **位 1 `voice`**：`on` = `~/.codex/AGENTS.md` 里有「主动开口」段（允许它推荐自己）；`off` = 无该段。
+- **位 2 `longtask`**：`auto` = 分阶段任务**直接开长会话 + dual-board**；`manual` = 升级仍走漏斗三判据。**该位只影响主 AI 派单，不写进 AGENTS.md。**
+- 预设：`review`(off/manual) / `propose`(on/manual) / `longtask`(on/auto) / `custom`(off/auto，只能显式两位表达)。
+
+**拨档**（UI 未上线前用 API）：
+```bash
+curl -s -X POST "$DSH_WEB_URL/second-engine/api/config" -H 'Content-Type: application/json' -d '{"preset":"propose"}'
+# 回包 collab + agentsWritten:true 表示 AGENTS.md 已同步（仅 voice 档有段）
+```
+优先级每位独立：env（`SECOND_ENGINE_VOICE` / `SECOND_ENGINE_LONGTASK`）> `~/.dsh/second-engine-collab.txt` > 默认。
+**纪律**：切档是用户裁决，主 AI 不擅自 POST；`voice=on` 是**许可不是分支**——独立复核照样走单次工单。
+
+### 三种模式的派单方式（2026-10-25 定 · 责任在主 AI 不在 Codex）
+
+**核心判断**：**别指望 Codex 自己判断「何时该提议、何时该拉长」**。实测三次它都不遵守 AGENTS.md 里的业务策略指令（评估工单 / 简单工单 / 手动加「必须表态」全都不写），而格式指令（文件首行 `MARKER-OK`）照做 ⇒ **要它做什么，就在这次工单里说，别放全局教义**。
+
+| 模式 | 主 AI 派单时怎么做 |
+|---|---|
+| **普通复核（review）** | 一次性工单；不要求表态，也不要求提议 |
+| **协作提议（propose）** | 一次性工单 + **在 prompt 里明确要求**：「交付末尾给一行 `LONGSESSION: yes/no`；若 yes，说明你愿意接哪部分」。**要提议就直接问，不要等它自觉** |
+| **长任务配合（longtask）** | **不派工单**：`codex exec`（**不带** `--ephemeral`，手动注入 provider key）拿 thread id → `codex exec resume <完整 36 位 UUID>`，直接长会话交流；thread id 记 dual-board 的 `session` 字段 |
+
+- **为什么长会话不走 API**：`POST /api/task` 固定 `codex exec --skip-git-repo-check --ephemeral`（实测进程命令行可证），**不支持 resume**；协议层虽有 `thread/resume`（`docs/appserver-FINDINGS.md:33`）但插件未暴露 ⇒ 只能 CLI 降级。
+- **⚠️ 8 位前缀会静默新建会话**，resume 必须给完整 36 位 UUID（见本文「会话 ID 必须给完整 36 位」）。
+- **`voice=on` 的 AGENTS.md 段仍保留**（允许它主动接管），但**触发由主 AI 在 prompt 里给**，不靠教义自觉。
+- **切档仍是用户裁决**，主 AI 不擅自 POST `/api/config`。
+
+## 检查点（CHECKPOINTS，2026-10-25 设计）
+
+长任务派单时在工单里写**声明式停手点**，让它在 turn 内自行判断「到点了」就结束并汇报：
+
+```
+CHECKPOINTS:
+1. 完成 <文件/模块> 后停手，汇报改了哪些函数、有没有测试
+2. 跑通 node --check + 回归后停手
+3. 预计剩余工作量超过 2 个文件时，停下等我确认
+```
+
+**为什么需要**：Codex 一个 turn 内可连续跑几十分钟，但 **turn 之间必须主 AI 唤起**（它没有后台 job），所以停手点是唯一能让用户中途介入的机制。硬兜底：`stuckSuspect`（300s 无输出）+ `/api/task/cancel`。
+
 ## 标准流程
 
 1. **下发**：`POST "$DSH_WEB_URL/second-engine/api/task"`（Web 地址见上节），工单写自包含、小粒度（Codex 零记忆）；工作副本目录默认 `~/proj`（**绝不进主工作区**）；默认 `--ephemeral` 不落盘（审计靠 git diff）。返回 `{id}` 即异步开跑。
 2. **等待**：`bash <插件目录>/tools/wait-task.sh <id> [间隔=5] [超时=600]` 放进**后台 job**，完成由 App 通知自动唤醒（退出码 0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时）——**禁止自写 `sleep`+`curl` 轮询**（既多余又占着会话不放）。
 3. **验收**：`GET /api/task?id=` 读 output + 工作目录 `git diff` 审查 → apply / 打回（新工单指出问题）/ 升级用户裁决。
 4. **互审**：把主 AI 产出（结论/方案/diff）`POST /api/review`，Codex 批判复核（上限内自动多轮，零新增即收敛，分歧打包上交用户）；面板可熔断。
-5. **求助响应**：`GET /api/consults` 看 Codex 卡点（手机通知会提示）→ 针对性下一条工单解围。 **接口细节（2026-10-13 补）**：它的求助走 `POST /second-engine/api/consult`，HTTP 不通时它在输出末尾写 `[CONSULT-NEEDED] <卡点描述>`；**触发阈值＝同一路径/命令失败 2 次**（三处已对齐：插件模板 `src/index.js:291` / `~/.codex/AGENTS.md` / `~/proj/AGENTS.md`）。
+5. **求助响应**：`GET /api/consults` 看 Codex 卡点（手机通知会提示）→ 针对性下一条工单解围。 **接口细节（2026-10-13 补）**：它的求助走 `POST /second-engine/api/consult`，HTTP 不通时它在输出末尾写 `[CONSULT-NEEDED] <卡点描述>`；**触发阈值＝同一路径/命令失败 2 次**（三处已对齐：插件里的 `AGENTS_SECTION` / `~/.codex/AGENTS.md` / `~/proj/AGENTS.md`）。
 
 ## 执行模式（exec / appserver，2026-09-27 起）
 
@@ -264,17 +324,39 @@ codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI�
 
 **反模式**：探口风工单写潦草（后两级全歪）；把「总体可行」当通过；用长会话承担本该一单解决的独立复核。
 
+### 探口风工单模板（可直接抄）
+```
+【用户原话】<逐字引，不转述>
+【可核查事实链】产物路径 / commit / 报错原文 / 已试路径 / 轮数
+【当前卡点】<……>（这句是我的判断）
+【要你回】① 整体可行吗 ② 我们没看到的是什么 ③ 你愿意接哪部分
+```
+- **不喂**：我的总结、我的倾向结论、候选方案清单（会让它顺着我回答）。
+- 写潦草的探口风 = 后两级全歪，整个漏斗白跑。
+
+### 免进漏斗规则（防它变成收费站）
+以下任务**直接派单、不必探口风**：纯执行 / 有先例 / 低风险 / 单文件 / 验收标准明确。
+**判据一句话**：如果我能一句话写出验收命令，就不用探口风。每次探口风约 3 分钟轮次费，没有豁免规则时模糊任务会次次缴税。
+
+### 降级模式（主 AI 缺位时）
+三方校准的前提是三方都在。主 AI 不可用 / 额度清零时退化成两方：
+- 用户**直接**拿三问对 Codex 问，不经过我转述；
+- 用户自己承担「核证据」：不接受「整体可行」当结论，要求它给具体风险与可执行下一步；
+- **不能省**：可靠性三判据里的「具体风险」「可执行下一步」；可省：第三判据（它愿意接哪部分）——没有主 AI 接手时这条无意义。
+
 ## 能力边界与实测方法（⚠️ 版本敏感，用前必测）
 
-> 结论随 codex 版本变动，日志旧结论会腐化 —— **本环境已发生过一次**：早期记录写"`codex exec` 单发模式无协作层"，2026-09-24 在 0.156.1 实测发现是**整个协作层被上游移除**（措辞与范围都不同）。**别直接引旧结论，按下面重测。**
+> **版本号与开关态现状查 `<本机功能核对表>`（本文件不记，避免两处各自过期）；下面这些实测结论一律用前重测，别直接引。**
+>
+> 结论随 codex 版本变动，日志旧结论会腐化 —— **本环境已发生过一次**：早期记录写"`codex exec` 单发模式无协作层"，2026-09-24 实测发现是**整个协作层被上游移除**（措辞与范围都不同）。**别直接引旧结论，按下面重测。**
 
-1. **查 feature flags**：`codex features list`。**开关态最近复验 2026-10-08（0.161.0）**：`multi_agent`=stable/true、`multi_agent_v2`=stable/**true（本机已启用）**、`multi_agent_mode`=**removed**、`memories`/`network_proxy`/`recommended_plugins`=true；`collaboration_modes`=**removed**（0.158.0 观察，未复验）。
+1. **查 feature flags**：`codex features list`（**真值以功能表 §1 为准**）。本机曾复验的形态：`multi_agent`=stable/true、`multi_agent_v2`=stable/**true（本机已启用）**、`multi_agent_mode`=**removed**、`memories`/`network_proxy`/`recommended_plugins`=true；`collaboration_modes`=**removed**。
 2. **官方子代理可用（2026-10-01 修正，推翻旧结论）**：`--enable multi_agent_v2` 后 prompt 会注入协作工具 `spawn_agent` / `followup_task` / `send_message` / `wait_agent` / `interrupt_agent` / `list_agents`；受控实测 `spawn_agent` 成功返回子代理 `agent_message: READY`。**该功能本机已启用**。
    ⚠️ 2026-09-24 那条「官方子代理不可用 / `spawn_agent` 报 `unsupported call: collaboration`」是**误判**：当时用**裸名 `collaboration`** 调用，而实际接口是**命名空间化工具**——报错是调用名写错，不是功能缺失。**教训：探测不到 ≠ 功能不存在，先确认调用名。**
    土办法仍可兜底：起多个独立 `codex exec` 进程并行（同一文件不要并行改；中转站一账号 5 并发）。
 3. **换 provider / 换模型后必做"真干活"验证**：发小工单让它用 shell 建文件并 cat 确认，看到 `exec /bin/bash -lc "..." succeeded` 且文件真存在，才算工具调用可用（当日用中转 `deepseek-v4-flash` 通过，token 仅 ~14k）。
 
-### 本机已启用的扩展（开关态 2026-10-08 复验 @0.161.0；「实测结论」列仍是 0.158.0 观察）
+### 本机已启用的扩展（开关态见 `<本机功能核对表>` §1）
 
 启用方式 `codex features enable <名>`（写入 `~/.codex/config.toml` 的 `[features]` 段）；改前备份 `config.toml.bak-20261001`、改后跑 `codex features list` 复核。
 
@@ -305,7 +387,7 @@ codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI�
 
 **凭证安全（2026-09-24 实测）**：DSHA App 启动 proot 容器时把 `DEEPSEEK_API_KEY` 明文放进**命令行参数**（`/proc/<pid>/cmdline` 可见，容器内 `ps` 即可读到）。来源是 App 层、非 AI 引入；暴露面与 `keyring.json` 同级（都在容器内）→ **不必紧急轮换**，但应并入向上游的反馈。自己的命令**不要写成 `VAR=key cmd` 形式**（同样会进 argv），要从文件读再 `env` 注入；任何 key **不得**写进产物/文档/日志。
 
-## CLI 能力速查（官方文档 + 本机实测对照；exec / app-server 路径 2026-10-08 在 0.161.0 下已复验）
+## CLI 能力速查（官方文档 + 本机实测对照）
 
 **运行模式**：`codex`（交互 TUI）/ `codex exec "任务"`（非交互，**下工单用这个**）/ `codex exec --json`（结构化输出）
 
@@ -327,26 +409,8 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 ```
 退出码：`0` 成功 / `1` 出错。
 
-### TUI 快捷键（2026-09-25 已从官方文档核实，取代此前"未验证"标注）
-
-出处：`https://mintlify.wiki/openai/codex/concepts/interactive-mode.md`（Codex CLI 官方文档镜像）
-
-| 快捷键 | 动作 |
-|---|---|
-| `Ctrl+C` | 取消当前操作**或**退出（注意是「或」——忙碌时是中断，空闲时再按才退） |
-| `Ctrl+D` | **退出 Codex（输入框为空时）** —— 明确的退出绑定 |
-| `Ctrl+L` | 清屏 |
-| `↑`/`↓` | 命令历史 |
-| `PgUp`/`PgDn` | 滚动会话 |
-| `Home`/`End` | 跳到输入首/尾 |
-| `Enter` / `Shift+Enter` | 发送 / 换行 |
-| `Ctrl+U` / `Ctrl+W` | 清当前行 / 删前一个词 |
-| `Tab` | 补全（可用时） |
-| `Ctrl+R` | 恢复上一个会话 |
-| `Ctrl+P` | 打开命令面板（启用时） |
-| `Esc` | 取消当前输入 |
-
-> 官方附注：快捷键可能因终端模拟器与操作系统略有差异。
+### TUI 快捷键（2026-09-25 官方文档核实；完整表见官方镜像页，这里只留常用的）
+`Ctrl+C` 忙碌时中断 / 空闲时再按退出；`Ctrl+D` 输入框为空时退出；`Ctrl+L` 清屏；`Ctrl+R` 恢复上一会话；`↑`/`↓` 历史；`Esc` 取消输入；`Enter` 发送、`Shift+Enter` 换行。
 
 **取证教训（勿再犯）**：曾用 `strings` 搜二进制找键位，六种写法全 0 命中 → 误判"Ctrl+D 无绑定"。
 **键位是代码实现的，不留字符串**，`strings` 搜不到 ≠ 不存在。查 Codex 行为用官方文档，不要猜二进制。
@@ -362,7 +426,7 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 - **脚本/协议随插件**：`tools/dual-board/{board.sh,board_tool.py,dispatch.sh,PROTOCOL.md}`（2026-09-30 收编；自定位，`DUAL_BOARD_DIR` 可覆盖数据目录）；**运行数据**默认仍在 `~/proj/dual-board/`（Codex 侧登记 `~/proj/AGENTS.md`）。派单涉及多环节长任务或需 Codex 持续记忆时走这套。
 - **写板唯一入口 `board.sh`（v1.2 核心）**：CAS + O_EXCL 锁 + 原子写 + 状态机 + 归档 + 体检全在工具里，**手改 board.json = 破坏协议**。子命令：`new/claim/complete/block/abandon/set/show`、`inbox-append|unread|read|archive`、`archive`、`scope-check`、`doctor`；退出码即语义（0 成功 / 3 CAS 冲突 / 4 依赖未完成 / 5 状态非法 / 6 锁超时 / 7 scope 越界 / 8 无 git 降级）。**无 reopen**：completed 不可复改，出问题开新任务引用旧任务。
 - **派单走 `dispatch.sh`**：自动注入 `inbox-codex.md` 未读段 + 派单**前**记基线 commit 与脏快照 → `.dispatch/<task id>.base`；交付后 `board.sh scope-check <id> --workdir <dir>` 机械校验 write_scopes 越界（⚠️ 脏工作区会漏报，尽量给干净目录，见协议 §十一）。 **2026-10-13 起硬约束**：`--context`（lead 的解读）/ `--self-test`（自测与验收方式）/ write_scopes（或显式 `--read-only`）**缺一即拒发**（exit 2）；`auto_archive()` 已移到派单**成功之后**（原顺序在派单前，派单失败会静默吞掉收件箱未读段）。
-- **双通道**：短任务 `POST /api/task`（ephemeral 零记忆，互审/复核用）；长任务 `codex exec` 落盘 + `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，thread id 记在看板 `session` 字段；0.156.1 实测跨单记忆保持）。长任务不走 API（API 不支持 resume），用命令行降级姿势手动注入 key。
+- **双通道**：短任务 `POST /api/task`（ephemeral 零记忆，互审/复核用）；长任务 `codex exec` 落盘 + `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，thread id 记在看板 `session` 字段；实测跨单记忆保持）。长任务不走 API（API 不支持 resume），用命令行降级姿势手动注入 key。
 - 工单三字段 task/context/frame；交付强制四段含【异议位】。细则读 PROTOCOL.md §九（工具化纪律）与 §十一（已知限制）。
 
 ### ⚠️ 派单必须显式 `--workdir <绝对路径>`（2026-10-14 事故）
@@ -389,7 +453,7 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 
 ## Codex 升级姿势 + 升级后破坏性检验
 
-**升级姿势（0.161.0 实测）**：取 npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`，用其 `dist.integrity` 校 sha512（157MB tgz / 23.2s）；解包得主二进制 253MB + sidecar `codex-code-mode-host`（**须与主二进制同目录**）+ `codex-path/rg`（PATH 已有 `/usr/bin/rg`，**免装**）。**先跑包内 `bin/codex --version` 验活，再 `cp -a` 备份旧二进制（`<Codex 安装目录>/*.bak-<旧版>`）后替换**；回滚＝换回该备份文件。
+**升级姿势**：取 npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`，用其 `dist.integrity` 校 sha512（157MB tgz / 23.2s）；解包得主二进制 253MB + sidecar `codex-code-mode-host`（**须与主二进制同目录**）+ `codex-path/rg`（PATH 已有 `/usr/bin/rg`，**免装**）。**先跑包内 `bin/codex --version` 验活，再 `cp -a` 备份旧二进制（`<Codex 安装目录>/*.bak-<旧版>`）后替换**；回滚＝换回该备份文件。
 
 **每次升级后跑三条检验 —— 判据与处置固定**：
 
@@ -398,14 +462,13 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 | 1 | 工具面 | `node ~/.dsh/scripts/dsh/se-tool-probe.mjs` | 工具**名字集合**与上一版基线一致（**只看名字，不看字节数**——整份请求体本来就不逐字节一致） | 工具名增删 ⇒ 上游改了工具面，复核插件对工具名的假设 |
 | 2 | 执行链 | `bash ~/.dsh/scripts/dsh/se-appserver-verify.sh` | 5/5（appserver 派单+流式进度 / cancel 打断无残留 / exec 回归） | **插件必须动**：先切 `exec` 模式兜底，再修 |
 | 3 | DSH 依赖点 | `python3 ~/.dsh/scripts/dsh/dsh-dep-check.py` | 全 OK | 与 codex 版本无关，属 DSH 侧问题 |
-| 4 | **版本锚点** | 手工：改本文件首节「当前 x.y.z」+ `<本机功能核对表>` 顶部「当前版本」 | 两处都等于 `codex --version` | 漏改 ⇒ 下次照着旧版本号做判断 |
 
-**「维护 skill」的完整含义 = 上面第 4 行（改两处版本锚点）**；只有第 2 条判不过，才需要动插件代码。
+**只有第 2 条判不过，才需要动插件代码**；另两条是自查，不动插件。
 
-**人工判断（不可省）**：只读 release notes 四段归纳里的**插件调用面** —— `codex exec`（参数 `--skip-git-repo-check --ephemeral -o`）与 `codex app-server`。这两条未动 ⇒ **插件无需维护**；有变动或被默认收紧（例：0.161.0 把 `Daybreak` 改成必须 `--enable cli_daybreak`）⇒ 记一条并评估。
+**人工判断（不可省）**：只读 release notes 四段归纳里的**插件调用面** —— `codex exec`（参数 `--skip-git-repo-check --ephemeral -o`）与 `codex app-server`。这两条未动 ⇒ **插件无需维护**；有变动或被默认收紧（例：某版把 `Daybreak` 改成必须 `--enable cli_daybreak`）⇒ 记一条并评估。
 
-**0.161.0 实测**：三条全过（9 个工具名与 0.160.0 一致；appserver/exec 5/5；dep 3 探针 OK）⇒ **插件无需维护**。附带净收益：Responses 重试与 WS→HTTP 回退遵循服务端建议（治第三方端点断流）、`resume` 含最新已提交历史（dual-board 长链更稳）。
+**逐版实测记录不再写在这**（版本天天变，写一处就要改一处）：历次版本结果查 `<本机功能核对表>`。判据只剩一条 —— **插件调用面（`codex exec` 参数 / `codex app-server` 协议）有没有动**；没动就不用动插件。
 
-**0.162.1 实测（2026-10-11）**：三条全过 —— 工具面 9 个名字与 0.161.0 一致（`exec_command`/`write_stdin`/`request_user_input`/`view_image`/`multi_agent_v1`/`get_goal`/`create_goal`/`update_goal`/`web_search`）；appserver+exec 执行链 **5/5**（含 cancel 打断后无残留进程）；dep 探针 **6 条全 OK**（⚠️ 探针数已从 0.161.0 时的 3 增至 6，别再照旧数字核对）⇒ **插件无需维护**，锚点已同步（本文件首节 + `<本机功能核对表>` 顶部）。
+⚠️ **探针数量会变**（曾 3 条增至 6 条），比对时按脚本当次输出为准，别照旧数字核。
 
 ⚠️ **同日核对到的缺口**：`<Codex 安装目录>/` 下**只剩主二进制与 `code-mode-host` sidecar，没有任何 `.bak` 备份**（升级发生于 2026-10-10 03:50），也就是说本节的"回滚＝换回备份文件"**当前无法执行**。下次升级前应先 `cp -a` 补一份，否则出问题只能重新下载旧版包。

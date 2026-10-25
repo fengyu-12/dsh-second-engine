@@ -1,6 +1,8 @@
 # dsh-second-engine
 
 > 🚀 **你的 AI 也能拥有自己的 AI**：装一个插件、再装个 223MB 的 Codex CLI，你的 DeepSeek Harness 里就多了一位 7×24 待命的**第二引擎**——主 AI 干累了可以「让 Codex 试试」，写完代码自动互审挑刺，卡住还会主动喊救命。一个手机，两颗大脑，你只管裁决。
+>
+> **v3.5.0 起，两颗大脑开始「商量着干活」**：三档协作模式 —— **普通复核**（默认，派单即完）· **协作提议**（要它自己表态愿不愿意接、接哪部分）· **长任务配合**（不派工单，主 AI 直接开长会话边干边聊）。档位在悬浮球里切，切完对下一次派单生效。
 
 | 平台 | 状态 |
 |---|---|
@@ -93,14 +95,38 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 > 备选通道：npmmirror 的 `@openai/codex@<版本>-linux-arm64` 平台包（`vendor/<arch>/bin/` 内含它）。
 > 验收判据：让它「建一个文件并运行」——回复像不像不算数，看文件是否真落盘。回复正确但目录为空＝host 没装上。
 
+## 长什么样
+
+<p align="center">
+  <img src="docs/images/float-panel.jpg" width="46%" alt="悬浮球面板">
+  <img src="docs/images/settings-panel.jpg" width="46%" alt="设置页">
+  <br>
+  <sub>左：<b>悬浮球</b> —— 三档协作模式一点即切，底部是 Codex 版本与会话占用两行 kv，有新版才亮徽标。
+  <br>右：<b>设置页</b> —— 引擎状态、协作模式、四家模型提供方、联网搜索与 MCP、浏览器聊天桥。</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/web-chat.jpg" width="46%" alt="浏览器聊天桥">
+  <img src="docs/images/terminal.jpg" width="46%" alt="终端 TUI">
+  <br>
+  <sub>左：<b>浏览器聊天桥</b> —— 手机浏览器里直接和 Codex 对话，与终端共享同一批会话。
+  <br>右：<b>终端 TUI</b> —— 原生 Codex，YOLO mode 全功能。</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/settings-model.jpg" width="46%" alt="界面风格与模型思考">
+  <br>
+  <sub><b>界面风格</b>（Codex 蓝 / Claude 陶土色）· 字号 · 模型与思考等级</sub>
+</p>
+
 ## 安装
 
 两种方式二选一。**不要跳过依赖安装**：插件用 `link:` 注册时，宿主不会替你装插件自己的依赖；缺依赖的表现是「装完重启，设置页没有第二引擎」，而且没有报错。
 
 ### 方式 A：tgz 安装（推荐，无需改配置文件）
 
-1. 下载 Releases 里的 `dsh-second-engine-3.1.2.tgz`；
-2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.1.2.tgz`）；
+1. 下载 Releases 里的 `dsh-second-engine-3.5.0.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.5.0.tgz`）；
 3. 重启 Web，设置页出现「第二引擎」即成功。
 
 tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
@@ -120,6 +146,26 @@ pnpm install
 
 # 3. 重启 Web，设置页出现「第二引擎」分区即成功
 ```
+
+### 安装后：收录知识层 skill（强烈建议）
+
+插件包里的 `skills/second-engine/`（`SKILL.md` + `Codex功能表.md`）是**给主 AI 读的操作手册**——派单模板、施工五要点、诊断清单、异常速查、协作模式全在里面。它**不会自动出现在 DSH 的 skill 目录**，需要手动放一次：
+
+```bash
+# ① 找已安装的包目录（tgz / 源码安装位置不同，两处都找一下）
+PKG=$(find "$HOME/.dsh/plugin-src" "$HOME/.dsh/profiles" -maxdepth 5 -type d -name dsh-second-engine 2>/dev/null | head -1)
+# ② 拷进 DSH 的 skill 目录
+mkdir -p "$HOME/.dsh/skills"
+cp -r "$PKG/skills/second-engine" "$HOME/.dsh/skills/"
+# ③ 校验：应看到 SKILL.md 与 Codex功能表.md
+ls "$HOME/.dsh/skills/second-engine/"
+```
+
+装好后，你说「用 Codex / 第二引擎 / 第二意见 / 让 Codex 试试」时，主 AI 会自动加载这套流程，而不是临场即兴发挥。
+
+不装也能用插件（面板、工单、互审都正常），只是主 AI 少了这份手册，**派单质量与踩坑规避会明显变差**。
+
+升级插件后 `skills/` 可能更新，**重跑第 ② 步覆盖即可**（`cp -r` 会合并覆盖同名文件）。
 
 ## 配置
 
@@ -192,10 +238,11 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.1.2）
+## 支持能力一览（v3.5.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **协作模式三档**（collab） | ✅ 3.5.0 | 普通复核 / 协作提议 / 长任务配合 + 自定义第四组合。两位各自独立：`voice`（允许它主动提议）/ `longtask`（分阶段任务直接开长会话）；优先级 环境变量 > `~/.dsh/second-engine-collab.txt` > 默认。切 `voice=on` 立即写 `~/.codex/AGENTS.md` 的 voice 段、切回即删（文件 0600）。悬浮球面板与设置页都能切 |
 | 插件自身版本提示 | ✅ 3.1.2 | `/api/plugin-version` 读自身 `package.json` 与 GitHub releases 比对（成功缓存 1h / 失败 10min）；**无更新时界面完全不出现**，有更新才在设置卡徽标与浮动球红点提示，只提示不自动装 |
 | **首 token 看门狗（180s）** | ✅ 3.0.0 | app-server 模式迟迟不回第一个事件时不再无限挂起——超时即判失败并报错，工单不会静默卡死 |
 | **终态方法集合** | ✅ 3.0.0 | 过滤迟到的旧 turn 事件，避免上一轮结果覆盖当前工单 |
@@ -216,8 +263,11 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 ## 版本记录（择要）
 
+> **3.1.2 → 3.5.0 是跳号发布**：这一轮动的是**协作机制本身** —— 三档协同、主 AI 侧派单契约、版本提示自动熄灭。不是挤牙膏式修补，按换代走。
+
 | 版本 | 关键点 |
 |---|---|
+| **3.5.0** | **协作模式三档落地**（普通复核 / 协作提议 / 长任务配合 + custom；`voice` 切档即写/删 `~/.codex/AGENTS.md` 段，`longtask` 只影响主 AI 派单）· 悬浮球加档位下拉 · 球面板版本行改「Codex 版本 / 会话目录占用」两行 kv + 与设置页同款「已是最新」徽标 · **修「升级完红点常亮」**：有新版提示由挂载查一次改为 30s 轮询，且无新版时自动熄灭（旧版只有点亮分支，升级完必须整页刷新才熄）· 主 AI 侧新增「派单前先读档位」流程（插件无推送通道，靠 `/api/status` 主动查）· SKILL 不再记版本号，版本与开关态统一归 `Codex功能表.md` |
 | **3.1.2** | 插件自身版本提示（`/api/plugin-version`，默认完全静默）· 面板「模型与思考」`/api/config`（键白名单 + 写前备份 + 原子替换）· 设置页改分区制（说明收进「?」、provider 主行只留名称/徽标/模型、会话清理折起）· 悬浮球面板重排（标题行状态点+模型名、版本与占用并一行、空态去框）· 面板高度跟随 `visualViewport`（键盘弹出不再慢半拍） |
 | **3.1.1** | 文档补全：安装分「tgz / 源码」两种方式并标明 link: 必装依赖 · 用 GPT 系模型需另装 `codex-code-mode-host`（含镜像下载与「文件真落盘」验收判据） |
 | **3.1.0** | exec 工单过程流 `.live` 跑完即删（不再积压磁盘）· `cleanup` 覆盖 `.live`（并跳过运行中的任务）· dual-board 用法段回灌 · SKILL 增「会话落盘路径与读法」 |
