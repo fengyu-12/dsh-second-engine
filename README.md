@@ -125,8 +125,8 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 
 ### 方式 A：tgz 安装（推荐，无需改配置文件）
 
-1. 下载 Releases 里的 `dsh-second-engine-3.6.0.tgz`；
-2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.6.0.tgz`）；
+1. 下载 Releases 里的 `dsh-second-engine-3.6.1.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.6.1.tgz`）；
 3. 重启 Web，设置页出现「第二引擎」即成功。
 
 tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
@@ -238,7 +238,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.6.0）
+## 支持能力一览（v3.6.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -274,7 +274,8 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
-| **3.6.0** | **债务清算 + 实现优化**。**修三处「不报错」的**：① 卡点求助地址随宿主端口漂移而失效（旧版 DSH 固定 3080，新版改动态端口后一直连不通，只能退回 `[CONSULT-NEEDED]` 文本兜底）→ 改为从宿主启动参数 `--port` 解析，可被 `SECOND_ENGINE_BASE_URL` 覆盖；② **注入文档对老用户永不更新**（`~/.codex/AGENTS.md` 的 v2/board 段原是「标记存在就跳过」）→ 补结束标记 + 摘除重写 + 三级边界降级（结束标记 → 旧模板末句锚 → 都没命中就告警不动手），**用户手加段落逐字保留**；`v1→v2` 迁移不再在锚句未命中时静默截断到文件尾；③ `rounds[].verdict` 与终止判据口径不一致（曾会记成「converged 却挂着 N 条问题」）。**补两处「写了但从没跑到」的清理**：`.live` 过程流清理被 200 MB 阈值挡在后面（2026-10-17 起一次没执行）→ 从阈值摘出、按 mtime 无条件清（仍跳过运行中任务）；Codex 日志库按时间清理 + 碎片回收（走内置 `node:sqlite`，零依赖；带库不存在/表名不符/integrity_check/Codex 在跑/磁盘不足五道安全闸）。**优化**：复核**首轮**提示词补三条硬要求（诚实条款「材料不足就明说并标 `verified:false`」/ 禁赞美禁总结 / 强制交代核查依据）——此前整套纪律只装在第 2 轮之后，而 90% 复核只跑 1 轮 · 复核新增 **`blocked` 硬档**（识别 `block`/`blocker` 后立即终止，不再跑后续轮，输出块首行换 `[REVIEW_BLOCKED]`）· 新增只读字段 `independentSources` + `quorumNote`（让「只有一个独立来源」可见，**不参与任何收敛判定**）· 配置与文档写入统一原子化 · `config.toml` 备份改按时间戳轮转（留最近 5 份）· 移出 `docs/appserver-*` 研究笔记 · 源码去私（`DEFAULT_TASK_WORKDIR` / `NOTIFY_TOKEN_PATH` 改 `$HOME` 派生，行为不变）· 新增 `GET /api/_meta` 路由自描述（24 条，随代码自动生成，不再手抄路由表） |
+| **3.6.1** | **修「干净环境一跑就崩」的 12 处**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` · 3 个注入函数补 `mkdirSync(CODEX_DIR)`（没装 Codex 时装插件，`AGENTS.md` 会被静默吞掉且不再补）· 网页桥 `updateConfigToml` 保留行尾注释。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
+| **3.6.0** | **债务清算 + 实现优化**。修三处**不报错**的静默失效：① 卡点求助地址写死 3080（新版 DSH 改动态端口后一直连不通，只靠文本兜底）→ 改从宿主 `--port` 解析；② `~/.codex/AGENTS.md` 的 v2/board 段「标记存在就跳过」⇒ 老用户永远拿不到新内容 → 补结束标记 + 摘除重写 + 三级边界（末命中则告警不动手），`v1→v2` 不再静默截断；③ `rounds[].verdict` 与终止判据口径不一致。补两处**写了但从没跑到**的清理：`.live` 被 200 MB 阈值挡在后面（10-17 起未执行）→ 从阈值摘出；Codex 日志库按时间清 + 碎片回收（`node:sqlite`，五道安全闸）。优化：复核**首轮**提示词补三条硬要求（此前纪律只装在第 2 轮后，而 90% 复核只跑 1 轮）· 复核新增 `blocked` 硬档（识别即终止）· 只读 `independentSources`/`quorumNote`（不参与收敛判定）· 写入统一原子化 · `config.toml` 备份轮转留 5 份 · 新增 `GET /api/_meta` 路由自描述。 |
 | **3.5.0** | **协作模式三档落地**（普通复核 / 协作提议 / 长任务配合 + custom；`voice` 切档即写/删 `~/.codex/AGENTS.md` 段，`longtask` 只影响主 AI 派单）· 悬浮球加档位下拉 · 球面板版本行改「Codex 版本 / 会话目录占用」两行 kv + 与设置页同款「已是最新」徽标 · **修「升级完红点常亮」**：有新版提示由挂载查一次改为 30s 轮询，且无新版时自动熄灭（旧版只有点亮分支，升级完必须整页刷新才熄）· 主 AI 侧新增「派单前先读档位」流程（插件无推送通道，靠 `/api/status` 主动查）· SKILL 不再记版本号，版本与开关态统一归 `Codex功能表.md` |
 | **3.1.2** | 插件自身版本提示（`/api/plugin-version`，默认完全静默）· 面板「模型与思考」`/api/config`（键白名单 + 写前备份 + 原子替换）· 设置页改分区制（说明收进「?」、provider 主行只留名称/徽标/模型、会话清理折起）· 悬浮球面板重排（标题行状态点+模型名、版本与占用并一行、空态去框）· 面板高度跟随 `visualViewport`（键盘弹出不再慢半拍） |
 | **3.1.1** | 文档补全：安装分「tgz / 源码」两种方式并标明 link: 必装依赖 · 用 GPT 系模型需另装 `codex-code-mode-host`（含镜像下载与「文件真落盘」验收判据） |
@@ -286,6 +287,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 ## 已知限制
 
+- **`~/.codex/AGENTS.md` 的注入只在插件启动时执行一次**：装插件时若还没装 Codex CLI（`~/.codex` 不存在），三个注入函数现在会各自先 `mkdirSync(CODEX_DIR, { recursive: true })` 再写，**所以目录缺失本身不再导致失败**（2026-10-26 修；旧版走到 `atomicWriteFileSync` 时抛 ENOENT，被外层 `catch` 静默吞掉且之后不重跑，只能等重启）。**仍然存在的边界**：若 `$HOME` 本身不可写（权限/SELinux 等），注入仍会跳过 —— 看 `GET /api/status` 的 `lastErrors` 里有没有 `agents-protocol`；有的话改权限后**重启一次 Web** 即可补上（`ensure*` 幂等，内容一致时零写入，不会重复叠加）。
 - **控制面无鉴权（本机威胁模型，已评估接受）**：`/second-engine/api/*` 只绑 loopback、不校验 token。本机任意进程可调 `POST /providers/update` 把 `baseUrl` 改成自己的地址，再触发 `/task` 或 `/review`，使插件把已存的 provider key 以 `Authorization: Bearer` 发向该地址（completions 模式经本地桥转发）。**这是本机威胁模型下的真实链路，不是远程漏洞**：需要本机代码执行或本机 HTTP 调用能力、且 active provider 已存非空 key。本项目按「单机、不暴露公网」定位接受此风险、不修。若将来要部署在多用户 / 共享机器环境，应优先修 —— 最小改法：`baseUrl` 变更时清空该 provider 的 `apiKey`（地址一变 key 失效，攻击者拿到地址也没 key）。
 - **沙箱**：proot 环境无 Landlock / bubblewrap，Codex 需 `danger-full-access` 运行——安全防线在流程层（工作副本隔离 + diff 审查 + git 仲裁），**不要把主工作区直接交给 Codex**；
 - **翻译桥**：实验性；内部以非流式请求上游、以流式事件回放，长任务首包延迟等于整段生成时间；

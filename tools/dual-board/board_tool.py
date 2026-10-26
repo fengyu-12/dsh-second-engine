@@ -66,6 +66,10 @@ class _Lock:
     """O_EXCL 锁上下文；超 10 分钟的残留锁视为废弃可接管。"""
 
     def __enter__(self):
+        # 数据目录不存在时自建（2026-10-26 修）：BOARD_DIR 默认是脚本所在目录（存在），但 board.sh
+        # 会把它设成 $HOME/proj/dual-board —— 新装用户那里没有这个目录，旧代码直接在
+        # os.open(LOCK, O_CREAT) 抛 FileNotFoundError，第一个动作就崩。本机因 9 月已手建过，从未触发。
+        os.makedirs(BOARD_DIR, exist_ok=True)
         for _ in range(LOCK_TRIES):
             try:
                 fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -95,9 +99,17 @@ class _Lock:
         return False
 
 
-def load_board() -> dict:
+def load_board(create: bool = False) -> dict:
+    """create=True 时允许「看板不存在⇒返回空板」，由第一个写操作（new）落盘成型。
+
+    2026-10-26 修：此前所有子命令都要求 board.json 已存在、且没有 init 入口 ——
+    新装用户照协议跑 `board.sh new ...` 第一条就 die「看板不存在」，而本机那份
+    是 2026-09-27 手建的，所以这个缺口从未被触发过。
+    """
     if not os.path.exists(BOARD):
-        die(1, f"看板不存在：{BOARD}")
+        if not create:
+            die(1, f"看板不存在：{BOARD}")
+        return {"revision": 0, "tasks": []}
     with open(BOARD, encoding="utf-8") as f:
         data = json.load(f)
     data.setdefault("revision", 0)
@@ -160,7 +172,7 @@ def fill_template(task: dict) -> dict:
 
 def cmd_new(a) -> None:
     with _Lock():
-        data = load_board()
+        data = load_board(create=True)
         check_cas(data, a.expect)
         if any(t.get("id") == a.id for t in data["tasks"]):
             die(1, f"任务 id 已存在：{a.id}")

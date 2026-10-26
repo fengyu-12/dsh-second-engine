@@ -536,6 +536,10 @@ const AGENTS_V1_TAIL_ANCHORS = ['- 只在指定工作副本内写文件；最终
 
 function ensureAgentsProtocol() {
   try {
+    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
+    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
+    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
+    mkdirSync(CODEX_DIR, { recursive: true })
     const path = join(CODEX_DIR, 'AGENTS.md')
     let existing = ''
     try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
@@ -573,6 +577,10 @@ const BOARD_TAIL_ANCHORS = [sectionTailLine(BOARD_SECTION, BOARD_END)]
 
 function ensureBoardProtocol() {
   try {
+    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
+    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
+    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
+    mkdirSync(CODEX_DIR, { recursive: true })
     const path = join(CODEX_DIR, 'AGENTS.md')
     let existing = ''
     try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
@@ -629,6 +637,10 @@ function collabStatus() {
 }
 function ensureVoiceProtocol() {
   try {
+    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
+    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
+    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
+    mkdirSync(CODEX_DIR, { recursive: true })
     const path = join(CODEX_DIR, 'AGENTS.md')
     let existing = ''
     try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则视为空 */ }

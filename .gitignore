@@ -6,3 +6,4 @@ W1*.md
 src/.probe-tmp.mjs
 *.probe_out
 *.bak-*
+__pycache__/

@@ -12,6 +12,9 @@
 #       由来：协议层定了工单三字段 task/context/frame，但 wrapper 的 build_prompt(task, scopes)
 #       从来没有 context 入口 ⇒ 约束只活在文档里（「协议写了但没人执行」）。
 set -euo pipefail
+# board.sh 与 dispatch.sh 同目录（随包脚本）；BOARD_DIR 是运行时数据目录，两者不是一个地方
+DUAL_BOARD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DUAL_BOARD_SCRIPT_DIR
 exec python3 - "$@" <<'PY'
 import argparse
 import datetime
@@ -25,6 +28,8 @@ import urllib.request
 from pathlib import Path
 
 BOARD_DIR = Path(os.environ.get("DUAL_BOARD_DIR") or (Path.home() / "proj" / "dual-board"))
+# heredoc 从 stdin 跑，__file__ 是 '<stdin>' 拿不到脚本路径，故由外层 bash 导出随包脚本目录
+SCRIPT_DIR = Path(os.environ["DUAL_BOARD_SCRIPT_DIR"])
 INBOX = BOARD_DIR / "inbox-codex.md"
 DISPATCH_DIR = BOARD_DIR / ".dispatch"
 API_URL = (os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/") + "/second-engine/api/task"
@@ -56,6 +61,8 @@ def unread_segments(text):
 def build_prompt(task, context, self_test, scopes):
     try:
         inbox_text = INBOX.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        inbox_text = ""  # 收件箱还没建 = 没有未读消息，不是错误
     except OSError as error:
         raise RuntimeError(f"无法读取收件箱 {INBOX}: {error}") from error
 
@@ -221,7 +228,7 @@ def auto_archive():
             ["inbox-archive", "lead"], ["channel-trim", "--keep", "10"]]
     for argv in jobs:
         try:
-            proc = subprocess.run(["bash", str(BOARD_DIR / "board.sh")] + argv,
+            proc = subprocess.run(["bash", str(SCRIPT_DIR / "board.sh")] + argv,
                                   text=True, capture_output=True, timeout=30)
             msg = ((proc.stdout or "") + (proc.stderr or "")).strip().replace("\n", " ")
             if msg:

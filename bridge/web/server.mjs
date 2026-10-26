@@ -483,7 +483,11 @@ function updateConfigToml(text, kv) {
     if (firstSectionIdx >= 0) continue;               // 已经进段了，后面的 key=value 都不属于顶层
     lastTopIdx = i;
     if (Object.prototype.hasOwnProperty.call(kv, m[2])) {
-      lines[i] = `${m[2]} = ${JSON.stringify(String(kv[m[2]]))}`;
+      // 保留行尾注释（2026-10-26 修）：旧写法整行重写成 `key = value`，会把用户写在那行的
+      // `# 说明` 一并抹掉 —— 改一次模型选择，那条注释就永久消失。这里只认 ` # ` 形态的尾注。
+      const ci = line.search(/\s#\s/)
+      const tailComment = ci >= 0 ? '  ' + line.slice(ci + 1).trimStart() : ''
+      lines[i] = `${m[2]} = ${JSON.stringify(String(kv[m[2]]))}${tailComment}`
       replaced.add(m[2]);
     }
   }
