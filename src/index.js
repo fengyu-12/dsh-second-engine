@@ -1049,6 +1049,8 @@ async function reconcileOnce() {
   // ② 作业探活：仅对内存中 running 的作业判失联（健康作业一律不碰）
   for (const task of tasks.values()) {
     if (task.status !== 'running') continue
+    // P2：取消中的任务内部 status 仍是 running（终态待 finalize），别让探活抢先判失联。
+    if (task.cancelled === true) continue
     const why = probeTaskLost(task)
     if (why === null) continue
     task.reconcileLost = why
@@ -1721,11 +1723,20 @@ async function handleCleanup(req, res) {
 // ── /task、/tasks、/task/cancel：异步工单 ──
 
 // 只要序列化安全的那部分（child/outPath/watchdog 绝不出进程）。
+// P2（2026-10-28）：取消是「意图」，不是「事实」。
+// 终态（status/exitCode/endedAt）只允许 finalizeJob 写（:1916 是全文件唯一赋值处）。
+// 但用户点取消后必须立刻看到结果 —— 所以视图层把「意图已成立 + 事实上仍在跑」映射成
+// 对外的 cancelled。内部 task.status 在子进程真正退出前保持 running。
+function viewStatus(task) {
+  if (task.cancelled === true && task.status === 'running') return 'cancelled'
+  return task.status
+}
+
 function taskView(task) {
   const view = {
     id: task.id,
     kind: task.kind === 'review' ? 'review' : 'task',
-    status: task.status,
+    status: viewStatus(task),
     exitCode: task.exitCode,
     startedAt: task.startedAt,
     endedAt: task.endedAt,
@@ -1744,6 +1755,9 @@ function taskView(task) {
     view.mode = 'appserver'
     view.progress = projectProgress(task.progress)
   }
+  // P1.1：活性时间 —— 与看门狗判据用同一个值（task.activityAt：事件心跳 ∨ 产物 mtime）。
+  // stuckSuspect 是看门狗「上次采样」的结论，二者可能短暂不一致（例如产物被清理后归 0）。
+  view.activityAt = Number.isFinite(task.activityAt) ? task.activityAt : 0
   if (view.kind === 'review') {
     // 互审进度：第 N/上限轮 + 每轮 {issues,verdict} 全量（issues 体量小，列表也带上，展开即见）。
     view.round = Number.isInteger(task.round) ? task.round : 0
@@ -1813,7 +1827,13 @@ function outFileMtimeMs(outPath) {
   try { return statSync(outPath).mtimeMs } catch { return null }
 }
 
-// spawn 后启动：每 30s 看一次 -o 文件 mtime，超 300s 无变化 → stuckSuspect + 通知一次。
+// 活性信号（P1.1，2026-10-28）：不再单独造 engineActivityAt 字段 —— 复用 task.activityAt。
+// 它本来就是「看门狗的上次活动时刻」（:1854 初始化、mtime 抬升、300s 比较），
+// 事件心跳直接写它，就是同一语义的第二个来源，不需要第二份状态。
+// 旧实现靠 onEvent 里 utimesSync(-o 文件) 续命，等于把「有事件」伪装成「文件在写」：
+// 既污染了 cleanupLiveFiles 的 mtime 判据（长跑任务永不超期），又让无 -o 文件的引擎
+// （HTTP / 单轮请求-响应）没处续命、必被误判停滞。
+// spawn 后启动：每 30s 看一次活性（显式心跳 ∨ -o 文件 mtime 兜底），超 300s 无变化 → stuckSuspect + 通知一次。
 // 复核每轮换新的 outPath，检查时按 task.outPath 动态取值，故 interval 可跨越整个任务生命周期。
 function startWatchdog(task) {
   if (task.watchdog !== null && task.watchdog !== undefined) return
@@ -1826,6 +1846,8 @@ function startWatchdog(task) {
   task.watchdog = setInterval(() => {
     try {
       if (task.endedAt !== null && task.endedAt !== undefined) { stopWatchdog(task); return }
+      // P1.1：两个活性源。① app-server 的事件心跳由 onEvent 直接写 task.activityAt；
+      // ② exec/复核的产物仍在写文件，mtime 是它唯一的活性源。两者都只做「抬升」。
       const mtime = task.outPath ? outFileMtimeMs(task.outPath) : null
       if (mtime !== null && mtime > task.activityAt) {
         task.activityAt = mtime
@@ -1897,13 +1919,23 @@ function appendConsultBlock(task) {
     + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
 }
 
+// P2.3（2026-10-28）：finalizeJob 的 extra 是历史旁路 —— 若允许任意字段，等于给
+// 「终态唯一落定」开一个后门（任何调用方都能绕过 status/exitCode 直接改 task）。
+// 当前唯一调用方 finalizeReview 只传这两个复核专属字段，故按白名单收口。
+const FINALIZE_EXTRA_ALLOWED = new Set(['verdict', 'error'])
+
 function finalizeJob(task, exitCode, status, extra) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
   stopWatchdog(task)
   // exitCode 省略 = 保留调用方已记的值：复核每轮在 runReview 里自记 exitCode，不能覆盖。
   if (exitCode !== undefined) task.exitCode = exitCode
   task.status = status
-  if (extra) Object.assign(task, extra)
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (FINALIZE_EXTRA_ALLOWED.has(k)) task[k] = v
+      else noteErr('finalizeJob.extra', new Error(`拒绝未知 extra 字段: ${k}`))
+    }
+  }
   // 读 -o 输出（头尾截断），成功才覆盖：复核轮文件在 readReviewOut 里逐轮已删、
   // 工单也可能没生成输出文件 —— 读不到时保留现有 output，这是常态不是错误。
   try { task.output = readHeadTail(task.outPath, TASK_OUTPUT_CLIP) } catch { /* 保留现有 output */ }
@@ -2054,7 +2086,7 @@ function reviewRecord(task) {
   return {
     id: task.id,
     kind: 'review',
-    status: task.status,
+    status: viewStatus(task),
     verdict: typeof task.verdict === 'string' ? task.verdict : '',
     stopReason: typeof task.stopReason === 'string' ? task.stopReason : '',
     prevId: typeof task.prevId === 'string' ? task.prevId : '',
@@ -2250,6 +2282,7 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     progress: [],
     // 排障用（不对外返回）：归一化事件的 meta 原文，环形上限 ENGINE_EVENTS_LIMIT。
     engineEvents: [],
+    // P1.1 心跳：引擎活性显式时间戳（看门狗判据主项；0 = 尚未收到任何事件）。
   }
   const handle = startAppServerTurn({
     cwd: workdir,
@@ -2284,11 +2317,12 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
         task.engineEvents.push({ at: Date.now(), kind: progressEntry(evt, 0).kind, meta: encoded })
         if (task.engineEvents.length > ENGINE_EVENTS_LIMIT) task.engineEvents.shift()
       }
-      // 任何事件都刷新 -o mtime：既有看门狗「300s 无变化 → stuckSuspect」自动适配流式场景
-      try {
-        const now = new Date()
-        utimesSync(outPath, now, now)
-      } catch { /* 文件可能尚未创建 */ }
+      // P1.1（2026-10-28）：原先此处 utimesSync(outPath) 给看门狗续命，现在直接抬升
+      // task.activityAt（看门狗判据用的同一个值），**不再碰文件**。
+      // 不碰文件的第二个理由：该 mtime 同时是 cleanupLiveFiles 的判据（statSync(...).mtimeMs
+      // 对 cutoff 比较），持续 utimesSync 会把长跑任务的 -o 钉在「永不超期」上，
+      // 崩溃没走 finalize 时就再也清不掉。
+      task.activityAt = Date.now()
     },
   })
   task.child = handle.child
@@ -2299,16 +2333,21 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
 
   handle.run.catch((e) => {
     task.appError = errMsg(e)
-    if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+    // P1.2（2026-10-28 补漏）：取消在 appserver 分支走的是 handle.done 的 reject，
+    // 不经过 exec 的 child.on('exit')。三处收尾都要认 task.cancelled，否则取消仍落 'error'。
+    const cancelled = task.cancelled === true
+    if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
   })
   handle.done
     .then((r) => {
-      const ok = r.status === 'completed'
-      if (finalizeTask(task, ok ? 0 : 1, ok ? 'done' : 'error') && task.cancelled !== true) void notifyTask(task)
+      const cancelled = task.cancelled === true
+      const ok = r.status === 'completed' && !cancelled
+      if (finalizeTask(task, cancelled ? -1 : (ok ? 0 : 1), cancelled ? 'cancelled' : (ok ? 'done' : 'error')) && !cancelled) void notifyTask(task)
     })
     .catch((e) => {
       task.appError = errMsg(e)
-      if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+      const cancelled = task.cancelled === true
+      if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
     })
 
   send(res, { ok: true, id, mode: 'appserver' })
@@ -2408,16 +2447,19 @@ async function handleTaskCreate(req, res) {
       outPath,
       live,
       cancelled: false,
-    }
+      // P1.1 心跳：exec 模式不产事件，活性仍由 -o/.live 文件 mtime 兜底（此值保持 0）。
+      }
     tasks.set(id, task)
     pruneTasks()
     startWatchdog(task)
 
     child.on('exit', (code, signal) => {
-      // 被取消的任务固定 error/-1；其余按真实退出码判定。
+      // 被取消的任务固定 cancelled/-1；其余按真实退出码判定。
+      // 2026-10-28（P1.2）：取消是独立终态，不再与失败混用 'error' —— 客户端
+      // lib/client.js:1349/:1509 已把 'cancelled' 当合法值（显示「已取消」）。
       const cancelled = task.cancelled === true
       const exitCode = cancelled ? -1 : (Number.isInteger(code) ? code : -1)
-      const status = cancelled ? 'error' : (exitCode === 0 ? 'done' : 'error')
+      const status = cancelled ? 'cancelled' : (exitCode === 0 ? 'done' : 'error')
       // 记录终止信号：exitCode=-1 时只有它能区分「外部 SIGTERM/SIGKILL」与「spawn 失败」。
       if (signal) task.lastSignal = signal
       // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
@@ -2458,7 +2500,7 @@ async function handleTaskList(_req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-// POST /task/cancel：body { id }。SIGTERM 后按约定标 error/-1（exit 回调不再重复收尾）。
+// POST /task/cancel：body { id }。SIGTERM 后按约定标 cancelled/-1（exit 回调不再重复收尾）。
 async function handleTaskCancel(req, res) {
   try {
     const body = await readBody(req)
@@ -2469,11 +2511,10 @@ async function handleTaskCancel(req, res) {
     if (task.status !== 'running') {
       return send(res, { ok: false, error: `任务已结束（${task.status}），无需取消` }, 400)
     }
-    // 立刻落定状态（用户看到反馈不必等子进程真的退出）；
+    // P2（2026-10-28）：这里只写「取消意图」，不预置终态 —— 终态唯一由 finalizeJob 写。
+    // 用户反馈靠 viewStatus() 立刻可见（cancelled 信号 + 仍是 running → 对外显示 cancelled）；
     // output 留给 exit 回调收尾，那样能拿到进程退出前的完整输出。
     task.cancelled = true
-    task.status = 'error'
-    task.exitCode = -1
     // T5：app-server 模式先发 turn/interrupt（优雅结束当前 turn），kill 作为兜底。
     if (task.app !== undefined && typeof task.app.interrupt === 'function') {
       // interrupt 可能 reject（连接已断等）：吞掉，取消路径靠 SIGTERM/SIGKILL 兜底。
@@ -2491,7 +2532,7 @@ async function handleTaskCancel(req, res) {
       } catch { /* best effort */ }
     }, 3000)
     if (typeof killTimer.unref === 'function') killTimer.unref()
-    send(res, { ok: true, id, status: task.status, exitCode: task.exitCode })
+    send(res, { ok: true, id, status: viewStatus(task), exitCode: -1 })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -3453,7 +3494,8 @@ async function handleReviewCreate(req, res) {
       outPath: '',
       cancelled: false,
       stuckSuspect: false,
-      // 硬预算（可由配置覆盖）—— runReview 里再用缺省值兜底。
+      // P1.1 心跳：复核逐轮走 exec，活性由该轮 -o 文件 mtime 兜底（此值保持 0）。
+        // 硬预算（可由配置覆盖）—— runReview 里再用缺省值兜底。
       wallMs: doc.reviewWallMs,
       tokenLimit: doc.reviewTokenLimit,
     }
@@ -3486,7 +3528,7 @@ async function handleReviewCancel(req, res) {
     }
     // 先置熔断标记：循环每轮结束（及下一轮 spawn 前）都会检查，确保不再推进。
     task.cancelled = true
-    task.status = 'cancelled'
+    // P2：不预置 status（终态归 finalizeJob）；verdict 是复核裁决标记，与任务状态无关，保留。
     task.verdict = 'cancelled'
     const child = task.child
     if (child !== null && child !== undefined) {
@@ -3499,7 +3541,7 @@ async function handleReviewCancel(req, res) {
       }, 3000)
       if (typeof killTimer.unref === 'function') killTimer.unref()
     }
-    send(res, { ok: true, id, status: task.status })
+    send(res, { ok: true, id, status: viewStatus(task) })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 

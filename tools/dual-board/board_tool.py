@@ -412,7 +412,10 @@ def _append_jsonl(path: str, records: list[dict]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-CHANNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel.md")
+# 2026-10-28 修：原先用 dirname(__file__)，脚本收编进插件后 CHANNEL 落到插件目录
+# → complete 的"清场"清的是插件里那个空文件，真正在看的 channel.md 从未被写过。
+# 与 BOARD_DIR 统一：运行数据一律跟着 DUAL_BOARD_DIR 走。
+CHANNEL = os.path.join(BOARD_DIR, "channel.md")
 CHANNEL_KEEP = 10
 
 

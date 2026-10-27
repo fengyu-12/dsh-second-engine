@@ -129,7 +129,8 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
     fi
   done
   [ "$align_bad" = 0 ] && ok "代码文件三处一致（$align_n 个）" || bad "三处落点 $align_bad 个文件不一致"
-  if [ "$ROOT" = "/root/dsha-second-engine" ] && [ -f "$LOAD_DIR/README.md" ]; then
+  # 不按本机绝对路径分支：只要加载层有 README 就比（发布树是剔私版，不比）
+  if [ -f "$LOAD_DIR/README.md" ]; then
     cmp -s "$ROOT/README.md" "$LOAD_DIR/README.md" && ok "README 实体=加载（发布树为剔私版，不比）" || bad "README 实体与加载层不一致"
   fi
 else
