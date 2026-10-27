@@ -15,6 +15,13 @@ set -euo pipefail
 # board.sh 与 dispatch.sh 同目录（随包脚本）；BOARD_DIR 是运行时数据目录，两者不是一个地方
 DUAL_BOARD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DUAL_BOARD_SCRIPT_DIR
+# Web 地址：与 wait-task.sh 共用 tools/web-base.sh。写死 3080 在动态端口（本机 43309）下连不通。
+# 优先级：SECOND_ENGINE_BASE_URL > DSH_WEB_URL > 运行中 dsh web 的 --port > 3080。
+if [ -f "$DUAL_BOARD_SCRIPT_DIR/../web-base.sh" ]; then
+  . "$DUAL_BOARD_SCRIPT_DIR/../web-base.sh"
+  SECOND_ENGINE_BASE_URL="${SECOND_ENGINE_BASE_URL:-$(se_web_base)}"
+  export SECOND_ENGINE_BASE_URL
+fi
 exec python3 - "$@" <<'PY'
 import argparse
 import datetime
@@ -32,7 +39,7 @@ BOARD_DIR = Path(os.environ.get("DUAL_BOARD_DIR") or (Path.home() / "proj" / "du
 SCRIPT_DIR = Path(os.environ["DUAL_BOARD_SCRIPT_DIR"])
 INBOX = BOARD_DIR / "inbox-codex.md"
 DISPATCH_DIR = BOARD_DIR / ".dispatch"
-API_URL = (os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/") + "/second-engine/api/task"
+API_URL = (os.environ.get("SECOND_ENGINE_BASE_URL") or os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/") + "/second-engine/api/task"
 
 
 def usage(parser):

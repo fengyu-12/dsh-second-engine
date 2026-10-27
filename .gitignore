@@ -7,3 +7,4 @@ src/.probe-tmp.mjs
 *.probe_out
 *.bak-*
 __pycache__/
+tools/dual-board/channel.md
