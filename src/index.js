@@ -39,6 +39,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync
 import { spawn, execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
+import { createRuntime } from './engine/runtime.js'
 import http from 'node:http'
 import { join, resolve, dirname, delimiter } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -192,9 +193,7 @@ const REVIEW_TEMPLATE =
   + '该条 issue 的 severity 写 blocker——这是硬停档：此类问题不存在「再改一轮试试」，'
   + '必须立即停手交人裁决。'
   + '输出 JSON: {issues:[{severity,point,suggestion,verified}], verdict}'
-// 看门狗：每 30s 探一次 -o 输出文件 mtime，超 300s 无变化即标疑似停滞并通知。
-const WATCHDOG_INTERVAL_MS = 30000
-const WATCHDOG_STALL_MS = 300000
+// 看门狗间隔与阈值已随 P3.2 搬进 src/engine/runtime.js（WATCHDOG_INTERVAL_MS / WATCHDOG_STALL_MS）。
 // 解析失败时回显的原始输出上限，避免把超长文本灌进任务表。
 const REVIEW_RAW_CLIP = 2000
 // 互审的硬预算缺省值（2026-10-03 补：此前只有轮数上限，"无新增即收敛"是**语义**条件，
@@ -1815,56 +1814,23 @@ function pruneTasks() {
   }
 }
 
-// 看门狗：任务结束即清 interval（finalizeTask / finalizeReview 都会调用）。
-function stopWatchdog(task) {
-  if (task.watchdog === null || task.watchdog === undefined) return
-  try { clearInterval(task.watchdog) } catch { /* best effort */ }
-  task.watchdog = null
-}
-
-// -o 输出文件 mtime（毫秒）；文件还没生成时返回 null。
-function outFileMtimeMs(outPath) {
-  try { return statSync(outPath).mtimeMs } catch { return null }
-}
-
-// 活性信号（P1.1，2026-10-28）：不再单独造 engineActivityAt 字段 —— 复用 task.activityAt。
-// 它本来就是「看门狗的上次活动时刻」（:1854 初始化、mtime 抬升、300s 比较），
-// 事件心跳直接写它，就是同一语义的第二个来源，不需要第二份状态。
-// 旧实现靠 onEvent 里 utimesSync(-o 文件) 续命，等于把「有事件」伪装成「文件在写」：
-// 既污染了 cleanupLiveFiles 的 mtime 判据（长跑任务永不超期），又让无 -o 文件的引擎
-// （HTTP / 单轮请求-响应）没处续命、必被误判停滞。
-// spawn 后启动：每 30s 看一次活性（显式心跳 ∨ -o 文件 mtime 兜底），超 300s 无变化 → stuckSuspect + 通知一次。
-// 复核每轮换新的 outPath，检查时按 task.outPath 动态取值，故 interval 可跨越整个任务生命周期。
-function startWatchdog(task) {
-  if (task.watchdog !== null && task.watchdog !== undefined) return
-  // 顺带固定子进程身份（对账 tick 判失联用）：只在首次记录，重复调用不覆盖。
-  if (task.childPid === undefined && task.child !== null && task.child !== undefined) {
-    task.childPid = Number.isInteger(task.child.pid) ? task.child.pid : null
-    task.childStart = readProcStartTime(task.childPid)
+// P3.2（2026-10-28）：看门狗与活性已搬进 src/engine/runtime.js（TaskRuntime 第一块）。
+// 这里只保留同名薄封装，调用点不动；rtOf 惰性建 runtime（WeakMap，随 task 回收）。
+const runtimes = new WeakMap()
+function rtOf(task) {
+  let rt = runtimes.get(task)
+  if (rt === undefined) {
+    rt = createRuntime(task, { notify, readProcStartTime })
+    runtimes.set(task, rt)
   }
-  task.activityAt = Date.now()
-  task.watchdog = setInterval(() => {
-    try {
-      if (task.endedAt !== null && task.endedAt !== undefined) { stopWatchdog(task); return }
-      // P1.1：两个活性源。① app-server 的事件心跳由 onEvent 直接写 task.activityAt；
-      // ② exec/复核的产物仍在写文件，mtime 是它唯一的活性源。两者都只做「抬升」。
-      const mtime = task.outPath ? outFileMtimeMs(task.outPath) : null
-      if (mtime !== null && mtime > task.activityAt) {
-        task.activityAt = mtime
-        task.stuckSuspect = false
-        return
-      }
-      if (task.stuckSuspect === true) return
-      if (Date.now() - task.activityAt >= WATCHDOG_STALL_MS) {
-        task.stuckSuspect = true
-        const label = task.kind === 'review' ? '复核' : '工单'
-        notify(`${label} ${task.id.slice(-6)} 疑似停滞（>300s 无输出更新）`)
-      }
-    } catch { /* best effort：看门狗自身绝不抛错 */ }
-  }, WATCHDOG_INTERVAL_MS)
-  // 不因看门狗把宿主进程吊住。
-  if (typeof task.watchdog.unref === 'function') task.watchdog.unref()
+  return rt
 }
+
+// 任务结束即停看门狗（finalizeTask / finalizeReview 都会调用）。
+function stopWatchdog(task) { rtOf(task).stopWatchdog() }
+
+// spawn 后启动：每 30s 看一次活性（心跳 ∨ -o 文件 mtime 兜底），超 300s 无变化 → stuckSuspect + 通知一次。
+function startWatchdog(task) { rtOf(task).startWatchdog() }
 
 // 超长 -o 输出只留头尾（各半）：output 会整段进内存并随 GET /task 全量外发，
 // 不设限时长任务的输出可达数百 MB（OOM + 响应体爆炸）。
@@ -2322,7 +2288,7 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
       // 不碰文件的第二个理由：该 mtime 同时是 cleanupLiveFiles 的判据（statSync(...).mtimeMs
       // 对 cutoff 比较），持续 utimesSync 会把长跑任务的 -o 钉在「永不超期」上，
       // 崩溃没走 finalize 时就再也清不掉。
-      task.activityAt = Date.now()
+      rtOf(task).heartbeat()
     },
   })
   task.child = handle.child
@@ -3191,7 +3157,7 @@ async function runReview(task, active) {
       const outPath = join(CODEX_DIR, `review-${task.id}-r${round}.out`)
       task.outPath = outPath
       // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
-      task.activityAt = Date.now()
+      rtOf(task).heartbeat()
       const { child, wait, getUsage } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
       task.child = child
       // 互审的探活身份：startWatchdog 在首轮 spawn 前就启动（那时 child 还是 null）记不到

@@ -113,7 +113,7 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 发布树剔私版：只比存在、不比内容（本机路径被换成「不随包分发」说明）
   # 发布树剔私版：只比存在、不比内容（本机路径被换成占位符）
   PRIVATE_STRIPPED=" src/app-server-client.js tools/dual-board/PROTOCOL.md bridge/README.md bridge/env.example bridge/CHANGELOG.md tools/README.md "
-  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py; do
+  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py; do
     [ -f "$ROOT/$f" ] || continue
     case "$PRIVATE_STRIPPED" in
       *" $f "*)
