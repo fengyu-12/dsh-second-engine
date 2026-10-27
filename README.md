@@ -125,8 +125,8 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 
 ### 方式 A：tgz 安装（推荐，无需改配置文件）
 
-1. 下载 Releases 里的 `dsh-second-engine-3.6.1.tgz`；
-2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.6.1.tgz`）；
+1. 下载 Releases 里的 `dsh-second-engine-3.6.2.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.6.2.tgz`）；
 3. 重启 Web，设置页出现「第二引擎」即成功。
 
 tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
@@ -238,7 +238,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
 
-## 支持能力一览（v3.6.1）
+## 支持能力一览（v3.6.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -274,7 +274,8 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
-| **3.6.1** | **修「干净环境一跑就崩」的 12 处**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` · 3 个注入函数补 `mkdirSync(CODEX_DIR)`（没装 Codex 时装插件，`AGENTS.md` 会被静默吞掉且不再补）· 网页桥 `updateConfigToml` 保留行尾注释。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
+| **3.6.2** | **补第二批「端口 / 注释」缺陷 + 固化冒烟**。① `tools/wait-task.sh`（连环境变量兜底都没有）与 `tools/dual-board/dispatch.sh` 的 Web 地址默认写死 `127.0.0.1:3080`，动态端口下派单/等待直接连不通 → 新增 `tools/web-base.sh`，优先级 `SECOND_ENGINE_BASE_URL` > `DSH_WEB_URL` > 运行中宿主 `--port` > 3080。② 行尾注释保留改**引号感知**（新 `bridge/web/toml-comment.mjs`）：值含 ` # ` 时不再从引号内部切开，`#` 前无空格的尾注也能保留。③ 新增 `tools/smoke.sh`：干净环境冒烟（语法 / 端口解析 / wait-task 联调 / 看板全链路 / dispatch 草稿 / install dry-run / 注释单测 / 三处落点对齐）。④ 版本记录计数口径统一：3.6.1 实为 **14 处**（5+2+2+1+3+1）。 |
+| **3.6.1** | **修「干净环境一跑就崩」的 14 处（提交说明的「9 处」只数了前三个文件）**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` · 3 个注入函数补 `mkdirSync(CODEX_DIR)`（没装 Codex 时装插件，`AGENTS.md` 会被静默吞掉且不再补）· 网页桥 `updateConfigToml` 保留行尾注释。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
 | **3.6.0** | **债务清算 + 实现优化**。修三处**不报错**的静默失效：① 卡点求助地址写死 3080（新版 DSH 改动态端口后一直连不通，只靠文本兜底）→ 改从宿主 `--port` 解析；② `~/.codex/AGENTS.md` 的 v2/board 段「标记存在就跳过」⇒ 老用户永远拿不到新内容 → 补结束标记 + 摘除重写 + 三级边界（末命中则告警不动手），`v1→v2` 不再静默截断；③ `rounds[].verdict` 与终止判据口径不一致。补两处**写了但从没跑到**的清理：`.live` 被 200 MB 阈值挡在后面（10-17 起未执行）→ 从阈值摘出；Codex 日志库按时间清 + 碎片回收（`node:sqlite`，五道安全闸）。优化：复核**首轮**提示词补三条硬要求（此前纪律只装在第 2 轮后，而 90% 复核只跑 1 轮）· 复核新增 `blocked` 硬档（识别即终止）· 只读 `independentSources`/`quorumNote`（不参与收敛判定）· 写入统一原子化 · `config.toml` 备份轮转留 5 份 · 新增 `GET /api/_meta` 路由自描述。 |
 | **3.5.0** | **协作模式三档落地**（普通复核 / 协作提议 / 长任务配合 + custom；`voice` 切档即写/删 `~/.codex/AGENTS.md` 段，`longtask` 只影响主 AI 派单）· 悬浮球加档位下拉 · 球面板版本行改「Codex 版本 / 会话目录占用」两行 kv + 与设置页同款「已是最新」徽标 · **修「升级完红点常亮」**：有新版提示由挂载查一次改为 30s 轮询，且无新版时自动熄灭（旧版只有点亮分支，升级完必须整页刷新才熄）· 主 AI 侧新增「派单前先读档位」流程（插件无推送通道，靠 `/api/status` 主动查）· SKILL 不再记版本号，版本与开关态统一归 `Codex功能表.md` |
 | **3.1.2** | 插件自身版本提示（`/api/plugin-version`，默认完全静默）· 面板「模型与思考」`/api/config`（键白名单 + 写前备份 + 原子替换）· 设置页改分区制（说明收进「?」、provider 主行只留名称/徽标/模型、会话清理折起）· 悬浮球面板重排（标题行状态点+模型名、版本与占用并一行、空态去框）· 面板高度跟随 `visualViewport`（键盘弹出不再慢半拍） |
