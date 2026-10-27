@@ -110,8 +110,15 @@ PUB_DIR="${SE_PUBLISH_DIR:-/root/Documents/deepseek-harness/default-workspace/�
 LOAD_DIR="${SE_LOAD_DIR:-$HOME/.dsh/plugin-src/dsh-second-engine}"
 if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   align_bad=0; align_n=0
-  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs package.json; do
+  # 发布树剔私版：只比存在、不比内容（本机路径被换成「不随包分发」说明）
+  PRIVATE_STRIPPED=" src/app-server-client.js "
+  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js lib/client.js; do
     [ -f "$ROOT/$f" ] || continue
+    case "$PRIVATE_STRIPPED" in
+      *" $f "*)
+        if [ -f "$PUB_DIR/$f" ]; then ok "剔私文件在位（不比内容）: $f"; else bad "发布树缺剔私文件: $f"; fi
+        continue;;
+    esac
     align_n=$((align_n+1))
     s1=$(md5sum "$ROOT/$f" | cut -d' ' -f1)
     s2=$(md5sum "$PUB_DIR/$f" 2>/dev/null | cut -d' ' -f1)

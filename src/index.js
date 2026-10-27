@@ -148,6 +148,12 @@ const CONSULT_KEEP_LIMIT = 20
 // 脱敏正则兜第二层：sk- 令牌 / Bearer 凭证 / key|token|password|secret 赋值形态 → [redacted]。
 const ERR_LOG = []
 const ERR_LOG_LIMIT = 50
+
+// progress 排障旁路（2026-10-28）：归一化事件的 meta 原文环形上限（条/字节，两者都封）。
+// 只存内存，不落盘、不进 taskView —— 引擎事件可能含模型/工具正文，不往 ERR_LOG（/status
+// 会回显最近 10 条）那种对外通道里放。
+const ENGINE_EVENTS_LIMIT = 20
+const ENGINE_EVENTS_META_BYTES = 4096
 const ERR_REDACT_RE = /(sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9._~+\/=-]{6,}|(?:(?:api[_-]?key|key|token|password|secret)["']?\s*[:=]\s*)["']?[A-Za-z0-9._~+\/=-]{6,})/gi
 function noteErr(tag, err) {
   let msg = err instanceof Error ? String(err.message ?? err) : String(err ?? '')
@@ -1731,8 +1737,12 @@ function taskView(task) {
   if (task.live !== undefined && task.live !== null) view.liveBytes = task.live.bytes ?? 0
   if (task.mode === 'appserver') {
     // T5：app-server 模式的实时进度（归一化事件，最近 20 条），供界面做流式展示。
+    // progress 封闭投影（2026-10-28）：对外只发 {kind, text, at} 三字段。事件里其余的
+    // 引擎专有形状（tool / usage / done / meta.eventType / itemId / contentIndex /
+    // summaryIndex / willRetry）一律不外发 —— 那是 Codex app-server 的词表，第二个引擎
+    // 一进 progress，消费端就得按引擎分支。排障用的原文见 task.engineEvents（不进本视图）。
     view.mode = 'appserver'
-    view.progress = Array.isArray(task.progress) ? task.progress.slice(-20) : []
+    view.progress = projectProgress(task.progress)
   }
   if (view.kind === 'review') {
     // 互审进度：第 N/上限轮 + 每轮 {issues,verdict} 全量（issues 体量小，列表也带上，展开即见）。
@@ -2193,6 +2203,33 @@ async function ensureGitBaseline(workdir) {
   } catch { /* best effort：基线失败不影响任务本身 */ }
 }
 
+// ── progress 封闭投影（2026-10-28）──
+// task.progress 与对外 progress 的唯一形状定义处；kind 沿用 app-server-client 已有的
+// 6 个封闭字面量（status|text|reasoning|tool|usage|done），不新增、不透传协议方法名。
+// 字段名 progress 保持不变（外部消费者可能按名字取数组）。
+const PROGRESS_KINDS = new Set(['status', 'text', 'reasoning', 'tool', 'usage', 'done'])
+const PROGRESS_TEXT_LIMIT = 2000
+const PROGRESS_LIMIT = 20
+
+// 归一化事件 → 封闭条目：显式构造，绝不展开原事件（缺字段就是空串，不会带出引擎形状）。
+function progressEntry(evt, at) {
+  const kind = PROGRESS_KINDS.has(evt?.kind) ? evt.kind : 'status'
+  let text = typeof evt?.text === 'string' ? evt.text : ''
+  if (text === '' && kind === 'tool') {
+    // tool 事件的正文在 tool.aggregatedOutput（命令输出预览），投影成 text 才有可读性。
+    const out = evt?.tool && typeof evt.tool.aggregatedOutput === 'string' ? evt.tool.aggregatedOutput : ''
+    const cmd = evt?.tool && typeof evt.tool.command === 'string' ? evt.tool.command : ''
+    text = out !== '' ? out : cmd
+  }
+  return { kind, text: text.slice(0, PROGRESS_TEXT_LIMIT), at }
+}
+
+// 对外投影：只取最近 PROGRESS_LIMIT 条，且逐条重建（顺带兼容改动前留在内存里的旧形状条目）。
+function projectProgress(list) {
+  if (!Array.isArray(list)) return []
+  return list.slice(-PROGRESS_LIMIT).map((e) => progressEntry(e, e?.at ?? null))
+}
+
 // T5：app-server 执行模式 —— 长连接 JSON-RPC。归一化事件进 task.progress；
 // agentMessage 增量由客户端直接 append 到 -o 文件，故 finalizeTask/看门狗逻辑零改动。
 function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey }) {
@@ -2211,6 +2248,8 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     cancelled: false,
     mode: 'appserver',
     progress: [],
+    // 排障用（不对外返回）：归一化事件的 meta 原文，环形上限 ENGINE_EVENTS_LIMIT。
+    engineEvents: [],
   }
   const handle = startAppServerTurn({
     cwd: workdir,
@@ -2219,11 +2258,32 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     outPath,
     codexBinary: resolveCodexBinary(),
     onEvent: (evt) => {
-      // 进度只保生产所需字段：meta.raw 是原始帧（可能很大），落盘前剔除
-      const meta = { ...(evt.meta ?? {}) }
-      delete meta.raw
-      task.progress.push({ at: Date.now(), ...evt, ...(evt.meta ? { meta } : {}) })
-      if (task.progress.length > 20) task.progress.shift()
+      // progress 封闭投影（2026-10-28）：不再 `{...evt}` 展开 —— 原先除 meta.raw 之外的
+      // 引擎专有字段（tool/usage/done/meta.eventType/itemId/…）会整条漏进对外响应。
+      task.progress.push(progressEntry(evt, Date.now()))
+      if (task.progress.length > PROGRESS_LIMIT) task.progress.shift()
+      // meta 原文另存一份给排障（task.engineEvents）：不进 taskView，只在直读 tasks Map 的
+      // 诊断路径可见。meta.raw 是原始 JSON-RPC 帧（可能很大）且是模型/工具正文的副本
+      // （-o 文件与 output 字段已有），故同样剔除；其余（eventType/itemId/status/…）保留。
+      if (evt.meta !== undefined && evt.meta !== null) {
+        const meta = { ...evt.meta }
+        delete meta.raw
+        // 字节上限：单条 meta 超阈就按字段截断（eventType 等短字段优先保留）。
+        let encoded = JSON.stringify(meta) ?? ''
+        if (encoded.length > ENGINE_EVENTS_META_BYTES) {
+          const slim = {}
+          for (const [k, v] of Object.entries(meta)) {
+            let piece
+            try { piece = JSON.stringify(v) ?? '' } catch { piece = String(v) }
+            if (piece.length <= 200) slim[k] = v
+          }
+          slim.truncated = true
+          encoded = JSON.stringify(slim)
+        }
+        if (!Array.isArray(task.engineEvents)) task.engineEvents = []
+        task.engineEvents.push({ at: Date.now(), kind: progressEntry(evt, 0).kind, meta: encoded })
+        if (task.engineEvents.length > ENGINE_EVENTS_LIMIT) task.engineEvents.shift()
+      }
       // 任何事件都刷新 -o mtime：既有看门狗「300s 无变化 → stuckSuspect」自动适配流式场景
       try {
         const now = new Date()
