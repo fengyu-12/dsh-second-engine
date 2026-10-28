@@ -70,6 +70,22 @@ interface CleanupTarget {
   readonly confirmRequired: boolean; // 破坏性确认（Pi 走 POST /api/pi-cleanup 的 confirm:true）
 }
 
+/**
+ * 当前引擎模型视图（P4.25，2026-10-29 契约 4.2）。Pi 的优先序：
+ *   ① runtime 当前值（Pi 桥 /api/runtime-settings → get_state 回读）
+ *   ② Pi settings 的默认（settings.defaultProvider → keyring.active）
+ *   ③ 空值 + fallback:true，不猜
+ * keyring 只在第 ② 级作为「配置默认」参与，不单独决定 provider。
+ * fallback=true 的语义：**没有可验证的 runtime 值，显示的是配置默认值**（UI 据此标注「（默认值）」），
+ * 不要泛化成任意回退。
+ */
+interface EngineModel {
+  readonly providerId: string;
+  readonly model: string;
+  readonly fallback: boolean;
+  readonly source: 'runtime' | 'config' | 'keyring' | 'none';
+}
+
 interface ViewEvent { kind: 'status' | 'text' | 'reasoning' | 'tool' | 'usage' | 'done'; text: string; at: number }
 interface ArtifactRef { path: string; bytes?: number; kind?: 'output' | 'live' | 'review-round' }
 

@@ -41,7 +41,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
 import { piProbe, piAvailableModels, resolvePiProvider, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
-import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl } from './engine/pi-bridge.js'
+import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl, PI_BRIDGE_PORT } from './engine/pi-bridge.js'
 import http from 'node:http'
 import { join, resolve, dirname, delimiter } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1182,27 +1182,48 @@ async function writeCodexConfig(provider) {
 }
 
 // ── API handlers ──
-// P4.5（2026-10-28）：当前引擎**实际会用**的模型。
-// Codex 看 keyring 的 active；Pi 看它认的那个 provider（回落规则与 rtOf 一致）。
-// 面板把它显示出来，否则切到 Pi 后标题还挂着 Codex 的 glm-5.3-flash。
-function activeEngineModel(id) {
+// P4.25（2026-10-29 契约 4.2）：Pi 的 provider/model 真源优先序
+//   ① runtime 当前值（Pi 桥 /api/runtime-settings → get_state 回读）
+//   ② Pi settings 的默认（resolvePiProvider：settings.defaultProvider → keyring.active）
+//   ③ 空值 + fallback:true，不猜
+// keyring 只在第 ② 级作为「配置默认」参与，不单独决定 provider。
+// fallback 语义收窄为「没有可验证的 runtime 值，显示的是配置默认」（面板据此标注「（默认值）」）。
+async function piRuntimeModel() {
+  try {
+    const headers = process.env.PI_BRIDGE_TOKEN ? { 'x-bridge-token': process.env.PI_BRIDGE_TOKEN } : undefined
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), 900)
+    const r = await fetch(`http://127.0.0.1:${PI_BRIDGE_PORT}/api/runtime-settings`, { headers, signal: ctl.signal })
+    clearTimeout(timer)
+    if (!r.ok) return null
+    const j = await r.json()
+    if (j && j.engine === 'pi' && typeof j.model === 'string' && j.model !== '') {
+      return { providerId: typeof j.provider === 'string' ? j.provider : '', model: j.model, fallback: false, source: 'runtime' }
+    }
+    return null
+  } catch { return null }
+}
+
+async function activeEngineModel(id) {
   if (id !== 'pi') {
     try {
       const doc = loadKeyring()
       const p = doc.providers.find((x) => x.id === doc.active)
-      return { providerId: doc.active, model: p?.model || '', fallback: false }
-    } catch { return { providerId: '', model: '', fallback: false } }
+      return { providerId: doc.active, model: p?.model || '', fallback: false, source: 'keyring' }
+    } catch { return { providerId: '', model: '', fallback: false, source: 'none' } }
   }
+  const runtime = await piRuntimeModel()
+  if (runtime !== null) return runtime
   const hit = resolvePiProvider()
-  if (hit !== null) return { providerId: hit.id, model: hit.model, fallback: false }
-  return { providerId: '', model: '', fallback: true }
+  if (hit !== null) return { providerId: hit.id, model: hit.model, fallback: true, source: 'config' }
+  return { providerId: '', model: '', fallback: true, source: 'none' }
 }
 
 /** 当前引擎的探测 + 能力（status/config 共用，别写两份）。 */
 async function engineView() {
   const active = activeEngineId()
   const caps = ENGINES[active] !== undefined ? ENGINES[active].capabilities : null
-  const view = { active, list: engineList(), caps, model: activeEngineModel(active), cleanup: cleanupTarget(active) }
+  const view = { active, list: engineList(), caps, model: await activeEngineModel(active), cleanup: cleanupTarget(active) }
   if (active === 'pi') {
     try { view.probe = { pi: await piProbe(), models: await piAvailableModels() } }
     catch (e) { view.probe = { pi: null, models: null, error: errMsg(e) } }
