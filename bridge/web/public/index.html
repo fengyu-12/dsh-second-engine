@@ -374,6 +374,35 @@ try {
     transition: border-color .15s, box-shadow .15s;
   }
   .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--acc-weak), var(--shadow-1); }
+  .runtime-controls { display:flex; align-items:center; gap:8px; padding:8px 12px 0; }
+  .runtime-controls select, .runtime-controls input { min-width:0; max-width:48%; border:1px solid var(--line); border-radius:7px; padding:5px 8px; color:var(--fg); background:var(--panel); font:inherit; font-size:12px; }
+  .runtime-controls input { flex:1; }
+  /* 思考档改成抽屉：一排 7 个按钮在手机上太占位置（用户要求像 DSH 那样收起） */
+  .rt-effort { position:relative; margin-left:auto; flex:none; }
+  .rt-effort-btn {
+    display:inline-flex; align-items:center; gap:6px;
+    border:1px solid var(--line); background:var(--panel); color:var(--fg);
+    border-radius:7px; padding:5px 9px; font:inherit; font-size:12px; cursor:pointer;
+  }
+  .rt-effort-btn:disabled { opacity:.5; cursor:default; }
+  .rt-effort-key { color:var(--muted); }
+  .rt-effort-cur { font-weight:600; min-width:1.6em; }
+  .rt-effort-caret { color:var(--dim); transition:transform .15s; }
+  .rt-effort-btn[aria-expanded="true"] .rt-effort-caret { transform:rotate(-90deg); }
+  .rt-effort-menu {
+    position:absolute; right:0; bottom:calc(100% + 6px); min-width:136px; padding:4px;
+    background:var(--panel); border:1px solid var(--line); border-radius:9px;
+    box-shadow:var(--shadow-1); z-index:60;
+  }
+  .rt-effort-menu button {
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    width:100%; border:0; background:transparent; color:var(--fg);
+    font:inherit; font-size:12.5px; padding:7px 10px; border-radius:6px; cursor:pointer; text-align:left;
+  }
+  .rt-effort-menu button:hover { background:var(--panel2); }
+  .rt-effort-menu button[aria-pressed="true"] { font-weight:600; }
+  .rt-effort-menu button[aria-pressed="true"]::after { content:'✓'; color:var(--accent); }
+  .runtime-controls [disabled] { opacity:.5; }
   .composer textarea {
     display: block; width: 100%; border: 0; resize: none; outline: none;
     background: transparent; color: var(--fg);
@@ -590,6 +619,19 @@ try {
 
   <footer class="composer-wrap">
     <div class="composer">
+      <div class="runtime-controls" id="runtime-controls">
+        <select id="runtime-model" aria-label="当前会话模型" title="切换当前会话模型" disabled>
+          <option value="">（读取中…）</option>
+        </select>
+        <div class="rt-effort">
+          <button type="button" class="rt-effort-btn" id="runtime-effort-btn" aria-haspopup="listbox" aria-expanded="false" disabled>
+            <span class="rt-effort-key">思考</span>
+            <span class="rt-effort-cur" id="runtime-effort-cur">—</span>
+            <span class="rt-effort-caret" aria-hidden="true">›</span>
+          </button>
+          <div class="rt-effort-menu" id="runtime-effort-menu" role="listbox" aria-label="思考等级" hidden></div>
+        </div>
+      </div>
       <textarea id="input" rows="1" placeholder="给第二引擎发消息…"></textarea>
       <div class="cbar">
         <button class="gbtn" id="stop" disabled>
@@ -653,41 +695,6 @@ try {
           <span class="lbl">紧凑模式<small>收窄留白，一屏更多内容</small></span>
           <label class="switch"><input type="checkbox" id="opt-compact"><span class="sw"></span></label>
         </div>
-      </section>
-      <section class="sgroup">
-        <div class="sg-t">模型与思考</div>
-        <div class="srow">
-          <span class="lbl">模型<small>写入 config.toml 顶层 model</small></span>
-          <span><input id="opt-model" list="model-candidates" autocomplete="off" spellcheck="false" placeholder="模型名">
-            <datalist id="model-candidates">
-              <option value="glm-5.3"></option>
-              <option value="glm-5.3-flash"></option>
-            </datalist></span>
-        </div>
-        <div class="srow">
-          <span class="lbl">思考等级<small>model_reasoning_effort</small></span>
-          <span class="seg" id="seg-effort">
-            <button data-v="low" aria-pressed="false">低</button>
-            <button data-v="medium" aria-pressed="false">中</button>
-            <button data-v="high" aria-pressed="false">高</button>
-            <button data-v="xhigh" aria-pressed="false">最高</button>
-          </span>
-        </div>
-        <div class="srow">
-          <span class="lbl">思考摘要<small>model_reasoning_summary</small></span>
-          <span class="seg" id="seg-summary">
-            <button data-v="auto" aria-pressed="false">自动</button>
-            <button data-v="none" aria-pressed="false">关</button>
-            <button data-v="concise" aria-pressed="false">简</button>
-            <button data-v="detailed" aria-pressed="false">详</button>
-          </span>
-        </div>
-        <div class="cfg-ro mono" id="cfg-ro">配置读取中…</div>
-        <div class="cfg-actions">
-          <button class="pbtn" id="cfg-save">保存</button>
-          <span id="cfg-msg"></span>
-        </div>
-        <p class="sfoot">改动写入 ~/.codex/config.toml，只对<b>新开的会话</b>生效；已经在跑的会话不会热切换。保存前会自动备份原文件。</p>
       </section>
       <p class="sfoot">外观与排版设置只保存在本机浏览器（localStorage），不影响其他设备。皮肤与深浅色沿用原有 bridge_skin / bridge_theme 键，老设置自动继承。</p>
     </div>
@@ -877,6 +884,7 @@ async function openThread(id) {
   drawer(false);
   saveEntries();                       // 先把当前这份存好
   threadId = id;
+  loadRuntimeSettings();
   localStorage.setItem('bridge_thread', id);
   const hit = threads.find((t) => t.id === id);
   setSubtitle(hit ? hit.title : '');
@@ -925,6 +933,105 @@ function newThread() {
 }
 
 function setStatus(text) { $('#status').textContent = text; }
+
+const runtimeModel = $('#runtime-model');
+const runtimeEffortBtn = $('#runtime-effort-btn');
+const runtimeEffortMenu = $('#runtime-effort-menu');
+const runtimeEffortCur = $('#runtime-effort-cur');
+let runtimeSettingsBusy = false;
+const EFFORT_LABELS = { off:'关', minimal:'最少', low:'低', medium:'中', high:'高', xhigh:'极高', max:'最大' };
+
+function closeEffortMenu() {
+  runtimeEffortMenu.hidden = true;
+  runtimeEffortBtn.setAttribute('aria-expanded', 'false');
+}
+
+// 思考档做成抽屉：一排 7 个按钮在手机上要占两行（用户要求改成像 DSH 那样点击展开）
+function renderEffortLevels(levels, selected) {
+  const list = Array.isArray(levels) ? levels : [];
+  runtimeEffortMenu.replaceChildren();
+  for (const level of list) {
+    const b = el('button', '', EFFORT_LABELS[level] || level);
+    b.type = 'button';
+    b.dataset.v = level;
+    b.setAttribute('aria-pressed', String(level === selected));
+    b.addEventListener('click', () => { closeEffortMenu(); updateRuntimeSettings({ effort: level }); });
+    runtimeEffortMenu.appendChild(b);
+  }
+  runtimeEffortCur.textContent = selected ? (EFFORT_LABELS[selected] || selected) : '—';
+  runtimeEffortBtn.disabled = list.length === 0;
+  if (list.length === 0) closeEffortMenu();
+}
+
+runtimeEffortBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const willOpen = runtimeEffortMenu.hidden;
+  runtimeEffortMenu.hidden = !willOpen;
+  runtimeEffortBtn.setAttribute('aria-expanded', String(willOpen));
+});
+document.addEventListener('click', () => closeEffortMenu());
+async function loadRuntimeSettings() {
+  const id = threadId;
+  runtimeModel.disabled = !id || !!controller;
+  runtimeEffortBtn.disabled = !id || !!controller;
+  if (!id || !TOKEN) { renderEffortLevels([], ''); return; }
+  try {
+    const r = await fetch(`/api/runtime-settings?threadId=${encodeURIComponent(id)}`, { headers: { 'x-bridge-token': TOKEN } });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    if (id !== threadId) return;
+    // 模型选择器改成真正的下拉（用户要求「直接拉取替换」，不要打字）
+    const models = Array.isArray(data.models) ? data.models.slice() : [];
+    if (data.model && !models.includes(data.model)) models.unshift(data.model);
+    runtimeModel.replaceChildren();
+    if (models.length === 0) {
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = data.model || '（无可选模型）';
+      runtimeModel.appendChild(o);
+      runtimeModel.disabled = true;
+    } else {
+      for (const m of models) {
+        const o = document.createElement('option');
+        o.value = m; o.textContent = m;
+        runtimeModel.appendChild(o);
+      }
+      runtimeModel.value = data.model && models.includes(data.model) ? data.model : models[0];
+      runtimeModel.disabled = !!controller;
+    }
+    renderEffortLevels(data.levels || [], data.effort || '');
+    runtimeEffortBtn.disabled = !(data.levels || []).length || !!controller;
+  } catch (err) {
+    if (id === threadId) setStatus(`设置读取失败：${err.message}`);
+  }
+}
+async function updateRuntimeSettings(patch) {
+  if (!threadId || runtimeSettingsBusy) return;
+  const id = threadId;
+  runtimeSettingsBusy = true;
+  runtimeModel.disabled = true;
+  runtimeEffortBtn.disabled = true;
+  closeEffortMenu();
+  setStatus('切换中…');
+  try {
+    const r = await fetch('/api/runtime-settings', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-bridge-token': TOKEN },
+      body: JSON.stringify({ threadId: id, ...patch }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    setStatus('当前会话设置已切换');
+    await loadRuntimeSettings();
+  } catch (err) {
+    setStatus(`切换失败：${err.message}`);
+    await loadRuntimeSettings();
+  } finally {
+    runtimeSettingsBusy = false;
+  }
+}
+runtimeModel.addEventListener('change', () => {
+  const model = runtimeModel.value.trim();
+  if (model) updateRuntimeSettings({ model });
+});
 
 // 归档 / 删除：走服务端的 codex 命令，删之前一定问一次
 async function threadAction(kind, t) {
@@ -1161,6 +1268,7 @@ async function send() {
     controller = null;
     $('#send').disabled = false;
     $('#stop').disabled = true;
+    loadRuntimeSettings();
     if ($('#status').textContent.startsWith('运行中')) setStatus('结束');
     lastBubble = null;
   }
@@ -1275,6 +1383,7 @@ entries = loadEntries(threadId);
 replay();
 renderConvoList();
 loadThreads();
+loadRuntimeSettings();
 
 if (!TOKEN) addNote('没有 token：请用启动时打印的完整网址打开本页', 'error');
 else setStatus(threadId ? '已接上一轮对话' : '就绪');
@@ -1316,33 +1425,7 @@ else setStatus(threadId ? '已接上一轮对话' : '就绪');
   syncEmpty();
 
   // 3) 设置面板
-  let cfgLoadedOnce = false;
-  function loadConfigPane() {
-    const msg = $('#cfg-msg');
-    if (!TOKEN) { $('#cfg-ro').textContent = '无 token：请用启动时打印的完整网址打开本页'; return; }
-    if (cfgLoadedOnce) return;
-    cfgLoadedOnce = true;
-    msg.textContent = ''; msg.className = '';
-    fetch('/api/config', { headers: { 'x-bridge-token': TOKEN } })
-      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
-      .then(({ ok, d }) => {
-        if (!ok) throw new Error(d.error || '读取失败');
-        $('#opt-model').value = d.model || '';
-        segSync('seg-effort', d.model_reasoning_effort || '');
-        segSync('seg-summary', d.model_reasoning_summary || '');
-        const p = (d.providers && d.model_provider && d.providers[d.model_provider]) || null;
-        $('#cfg-ro').textContent = p
-          ? `provider ${d.model_provider} · ${p.base_url || ''}`
-          : `provider ${d.model_provider || '（未知）'}`;
-      })
-      .catch((err) => {
-        cfgLoadedOnce = false;   // 下次开面板重试
-        $('#cfg-ro').textContent = '配置读取失败';
-        msg.textContent = String(err.message || err);
-        msg.className = 'err';
-      });
-  }
-  function openSettings(v) { $('#sdrawer').classList.toggle('open', v); if (v) loadConfigPane(); }
+  function openSettings(v) { $('#sdrawer').classList.toggle('open', v); }
   $('#settings').addEventListener('click', () => openSettings(true));
   $('#sclose').addEventListener('click', () => openSettings(false));
   document.querySelector('.smask').addEventListener('click', () => openSettings(false));
@@ -1396,43 +1479,6 @@ else setStatus(threadId ? '已接上一轮对话' : '就绪');
   const origScroll = scroll;
   scroll = function (force) { if (!AUTOSCROLL && !force) return; origScroll(force); };
 
-  // 5) 模型与思考：GET /api/config 回填，保存时 POST /api/config（只发这三个键）
-  function segValue(id) {
-    const on = document.querySelector('#' + id + ' button[aria-pressed="true"]');
-    return on ? on.dataset.v : '';
-  }
-  ['seg-effort', 'seg-summary'].forEach((id) => {
-    document.getElementById(id).addEventListener('click', (e) => {
-      const b = e.target.closest('button'); if (!b) return;
-      segSync(id, b.dataset.v);
-    });
-  });
-  const cfgSave = $('#cfg-save');
-  cfgSave.addEventListener('click', async () => {
-    const msg = $('#cfg-msg');
-    const body = { model: $('#opt-model').value.trim() };
-    const effort = segValue('seg-effort'), summary = segValue('seg-summary');
-    if (effort) body.model_reasoning_effort = effort;
-    if (summary) body.model_reasoning_summary = summary;
-    cfgSave.disabled = true;
-    msg.textContent = '保存中…'; msg.className = '';
-    try {
-      const r = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-bridge-token': TOKEN },
-        body: JSON.stringify(body),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-      msg.textContent = '已保存，新会话生效';
-      msg.className = 'ok';
-    } catch (err) {
-      msg.textContent = String(err.message || err);
-      msg.className = 'err';
-    } finally {
-      cfgSave.disabled = false;
-    }
-  });
 })();
 </script>
 </body>

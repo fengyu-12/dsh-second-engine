@@ -50,8 +50,8 @@ codex app-server --listen ws://127.0.0.1:$BRIDGE_AS_PORT   ← 唯一所有者�
 
 ```bash
 ./install.sh --dry-run                     # 先看要做什么
-./install.sh --with-codex-env              # 装到 $HOME/.local/share/second-engine-bridge + 启动器
-cd $HOME/.local/share/second-engine-bridge
+./install.sh --with-codex-env              # 装到 $HOME/proj/second-engine-bridge/bridge + 启动器
+cd $HOME/proj/second-engine-bridge/bridge
 ./ctl.sh start        # 起所有者 + 网页
 ./ctl.sh url          # 打印手机浏览器可直接打开的网址（含 token）
 ./ctl.sh check        # 体检

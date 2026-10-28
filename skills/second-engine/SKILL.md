@@ -1,9 +1,9 @@
 ---
 name: second-engine
-description: 唤起与操作第二引擎 Codex 的完整流程：提供方与模型管理、工单下发（API 优先）、双向互审、卡点求助响应、结果验收、会话磁盘管理。当任务需要异构第二意见、并行下探子任务、独立复核、或用户说「用 Codex / 第二引擎 / 第二意见 / 让 Codex 试试」时使用。
+description: 唤起与操作第二引擎（Codex 或 Pi，可在设置页切换）的完整流程：引擎切换、提供方与模型管理、工单下发（API 优先）、双向互审、卡点求助响应、结果验收、会话磁盘管理。当任务需要异构第二意见、并行下探子任务、独立复核，或用户说「用 Codex / 用 Pi / 第二引擎 / 第二意见 / 让 Codex 试试」时使用。
 ---
 
-# second-engine · Codex 第二引擎操作流程
+# second-engine · 第二引擎操作流程（Codex / Pi）
 
 ## 🔴 什么时候该派它（2026-10-14 用户定稿 · 两分法）
 
@@ -68,6 +68,54 @@ curl -s "$DSH_WEB_URL/second-engine/api/status" | python3 -c "import sys,json;pr
 ```
 
 拿到 `preset` 就照「三种模式的派单方式」发：`review` 单发不问表态 / `propose` 单发 + prompt 里要 `LONGSESSION:` 行 / `longtask` **不派工单**、直接 `codex exec` 起长会话。**查不到（接口挂、字段缺）一律按 `review` 兜底**，不猜；字段含义见「协作模式开关」。
+
+## 文件地图 · 哪份是真身（2026-10-28 立；当晚在这上面连错三次）
+
+| 路径 | 身份 | 什么时候动 |
+|---|---|---|
+| `<插件目录>/` | **代码真身**（唯一带 git 历史的） | 改代码只改这里 |
+| `~/.dsh/plugin-src/dsh-second-engine/` | **加载层**：Web 进程实际 import 的那份 | 真身改完**必须 `cp` 过来**；漏了＝没生效（重启也白搭） |
+| `second-engine-publish/`（独立克隆） | 发布树（文档已剔私） | **只在发版时**同步 |
+| `~/proj/dual-board/` | **数据**：board.json / channel.md / inbox-* / archive / .dispatch | 只放数据，**不放脚本**（旧副本 2026-10-28 已删） |
+| `~/.dsh/待办/多引擎适配-施工追踪.md` | 本次长任务的施工台账 | 每块做完划线 |
+
+- **自检一条命令**：`bash <插件目录>/tools/smoke.sh` 第 8 段比对 **17 个文件**的三处指纹；文档类（README / CHANGELOG / PROTOCOL / env.example）发布树是剔私版，只比存在不比内容。
+- **board 唯一入口**：`<插件目录>/tools/dual-board/board.sh`；数据目录默认 `~/proj/dual-board`（`DUAL_BOARD_DIR` 可覆盖）。
+- **三个坑（实测踩的）**：① 改完真身没同步加载层 → 重启后验证白跑；② `board_tool.py` 的 `CHANNEL` 曾错挂 `dirname(__file__)`，`complete` 的清场全写进插件目录（已改为跟 `BOARD_DIR`）；③ 面板卡片状态白名单曾漏 `cancelled`，导致「已取消 + 运行中」并存。
+
+## Pi 引擎（2026-10-28 实测立；路径与事件格式都是本机跑出来的，不是文档抄的）
+
+插件支持 `engine=codex|pi` 切换（`~/.dsh/second-engine-engine.txt`）。Pi 不是 Codex，**下面每个路径都不同**：
+
+| 用途 | Codex | Pi |
+|---|---|---|
+| 模型清单 | `~/.codex/config.toml` | `~/.pi/agent/models.json`（`{providers:{<id>:{baseUrl,api,apiKey,models:[{id}]}}}`）|
+| 默认模型 | 同上 | `~/.pi/agent/settings.json` → `defaultProvider` / `defaultModel` |
+| MCP | `config.toml` 的 `[mcp_servers.*]` | `~/.pi/agent/mcp.json`（`{mcpServers:{name:{url}|{command,args}}}`，禁用写 `enabled:false`）|
+| 会话 | `~/.codex/sessions` | `~/.pi/agent/sessions/<cwd>/*.jsonl` |
+| 模型缓存 | — | `~/.pi/agent/models-store.json` |
+| 聊天桥 | 8787 附近，`ctl.sh` | **8788**，`bridge/pi/server.mjs`（自己管 `pi --mode rpc`）|
+
+**三个只能实测才知道的事实**：
+
+1. **流式文本在 `message_update.assistantMessageEvent`**：`{type:'text_delta', delta:'你好'}`。`raw.message` 是空的（PiHub 0.4.0 就按 `raw.message` 读，对 Pi 1.4.0 拿不到增量）。结束信号用 `agent_settled`（比 `agent_end` 晚，带 `aborted`）。
+2. **`get_available_models` 返回全局清单**：每项带 `provider` 字段，不按它过滤就会把别家的模型混进来（真实事故：拉 DeepSeek 出现 glm-5.3）。
+3. **Pi 没有 `web_search`**：内置工具只有 read/bash/powershell/edit/write/grep/find/ls（+codemode/tool_search），联网走 MCP。别把 Codex 的 `web_search` 开关套上去。
+
+**桥的进程 pid 不写在日志里**：`[pi-bridge] … pid=NNNN` 那个是 **pi 子进程**，不是桥进程。按它 kill 会「桥还在、子进程死」→ prompt 永远超时 + 新进程 `EADDRINUSE`。桥的真实 pid 只能按 `/proc/*/cmdline` 精确匹配（`argv[0]` 以 `node` 结尾 且 `argv[1]` 以 `bridge/pi/server.mjs` 结尾）。
+
+**聊天桥前端契约**（复用 `bridge/web/public/index.html`，与 Codex 桥同一个页面）：`/api/send` 必须回 **NDJSON 流**，逐行 `{kind:'meta'|'text'|'activity'}`，收尾 `{kind:'end'}`；回一次性 JSON 会让界面**静默无反应**。页面还需要 token：不带 `?t=` 时靠 302 到 `/?t=local` 种进 localStorage，否则红条「没有 token」且禁止发送。
+
+## 派单与核对纪律（从多次误判提炼，只记判据不记过程）
+
+- **workdir 里不能放同名过期副本**。模型会诚实去读 workdir 里能找到的那份，给出「对那份完全正确、对真身全错」的答案。派单前 `find <workdir> -name index.js` 查一遍；发现副本就挪走或改名。
+- **核对它给的行号，先确认为它读的是哪份文件**。拿 A 的行号去比 B，会得出「它在编」的错误结论——实际它读的是旧快照且 6/6 命中。**先问"你读的哪个路径"，再判对错。**
+- **要它精确改代码，路径写到文件级**：`<插件目录>/src/index.js`，别只给 workdir。
+- **采纳它提出的新名词前先 `grep -c`**。合同里塞进 `queued`/`finalizing` 两个状态，代码里 0 命中——凭空放大改造面。**新名词先验证存在性**。
+- **改「取消 / 终局」这类语义，先把所有写点找齐**。exec 走 `child.on('exit')`、appserver 走 `handle.done` reject；只改一条路径等于没改，且要等真实取消才暴露。
+- **删一个副作用前，查它还兼管什么**。`utimesSync(outPath)` 同时喂看门狗和污染 `cleanupLiveFiles` 的 mtime 判据——删掉解耦了两件事，也顺带改了清理行为（这是好事，但要知道）。
+- **同一块 UI 可能有两套判据**。面板标题走 `taskStateText()`（认 `cancelled`），同卡片的 `status` 变量白名单只有 `done|error` → 出现「已取消 + 运行中」并存。改状态语义时扫全部判据，不只看一处。
+- **`grep task\.<字段>` 这类归零判据看不见对象字面量里的裸字段**（`const task = { ..., child, ... }`）。改字段归属时必须对着**每条创建路径**逐个确认（本项目三条：appserver / exec / review）；否则会出现「grep 已归零、运行时却拿不到值」——2026-10-28 就这么漏了 exec 的 child，导致取消杀不死进程、`endedAt` 永不落定，而冒烟 32 项全绿。
 
 ## 引擎现状（版本号、开关态、逐版实测一律查 `<本机功能核对表>`，本文件不记）
 - 二进制 `/usr/local/bin/codex`（musl 静态）；沙箱 `danger-full-access`（proot 无 Landlock/bwrap）→ **防线靠流程：工作副本隔离 + diff 审查 + git 仲裁**；升级姿势 + 升级后破坏性检验见本文末节。

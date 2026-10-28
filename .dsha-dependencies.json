@@ -1,0 +1,35 @@
+{
+  "format": 1,
+  "state": "bundled-verified",
+  "plugin": "dsh-second-engine",
+  "version": "3.1.1",
+  "archiveSha256": "",
+  "manifestSha256": "2747129d42fabad3fe41217482ceece8acbbcf04817ebf69454c2acccbbe501e",
+  "treeSha256": "7c013e17886dc693bdfacf571b5e7ce56e333061f79c94684b6d562d04ee0176",
+  "resolved": [
+    {
+      "path": "node_modules/@deepseek-ai/cosmokit",
+      "name": "@deepseek-ai/cosmokit",
+      "version": "1.8.6",
+      "manifestSha256": "70ef4acbb6f4186b9fd24d1e7f32457112179767cf42de849bf00ef7f63b0467"
+    },
+    {
+      "path": "node_modules/@deepseek-ai/schemastery",
+      "name": "@deepseek-ai/schemastery",
+      "version": "3.18.5",
+      "manifestSha256": "3e7deee09015c7f7aa17ae6cecfb928985520baec66aa676dc3f4ed67d4231f0"
+    },
+    {
+      "path": "node_modules/@standard-schema/spec",
+      "name": "@standard-schema/spec",
+      "version": "1.1.0",
+      "manifestSha256": "58e5bd75ddd0684c88b07cd799585cc72a37fd6efb8ab0c936d49e230d5164fb"
+    }
+  ],
+  "lockSha256": "4ddeff573eaa2cee13c2f0506a3d18a5061b918cf770a5127f2dc6bef7d85d3d",
+  "manager": "pnpm",
+  "managerVersion": "not-executed",
+  "integrity": "actual file tree SHA-256 and native pnpm lockfile",
+  "runtimeDsh": "0.2.1-rc.2",
+  "authorClaims": {}
+}

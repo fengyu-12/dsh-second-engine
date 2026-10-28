@@ -113,7 +113,7 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 发布树剔私版：只比存在、不比内容（本机路径被换成「不随包分发」说明）
   # 发布树剔私版：只比存在、不比内容（本机路径被换成占位符）
   PRIVATE_STRIPPED=" src/app-server-client.js tools/dual-board/PROTOCOL.md bridge/README.md bridge/env.example bridge/CHANGELOG.md tools/README.md "
-  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py; do
+  for f in tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs bridge/pi/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js src/engine/pi-runtime.js src/engine/pi-rpc-runtime.js src/engine/registry.js src/engine/pi-probe.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py; do
     [ -f "$ROOT/$f" ] || continue
     case "$PRIVATE_STRIPPED" in
       *" $f "*)
@@ -133,8 +133,50 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   if [ -f "$LOAD_DIR/README.md" ]; then
     cmp -s "$ROOT/README.md" "$LOAD_DIR/README.md" && ok "README 实体=加载（发布树为剔私版，不比）" || bad "README 实体与加载层不一致"
   fi
+  # docs/：实体 = 加载层必须是完整镜像（生效层要能对着文档排查）。
+  # 发布树是有意剔私的（appserver-* 本机排查记录、capabilities 派单计划都不随包），故不比。
+  # 2026-10-28 立：此前 docs 完全不在检查范围，加载层的 task-runtime-contract.md
+  # 落后实体 6 行注释（cancel 语义）却没被发现——只能靠手工全量 md5 扫才看见。
+  docs_bad=0; docs_n=0
+  for f in $(cd "$ROOT" && ls docs/*.md 2>/dev/null); do
+    [ -f "$ROOT/$f" ] || continue
+    docs_n=$((docs_n+1))
+    if [ ! -f "$LOAD_DIR/$f" ]; then
+      docs_bad=$((docs_bad+1)); printf '  ⚠️  加载层缺 %s\n' "$f"
+    elif ! cmp -s "$ROOT/$f" "$LOAD_DIR/$f"; then
+      docs_bad=$((docs_bad+1)); printf '  ⚠️  %s 实体≠加载\n' "$f"
+    fi
+  done
+  [ "$docs_bad" = 0 ] && ok "docs 实体=加载（$docs_n 个；发布树剔私不比）" || bad "docs 有 $docs_bad 个不一致/缺失"
+  # 可执行位：zip 打包（含手机端 MT 管理器）会丢掉 Unix 权限位。
+  # 2026-10-28 实测：从 zip 同步回来后 ctl.sh 变 600，面板点「聊天桥→启动」报
+  # EACCES: permission denied, access '.../bridge/web/ctl.sh'。加这道闸免得再发一次。
+  exec_bad=0; exec_n=0
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    exec_n=$((exec_n+1))
+    [ -x "$ROOT/${f#./}" ] || { exec_bad=$((exec_bad+1)); printf '  ⚠️  无执行位: %s\n' "$f"; }
+  done <<EOF
+$(cd "$ROOT" && find . -name "*.sh" -not -path "./node_modules/*" 2>/dev/null | sort)
+EOF
+  [ -x "$ROOT/bridge/web/codex-env" ] || { exec_bad=$((exec_bad+1)); printf '  ⚠️  无执行位: bridge/web/codex-env\n'; }
+  [ "$exec_bad" = 0 ] && ok "可执行位齐全（$exec_n 个 .sh + codex-env）" || bad "$exec_bad 个脚本缺执行位（zip 打包会丢）"
 else
   skip "发布树或 plugin-src 不存在（SE_PUBLISH_DIR / SE_LOAD_DIR 可覆盖），跳过三处比对"
+fi
+
+printf '\n== 9/9 未定义变量（no-undef）==\n'
+# 为什么加这段：`node --check` 只查语法。2026-10-28 设置页引用了浮球面板的 busy，
+# 语法完全合法，运行时 ReferenceError 把整块设置页渲染搞白。eslint 的 no-undef 能抓。
+if command -v eslint >/dev/null 2>&1 && [ -f "$ROOT/tools/lint-undef.config.mjs" ]; then
+  if eslint --config "$ROOT/tools/lint-undef.config.mjs" "$ROOT/lib/client.js" "$ROOT/src/index.js" >/tmp/se-lint.$$ 2>&1; then
+    ok "no-undef 干净（client.js + index.js）"
+  else
+    bad "no-undef 报错："; grep -E "error" /tmp/se-lint.$$ | head -5
+  fi
+  rm -f /tmp/se-lint.$$
+else
+  skip "eslint 未安装（npm i -g eslint）"
 fi
 
 [ "$FAIL" -eq 0 ]

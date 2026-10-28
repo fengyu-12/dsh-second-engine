@@ -46,6 +46,23 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 | DSH 主 AI | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
+## 另一个引擎：Pi（2026-10-28 起）
+
+**第二引擎不再只能是 Codex。** 设置 → 第二引擎 → 引擎，可切 `Codex` 或 `Pi`，切换即时生效（存 `~/.dsh/second-engine-engine.txt`）。
+
+[Pi](https://pi.dev)（`npm i -g @earendil-works/pi-coding-agent`，v1.4.0，约 22 MB）是另一个本地 coding agent：原生支持 15+ provider（anthropic / openai / deepseek / gemini / zhipu 等），按 `<PROVIDER>_API_KEY` 取凭据。它的好处是**不用再装一个 223MB 的 CLI**，模型直接复用你已有的 key。
+
+| | Codex 引擎 | Pi 引擎 |
+|---|---|---|
+| 工单下发 / 取消 / 进度 | ✅ | ✅ |
+| 多轮复核（`/review`）+ 协作模式三档 | ✅ | ❌ 只出工单（Pi 无复核链路，面板会隐藏该卡） |
+| 浏览器聊天桥 | 8787 附近的 `ctl.sh` | **8788** 自建桥，端口独立 |
+| 模型提供方 / MCP | `config.toml` + keyring | `~/.pi/agent/{models.json,settings.json,mcp.json}` |
+
+两个引擎的**面板是同一套**（模型提供方 / 联网搜索与 MCP / 浏览器聊天桥都由后端按引擎分流，前端零改动），所以外观与操作一致，只有「会话清理」各按自己的目录来。
+
+> Pi 的模型清单支持从远端拉取（填 baseUrl + apiKey 后点「获取模型列表」），也支持手填模型名。
+
 ## 协作看板（dual-board，v1.4）
 
 长任务协作走文件看板。**脚本与协议随插件**：`tools/dual-board/`（`board.sh` / `board_tool.py` / `dispatch.sh` / `PROTOCOL.md`，2026-09-30 收编、路径自定位）；**运行数据**默认仍在 `/root/proj/dual-board/`，可用 `DUAL_BOARD_DIR` 覆盖（Codex 侧由 `/root/proj/AGENTS.md` 自动注入，无需人工提醒）：
@@ -63,7 +80,7 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 ## 前置要求
 
 - DeepSeek Harness（新版 App + Web）
-- [OpenAI Codex CLI](https://github.com/openai/codex/releases) **≥ 0.164.0** —— 本版实测基线就是 `0.164.0`；更低版本（如 `0.155.x`）没有系统验证过，`exec` / `app-server` 的协议面可能对不上
+- [OpenAI Codex CLI](https://github.com/openai/codex/releases) ≥ 0.155.1
 
 ### 安装 Codex CLI（Android proot / aarch64 Linux）
 
@@ -125,8 +142,8 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 
 ### 方式 A：tgz 安装（推荐，无需改配置文件）
 
-1. 下载 Releases 里的 `dsh-second-engine-3.6.2.tgz`；
-2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.6.2.tgz`）；
+1. 下载 Releases 里的 `dsh-second-engine-3.5.0.tgz`；
+2. 打开 DSH App 的插件管理页，安装时粘贴 tgz 的 HTTPS 直链，或容器内绝对路径（如 `/root/Downloads/dsh-second-engine-3.5.0.tgz`）；
 3. 重启 Web，设置页出现「第二引擎」即成功。
 
 tgz 由 pnpm 解析，`dependencies` 会自动装上，不需要再跑 `npm install`。
@@ -237,18 +254,16 @@ curl -s -X POST "$W/second-engine/api/task" \
 - **工单是异步的**：`POST /api/task` 拿到 `{id}` 就可以走人，**完成经 App 通知提醒**；等结果用
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
+- **复核接力**：`POST /api/review` 可带 `"prev":"<上一轮复核id>"`——首轮自动附上一轮未决问题对照；
+  复核收尾把记录（rounds / verdict / stopReason / reviewDirty）持久化到 `~/.codex/reviews/<id>.json`
+  （0600，数量 200 封顶 + 按保留天数龄清），历史用 `GET /api/reviews?limit=20` 拉取（重启不丢）；
+  末轮未决问题同时以 `[REVIEW_ISSUES]` 块追加进该复核任务的 `output`。带 `reviewDirty` 时通知也会提示
+  （复核窗口内工作区新增改动＝**证据**：含任何写入者的改动，不归因、不阻断——起点已脏的路径不计入）。
 
 ## 支持能力一览（v3.6.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **复核 `blocked` 硬档** | ✅ 3.6.0 | 模型在 `verdict` 里给 `block`/`blocked`、或任一 issue 的 `severity` 属阻断级（`blocker`/`critical`），即归一成 `blocked` 并**立即终止、不再跑后续轮**；输出块首行换 `[REVIEW_BLOCKED]`，面板显示「⛔ 阻断 · 禁止上线」。用于「涉及钱 / 数据丢失 / 安全漏洞」这类不该等下一轮的问题 |
-| **独立来源可见性** | ✅ 3.6.0 | 复核结果新增只读字段 `independentSources`（当前恒为 `1`）与 `quorumNote`：让「这次 converged 只有一个独立来源」这件事可见。**只做可见性，不参与收敛判定**——双引擎下若「不足就不许收敛」，等于永远无法收敛 |
-| **路由自描述 `GET /api/_meta`** | ✅ 3.6.0 | 24 条路由的 method/path/desc 由注册表自动生成，取代 SKILL 里手抄的路由表（手抄必腐） |
-| **复核处境块**（`buildReviewContext`） | ✅ 3.5.0 | 复核时随请求注入处境（对话与事实链：产物路径 / 报错原文 / 已试路径 / 当前卡点 / 轮数），Codex 不必猜上下文。**只当行为提示，不是安全边界** —— 真边界在 cwd 强制校验与权限白名单 |
-| **逐条 `verified` 标注** | ✅ 3.5.0 | 每条 issue 必须带 `verified` 布尔：经实际运行或读文件核实过为 `true`，只凭文本推测为 `false`。**仅作信息字段，不参与收敛判定** —— 自报值不可信，把收敛权交给它会诱导模型批量标 `unverified` 来快速收敛 |
-| **复核 cwd 强制校验** | ✅ 3.5.0 | 与工单对齐：接受 `body.workdir`，**目录不存在直接 400**，不再回落到敏感默认目录。这条是处境块能可靠工作的前提（否则处境块可能把模型引到错误的 `~/.codex`） |
-| **per-run 处境取代全局静态 context** | ✅ 3.5.0 | 不往 `~/.codex/AGENTS.md` 写「插件版本 / workdir / 执行模式」这类全局静态 context，改为每次复核随请求注入。理由：全局静态 context 在切换工作区或换 provider 后容易变成误导 |
 | **协作模式三档**（collab） | ✅ 3.5.0 | 普通复核 / 协作提议 / 长任务配合 + 自定义第四组合。两位各自独立：`voice`（允许它主动提议）/ `longtask`（分阶段任务直接开长会话）；优先级 环境变量 > `~/.dsh/second-engine-collab.txt` > 默认。切 `voice=on` 立即写 `~/.codex/AGENTS.md` 的 voice 段、切回即删（文件 0600）。悬浮球面板与设置页都能切 |
 | 插件自身版本提示 | ✅ 3.1.2 | `/api/plugin-version` 读自身 `package.json` 与 GitHub releases 比对（成功缓存 1h / 失败 10min）；**无更新时界面完全不出现**，有更新才在设置卡徽标与浮动球红点提示，只提示不自动装 |
 | **首 token 看门狗（180s）** | ✅ 3.0.0 | app-server 模式迟迟不回第一个事件时不再无限挂起——超时即判失败并报错，工单不会静默卡死 |
@@ -275,8 +290,8 @@ curl -s -X POST "$W/second-engine/api/task" \
 | 版本 | 关键点 |
 |---|---|
 | **3.6.2** | **补第二批「端口 / 注释」缺陷 + 固化冒烟**。① `tools/wait-task.sh`（连环境变量兜底都没有）与 `tools/dual-board/dispatch.sh` 的 Web 地址默认写死 `127.0.0.1:3080`，动态端口下派单/等待直接连不通 → 新增 `tools/web-base.sh`，优先级 `SECOND_ENGINE_BASE_URL` > `DSH_WEB_URL` > 运行中宿主 `--port` > 3080。② 行尾注释保留改**引号感知**（新 `bridge/web/toml-comment.mjs`）：值含 ` # ` 时不再从引号内部切开，`#` 前无空格的尾注也能保留。③ 新增 `tools/smoke.sh`：干净环境冒烟（语法 / 端口解析 / wait-task 联调 / 看板全链路 / dispatch 草稿 / install dry-run / 注释单测 / 三处落点对齐）。④ 版本记录计数口径统一：3.6.1 实为 **14 处**（5+2+2+1+3+1）。 |
-| **3.6.1** | **修「干净环境一跑就崩」的 14 处（提交说明的「9 处」只数了前三个文件）**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` · 3 个注入函数补 `mkdirSync(CODEX_DIR)`（没装 Codex 时装插件，`AGENTS.md` 会被静默吞掉且不再补）· 网页桥 `updateConfigToml` 保留行尾注释。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
-| **3.6.0** | **债务清算 + 实现优化**。修三处**不报错**的静默失效：① 卡点求助地址写死 3080（新版 DSH 改动态端口后一直连不通，只靠文本兜底）→ 改从宿主 `--port` 解析；② `~/.codex/AGENTS.md` 的 v2/board 段「标记存在就跳过」⇒ 老用户永远拿不到新内容 → 补结束标记 + 摘除重写 + 三级边界（末命中则告警不动手），`v1→v2` 不再静默截断；③ `rounds[].verdict` 与终止判据口径不一致。补两处**写了但从没跑到**的清理：`.live` 被 200 MB 阈值挡在后面（10-17 起未执行）→ 从阈值摘出；Codex 日志库按时间清 + 碎片回收（`node:sqlite`，五道安全闸）。优化：复核**首轮**提示词补三条硬要求（此前纪律只装在第 2 轮后，而 90% 复核只跑 1 轮）· 复核新增 `blocked` 硬档（识别即终止）· 只读 `independentSources`/`quorumNote`（不参与收敛判定）· 写入统一原子化 · `config.toml` 备份轮转留 5 份 · 新增 `GET /api/_meta` 路由自描述。 |
+| **3.6.1** | **修「干净环境一跑就崩」的 14 处**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** 2 处 · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 2 处 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` 1 处 · 3 个注入函数补 `mkdirSync(CODEX_DIR)` 3 处 · 网页桥 `updateConfigToml` 保留行尾注释 1 处。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
+| **3.6.0** | **债务清算 + 实现优化**。修三处**不报错**的静默失效：① 卡点求助地址写死 3080（新版 DSH 改动态端口后一直连不通，只靠文本兜底）→ 改从宿主 `--port` 解析；② `~/.codex/AGENTS.md` 的 v2/board 段「标记存在就跳过」⇒ 老用户永远拿不到新内容 → 补结束标记 + 摘除重写 + 三级边界（末命中则告警不动手），`v1→v2` 不再静默截断；③ `rounds[].verdict` 与终止判据口径不一致。补两处**写了但从没跑到**的清理：`.live` 被 200 MB 阈值挡在后面（10-17 起未执行）→ 从阈值摘出；Codex 日志库按时间清 + 碎片回收（`node:sqlite`，五道安全闸）。优化：复核**首轮**提示词补三条硬要求 · 复核新增 `blocked` 硬档（识别即终止）· 只读 `independentSources`/`quorumNote`（不参与收敛判定）· 写入统一原子化 · `config.toml` 备份轮转留 5 份 · 新增 `GET /api/_meta` 路由自描述。 |
 | **3.5.0** | **协作模式三档落地**（普通复核 / 协作提议 / 长任务配合 + custom；`voice` 切档即写/删 `~/.codex/AGENTS.md` 段，`longtask` 只影响主 AI 派单）· 悬浮球加档位下拉 · 球面板版本行改「Codex 版本 / 会话目录占用」两行 kv + 与设置页同款「已是最新」徽标 · **修「升级完红点常亮」**：有新版提示由挂载查一次改为 30s 轮询，且无新版时自动熄灭（旧版只有点亮分支，升级完必须整页刷新才熄）· 主 AI 侧新增「派单前先读档位」流程（插件无推送通道，靠 `/api/status` 主动查）· SKILL 不再记版本号，版本与开关态统一归 `Codex功能表.md` |
 | **3.1.2** | 插件自身版本提示（`/api/plugin-version`，默认完全静默）· 面板「模型与思考」`/api/config`（键白名单 + 写前备份 + 原子替换）· 设置页改分区制（说明收进「?」、provider 主行只留名称/徽标/模型、会话清理折起）· 悬浮球面板重排（标题行状态点+模型名、版本与占用并一行、空态去框）· 面板高度跟随 `visualViewport`（键盘弹出不再慢半拍） |
 | **3.1.1** | 文档补全：安装分「tgz / 源码」两种方式并标明 link: 必装依赖 · 用 GPT 系模型需另装 `codex-code-mode-host`（含镜像下载与「文件真落盘」验收判据） |
@@ -288,11 +303,9 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 ## 已知限制
 
-- **`~/.codex/AGENTS.md` 的注入只在插件启动时执行一次**：装插件时若还没装 Codex CLI（`~/.codex` 不存在），三个注入函数现在会各自先 `mkdirSync(CODEX_DIR, { recursive: true })` 再写，**所以目录缺失本身不再导致失败**（2026-10-26 修；旧版走到 `atomicWriteFileSync` 时抛 ENOENT，被外层 `catch` 静默吞掉且之后不重跑，只能等重启）。**仍然存在的边界**：若 `$HOME` 本身不可写（权限/SELinux 等），注入仍会跳过 —— 看 `GET /api/status` 的 `lastErrors` 里有没有 `agents-protocol`；有的话改权限后**重启一次 Web** 即可补上（`ensure*` 幂等，内容一致时零写入，不会重复叠加）。
-- **控制面无鉴权（本机威胁模型，已评估接受）**：`/second-engine/api/*` 只绑 loopback、不校验 token。本机任意进程可调 `POST /providers/update` 把 `baseUrl` 改成自己的地址，再触发 `/task` 或 `/review`，使插件把已存的 provider key 以 `Authorization: Bearer` 发向该地址（completions 模式经本地桥转发）。**这是本机威胁模型下的真实链路，不是远程漏洞**：需要本机代码执行或本机 HTTP 调用能力、且 active provider 已存非空 key。本项目按「单机、不暴露公网」定位接受此风险、不修。若将来要部署在多用户 / 共享机器环境，应优先修 —— 最小改法：`baseUrl` 变更时清空该 provider 的 `apiKey`（地址一变 key 失效，攻击者拿到地址也没 key）。
 - **沙箱**：proot 环境无 Landlock / bubblewrap，Codex 需 `danger-full-access` 运行——安全防线在流程层（工作副本隔离 + diff 审查 + git 仲裁），**不要把主工作区直接交给 Codex**；
 - **翻译桥**：实验性；内部以非流式请求上游、以流式事件回放，长任务首包延迟等于整段生成时间；
-- **工单记录**：内存态，重启 Web 即清空；
+- **工单记录**：内存态，重启 Web 即清空（复核记录自 2026-10-25 起持久化到 `~/.codex/reviews/`，不受影响）；
 - **完成提醒**：经 App 通知提醒用户回 Web 唤起主 AI 验收（DSH 暂无会话主动注入 API）；
 - **t-tool run 前提**：目标会话须停在 shell 提示符；pane 正跑前台程序时哨兵等不到，表现为 TIMEOUT（会话不损，等程序结束即可）；命令须写单行；
 - **t-tool wait 基线语义**：匹配的是全屏（含旧输出），"等命令跑完"一律用 `run`；需要"只匹配新增输出"时传基线行数（第 5 参）；
@@ -300,9 +313,11 @@ curl -s -X POST "$W/second-engine/api/task" \
 - **完成通知节流**：App 通知 30 秒节流，连续快速完成的任务可能合并提醒；
 - **插件 API 无鉴权**：`/second-engine/api/*` 仅绑定 127.0.0.1（外网不可及），但本机任意 App 均可无认证调用——个人设备低风险，接入外部 agent 前将统一加 token（bridge_token 同款机制）。
 
-## 执行模式
+## 执行模式（2026-09-27 起）
 
-**工单**支持两种执行模式，切换不需要重启；**复核恒走 `exec`** —— 复核轮次短、`exec` 即默认，所以没有做 appserver 分支。本文件早前版本写作「工单与复核都支持两种」，与实现不符，以代码为准（`execMode()` 全文件仅工单分支引用）：
+工单支持两种执行模式，**切换不需要重启**。**复核（`POST /api/review`）恒走 exec 多轮子进程**——
+appserver 化在路线图上（复用 `startAppServerTurn` 即可；卡点是 token 硬预算的数据源要从
+exec 尾部 "tokens used" 换成 `thread/tokenUsage/updated` 事件，未验收前不切）：
 
 | 模式 | 机制 | 能力 |
 |---|---|---|
@@ -315,13 +330,13 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 ```
 
 优先级：环境变量 `SECOND_ENGINE_EXEC_MODE` > 上述模式文件 > 默认 `exec`。
-验收脚本：`bash <DSH 脚本目录>/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
+验收脚本：`bash /root/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。
 
 **实时可见性（怎么判断"到底行动了没"）**：
 - **模型清单**：`POST /api/models {id}` 对智谱会**并集**两个端点（`/api/v1`（Codex 专用，只列 3 个）+ `/api/coding/paas/v4`（全量）），响应里的 `sources` 字段回显实际来源。实测两端点共用同一把 key，且 `/api/v1/responses` 支持全部 glm 模型（2026-09-28）。
 - **exec 模式**：`GET /api/task?id=` 看 `liveBytes`（过程流字节数，持续增长即在动）；过程流保留在 `<outPath>.live`（最终结果仍以 `-o` 文件为准）。
 - **appserver 模式**：除 `liveBytes` 外还有 `progress` 数组（归一化事件，最近 20 条，可见 reasoning / 文本增量 / 工具调用 / 用量）。
-协议依据：事件→归一化字段映射取自 app-server 生成的 JSON Schema（作者的映射笔记不随包分发）。
+协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
 ## 架构
 

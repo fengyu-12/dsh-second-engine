@@ -698,12 +698,41 @@ const server = createServer(async (req, res) => {
   if (url.pathname.startsWith('/api/')) {
     if (!authed(req, url)) return json(res, 401, { error: 'token 无效，请用启动时打印的完整网址打开' });
 
-    // /api/config 只读写本地 config.toml，不依赖 app-server：放在 requireReady 之前，
-    // 上游挂了的时候设置面板也还能看到/改模型配置。
     if (req.method === 'GET' && url.pathname === '/api/config') return handleGetConfig(res);
     if (req.method === 'POST' && url.pathname === '/api/config') return handlePostConfig(req, res);
 
     if (!requireReady(res)) return;
+
+    if (url.pathname === '/api/runtime-settings') {
+      let payload = { threadId: url.searchParams.get('threadId') || '' };
+      if (req.method === 'POST') {
+        try { payload = JSON.parse((await readBody(req)) || '{}'); }
+        catch (err) { return json(res, 400, { error: `请求体不是 JSON：${err.message}` }); }
+      }
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return json(res, 400, { error: '请求体必须是 JSON 对象' });
+      if (typeof payload.threadId !== 'string' || !payload.threadId) return json(res, 400, { error: '缺少 threadId' });
+      try {
+        if (req.method === 'GET') {
+          const read = await as.call('thread/read', { threadId: payload.threadId });
+          const thread = read.thread || {};
+          return json(res, 200, { engine: 'codex', model: thread.model || '', effort: thread.reasoningEffort || '', levels: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+        }
+        if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+        const keys = Object.keys(payload).filter((k) => k !== 'threadId');
+        if (!keys.length || keys.some((k) => !['model', 'effort'].includes(k))) return json(res, 400, { error: '只接受 model / effort' });
+        const update = { threadId: payload.threadId };
+        if (payload.model !== undefined) {
+          if (typeof payload.model !== 'string' || !/^[\w:./+-]{1,200}$/.test(payload.model.trim())) return json(res, 400, { error: 'model 格式不合法' });
+          update.model = payload.model.trim();
+        }
+        if (payload.effort !== undefined) {
+          if (!['minimal', 'low', 'medium', 'high', 'xhigh'].includes(payload.effort)) return json(res, 400, { error: 'effort 不合法' });
+          update.effort = payload.effort;
+        }
+        await as.call('thread/settings/update', update);
+        return json(res, 200, { ok: true, ...update });
+      } catch (err) { return json(res, 502, { error: `会话设置切换失败：${err.message}` }); }
+    }
 
     // 会话列表直接问 app-server（真源），所以终端那边的对话也能在这里切
     if (req.method === 'GET' && url.pathname === '/api/threads') {

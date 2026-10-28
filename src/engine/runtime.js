@@ -9,10 +9,23 @@ import { statSync } from 'node:fs'
 export const WATCHDOG_INTERVAL_MS = 30000
 export const WATCHDOG_STALL_MS = 300000
 
-/** -o 输出文件 mtime（毫秒）；文件还没生成时返回 null。 */
+/**
+ * 产物 mtime（毫秒）：**同时看 `-o` 与 `-o.live` 取最大**；两者都不存在返回 null。
+ *
+ * 2026-10-28 修：原实现只看 `-o`，但 exec 模式下 codex 的 `-o` 只在**结束时**写一次，
+ * 运行期间唯一的实时写入是 `.live`（child.stdout → writeLive）。只看 `-o` 会让长任务
+ * 在 300s 后必被误判停滞 —— 实测：任务跑 60s，`-o` 文件压根不存在，`.live` 488B 且没变。
+ */
 export function outFileMtimeMs(outPath) {
   if (outPath === undefined || outPath === null || outPath === '') return null
-  try { return statSync(outPath).mtimeMs } catch { return null }
+  let best = null
+  for (const p of [outPath, `${outPath}.live`]) {
+    try {
+      const m = statSync(p).mtimeMs
+      if (best === null || m > best) best = m
+    } catch { /* 该文件还没生成 */ }
+  }
+  return best
 }
 
 /**
@@ -22,6 +35,9 @@ export function outFileMtimeMs(outPath) {
 export function createRuntime(task, deps) {
   const { notify, readProcStartTime, stallMs = WATCHDOG_STALL_MS, intervalMs = WATCHDOG_INTERVAL_MS } = deps
   let timer = null
+  // P3.3：子进程与 app-server 句柄由 runtime 私有持有 —— 公共代码不再摸 task.child / task.app。
+  let child = null
+  let app = null
 
   const rt = {
     descriptor: { id: 'codex', transport: task.app !== undefined && task.app !== null ? 'in-process' : 'process' },
@@ -31,6 +47,63 @@ export function createRuntime(task, deps) {
      * 这与改动前的语义一致 —— 旧代码里事件只写 activityAt，stuckSuspect 的恢复只发生在
      * 看门狗 tick 里发现 mtime 抬升时。若在这里顺手清掉 stuckSuspect，会改变告警行为。
      */
+    // ── P3.3：子进程 / app-server 句柄（公共代码只通过这些方法操作）──
+    setChild(c) { child = c ?? null },
+    child() { return child },
+    setApp(a) { app = a ?? null },
+    pid() { return child !== null && Number.isInteger(child.pid) ? child.pid : null },
+    /** 发信号；进程可能已退出，失败吞掉（与旧 try/catch 语义一致）。 */
+    kill(signal) { try { if (child !== null) child.kill(signal) } catch { /* 进程可能刚好自己退出 */ } },
+    /** app-server 优雅结束当前 turn；失败吞掉，取消路径靠 SIGTERM/SIGKILL 兜底。 */
+    interrupt() {
+      if (app !== null && typeof app.interrupt === 'function') {
+        void Promise.resolve(app.interrupt()).catch(() => { /* 连接已断等 */ })
+      }
+    },
+
+    /**
+     * 视图投影（P3.6）：公共代码（taskView / taskSummary / 看板）只调它，不再直读字段。
+     * cancelled 映射也在这里做 —— 外部看到 'cancelled'，内部 status 仍是 'running'，
+     * 直到 finalize 落定（这正是 P2.1 要的「意图 vs 事实」）。
+     */
+    // ── 字段访问器（P3.4-P3.7）：公共代码只经这些方法读写，不再摸 task.<字段> ──
+    isCancelled() { return task.cancelled === true },
+    setCancelled() { task.cancelled = true },
+    setForcedKill() { task.forcedKill = true },
+    setLastSignal(sig) { if (sig) task.lastSignal = sig },
+    getExitCode() { return task.exitCode },
+    setExitCode(code) { task.exitCode = code },
+    getOutPath() { return task.outPath },
+    setOutPath(p) { task.outPath = p },
+    getChildPid() { return task.childPid },
+    setChildPid(pid) { task.childPid = pid },
+    getChildStart() { return task.childStart },
+    setChildStart(st) { task.childStart = st },
+    setAppError(e) { task.appError = e },
+    setReconcileLost(why) { task.reconcileLost = why },
+    /** 环形 20 条的进度的唯一写入口（上限与 index.js 的 PROGRESS_LIMIT 保持一致）。 */
+    pushProgress(entry, limit = 20) {
+      task.progress.push(entry)
+      while (task.progress.length > limit) task.progress.shift()
+    },
+
+    snapshot() {
+      const cancelled = task.cancelled === true
+      return {
+        status: cancelled && task.status === 'running' ? 'cancelled' : task.status,
+        exitCode: task.exitCode,
+        mode: task.mode,
+        progress: task.progress,
+        liveBytes: task.live !== undefined && task.live !== null ? (task.live.bytes ?? 0) : undefined,
+        activityAt: Number.isFinite(task.activityAt) ? task.activityAt : 0,
+        stuckSuspect: task.stuckSuspect === true,
+        lastSignal: task.lastSignal,
+        reconcileLost: task.reconcileLost,
+        appError: task.appError,
+        error: task.error,
+      }
+    },
+
     heartbeat(at) {
       const v = at ?? Date.now()
       if (!(v > (Number.isFinite(task.activityAt) ? task.activityAt : 0))) return task.activityAt
@@ -42,8 +115,8 @@ export function createRuntime(task, deps) {
     startWatchdog() {
       if (timer !== null) return
       // 顺带固定子进程身份（对账 tick 判失联用）：只在首次记录，重复调用不覆盖。
-      if (task.childPid === undefined && task.child !== null && task.child !== undefined) {
-        task.childPid = Number.isInteger(task.child.pid) ? task.child.pid : null
+      if (task.childPid === undefined && child !== null) {
+        task.childPid = Number.isInteger(child.pid) ? child.pid : null
         task.childStart = readProcStartTime(task.childPid)
       }
       task.activityAt = Date.now()

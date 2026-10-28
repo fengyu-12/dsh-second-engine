@@ -2,30 +2,9 @@
 
 本文件是**改动记录 + 回滚手册**（时间倒序）。使用/安装/接入请看同目录 `README.md`。
 
-> 路径约定：文中 `<bridge 运行目录>/` 指**本机运行实例**；可搬运副本里对应的就是本目录的
+> 路径约定：文中 `/root/proj/web-bridge/` 指**本机运行实例**；可搬运副本里对应的就是本目录的
 > `bridge/`（`bridge/server.mjs`、`bridge/ctl.sh`、`bridge/public/index.html` …）。
 > 备份文件名（`*.bak-*`）只在本机运行目录里存在。
-
----
-
-# 2026-10-23 — 3.1.2 适配 DSH 0.2.1
-
-## 1. 做了什么
-
-| 改动 | 文件 | 说明 |
-|---|---|---|
-| 兼容声明 | `package.json` | 新增 `engines.dsh: ">=0.2.1-alpha.5"`；DSH 0.2.1 的兼容检查按它判定，不再显示 unknown |
-| 版本 | `package.json`、`README.md` | 3.1.1 → 3.1.2 |
-| 文档 | `skills/second-engine/SKILL.md` | Codex 锚点更新到 0.163.0，补 0.2.1 实测结论 |
-
-## 2. 实测
-
-- DSH 0.2.1-rc.2 / DSHA build190：插件 host `loaded`，设置页「第二引擎」入口正常，无 `ERR_MODULE_NOT_FOUND`。
-- 依赖不变：`@deepseek-ai/schemastery` 由宿主提供，未新增第三方依赖。
-
-## 3. 未验
-
-- 桌面壳未实测；dual-board 与聊天桥的端到端未在 0.2.1 重跑。
 
 ---
 
@@ -118,11 +97,11 @@ grep -n web-bridge install.sh bin/codex-env                 → 零命中
 ## 4. 回滚
 
 ```sh
-cd <安装目录>
+cd /root/proj/second-engine-bridge
 cp -p install.sh.bak-20260929-defaultpath    install.sh
 cp -p bin/codex-env.bak-20260929-defaultpath bin/codex-env
 cp -p README.md.bak-20260929-defaultpath     README.md
-cp -p <bridge 运行目录>/ctl.sh.bak-20260929-depguard <bridge 运行目录>/ctl.sh
+cp -p /root/proj/web-bridge/ctl.sh.bak-20260929-depguard /root/proj/web-bridge/ctl.sh
 ```
 
 ## 5. 遗留（本次未做）
@@ -131,7 +110,7 @@ cp -p <bridge 运行目录>/ctl.sh.bak-20260929-depguard <bridge 运行目录>/c
   `-r` 的 flock 锁探测、help 同步。**故意不回灌** `BOOT_LOG`（`$HOME/proj/se-verify/boot-log.sh`
   是本机运维耦合，分发包不该带），也不改硬编码→变量的设计（包内 `BRIDGE_DIR` 可覆盖更好）。
   实测：`BRIDGE_DIR=… bash bin/codex-env -u` 正常打印网址、`bash -n` 通过。
-- `<工作目录>/README.md` 工具表仍把 `web-bridge/ctl.sh` 当运行实例（历史文档，未改）。
+- `/root/proj/README.md` 工具表仍把 `web-bridge/ctl.sh` 当运行实例（历史文档，未改）。
 
 ---
 
@@ -170,12 +149,12 @@ sed -n '/^<script>$/,/^<\/script>$/p' public/index.html | sed '1d;$d' > /tmp/x.m
 | 再点一次 | `light` | — | — | 🌙 |
 
 截图已归档：`evidence/2026-09-25/ui/ui-light.png`、`ui-light-drawer.png`、`ui-dark.png`
-（原 `<工作目录>/.scratch/`，2026-09-25 收进 `evidence/`）。
+（原 `/root/proj/.scratch/`，2026-09-25 收进 `evidence/`）。
 
 ## 4. 回滚
 
 ```sh
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 cp -p public/index.html.bak-20260925-light-theme public/index.html
 ./ctl.sh reload-web
 ```
@@ -231,7 +210,7 @@ codex app-server --listen ws://127.0.0.1:3096      ← 就是桥自己的上游�
 ## 4. 自验（全部实测）
 
 ```sh
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 node --check server.mjs                                    # 语法 OK
 sed -n '/^<script>/,/^<\/script>/p' public/index.html | sed '1d;$d' > /tmp/x.mjs && node --check /tmp/x.mjs
 ./ctl.sh reload-web                                        # 不踢 TUI
@@ -253,7 +232,7 @@ curl -s -X POST "…/api/thread/archive" -d '{"id":"01a0d8ad-…"}'   # → 409 
 ## 5. 回滚
 
 ```sh
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 cp -p server.mjs.bak-20260925-lockholder server.mjs
 cp -p public/index.html.bak-20260925-lockholder-search public/index.html
 ./ctl.sh reload-web
@@ -347,7 +326,7 @@ bash ctl.sh status                                  → appServer connected:true
 ## 4. 回滚
 
 ```sh
-cd <工作目录>
+cd /root/proj
 cp web-bridge/server.mjs.bak-20260925-interrupt-race              web-bridge/server.mjs
 cp web-bridge/public/index.html.bak-20260925-interrupt-race       web-bridge/public/index.html
 cp second-engine-bridge/bridge/server.mjs.bak-20260925-interrupt-race        second-engine-bridge/bridge/server.mjs
@@ -364,7 +343,7 @@ cd web-bridge && bash ctl.sh reload-web
 
 ## 附：用中转站做多模型第二意见的过程（可复用）
 
-排查此 bug 时，用 `<工作目录>/relay-forge/forge.py` 把任务书并发投给 4 个模型（qwen3.8-max /
+排查此 bug 时，用 `/root/proj/relay-forge/forge.py` 把任务书并发投给 4 个模型（qwen3.8-max /
 qwen3.7-plus / qwen3.7-max / qwen3-coder-plus），产出 4.7K~5.4K 字符/份，**四份独立收敛到同一套方案**
 （`pendingCancel` + 两条就绪路径 + 三态返回 + 精确 threadId）——**共识度可作可信度信号**。
 
@@ -375,7 +354,7 @@ qwen3.7-plus / qwen3.7-max / qwen3-coder-plus），产出 4.7K~5.4K 字符/份�
 
 > **教训：共识 ≠ 正确。** 第二意见是线索，必须逐条对着代码验证后再采信 —— 与铁律「AI 输出一律当线索不当结论」同源。
 
-候选原文留存：`<工作目录>/relay-forge/out/20260925-150048/`
+候选原文留存：`/root/proj/relay-forge/out/20260925-150048/`
 
 ---
 
@@ -425,8 +404,8 @@ flock，**一个进程 = 一个会话写者**。`codex resume --last` 起的是*
 
 | 文件 | 说明 |
 |---|---|
-| `<bridge 运行目录>/public/index.html` | 本机**运行实例** |
-| `<安装目录>/bridge/public/index.html` | **可搬运副本** |
+| `/root/proj/web-bridge/public/index.html` | 本机**运行实例** |
+| `/root/proj/second-engine-bridge/bridge/public/index.html` | **可搬运副本** |
 
 三处改动：
 
@@ -449,7 +428,7 @@ grep -n 'idchip|copyText|item.title = t.id'    # CSS:77 / 渲染:243-254 / 助�
 
 # ③ 服务端是否已吐新版（关键：决定要不要重启）
 curl -sS -H "x-bridge-token: $TK" http://127.0.0.1:3095/ | grep -c idchip   # → 2
-sed -n '412,415p' <bridge 运行目录>/server.mjs                          # await readFile(PAGE) + no-store
+sed -n '412,415p' /root/proj/web-bridge/server.mjs                          # await readFile(PAGE) + no-store
 ```
 
 **③ 的结论很重要**：`server.mjs` 是**每请求读盘**且带 `cache-control: no-store`，
@@ -458,7 +437,7 @@ sed -n '412,415p' <bridge 运行目录>/server.mjs                          # aw
 ## 4. 回滚
 
 ```sh
-cd <工作目录>
+cd /root/proj
 cp web-bridge/public/index.html.bak-20260925-show-id                    web-bridge/public/index.html
 cp second-engine-bridge/bridge/public/index.html.bak-20260925-show-id   second-engine-bridge/bridge/public/index.html
 # 刷新网页即可（服务端每请求读盘，无需重启）
@@ -506,7 +485,7 @@ cp second-engine-bridge/bridge/public/index.html.bak-20260925-show-id   second-e
 - 空 input 的 `turn/start` 会**真的调用模型**（花钱、留垃圾回合）→ **不能**用它逼落盘。
 - 自己给官方 `path` 补最小 `session_meta` → `thread/read` 能用但 `thread/list` 不可见，owner 之后还会追加自己的 meta（2 条 meta）→ 放弃此路。
 - owner 对建在它上面的会话**一律报 `originator="web-bridge"`** → 分不出是谁开的 → 桥自己加一份归属账本。
-- `thread/start` 的 `cwd` 协议层有效，但 **TUI 走 `--remote` 建会话时不传 cwd** → owner 用自己的 cwd（`<工作目录>`）。
+- `thread/start` 的 `cwd` 协议层有效，但 **TUI 走 `--remote` 建会话时不传 cwd** → owner 用自己的 cwd（`/root/proj`）。
 - 未落盘会话**无法删除**（`thread/delete` 报 `no rollout found`）→ 会残留在列表，已知小瑕疵。
 
 ## 3. 代码改动（按文件）
@@ -566,7 +545,7 @@ cp second-engine-bridge/bridge/public/index.html.bak-20260925-show-id   second-e
 
 ### 4.1 操作/验证桥
 ```bash
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 ./ctl.sh check                      # 全绿（含新增 thread/loaded/list 项）
 ./ctl.sh reload-web                 # 只重载网页进程，不踢终端 TUI
 ./ctl.sh threads 10                 # 列会话（终端侧）
@@ -599,17 +578,17 @@ codex-env                      # 默认：owner 上开新会话，网页 5 秒�
 codex-env -s                   # 独立会话（网页看不见）
 codex-env -a                   # 挂 owner，弹选择器
 codex-env -a <id>              # 挂 owner 并直接打开
-codex-env <工作目录>/se-verify # 目录与 owner 不一致 → 自动退回独立会话并提示
+codex-env /root/proj/se-verify # 目录与 owner 不一致 → 自动退回独立会话并提示
 ```
 
 ### 4.4 打包副本安装（幂等）
 ```bash
-cd <安装目录> && ./install.sh --dry-run --with-codex-env
+cd /root/proj/second-engine-bridge && ./install.sh --dry-run --with-codex-env
 ```
 
 ### 4.5 浏览器真机验证（用完**必须** stop）
 ```bash
-cd <工作目录>
+cd /root/proj
 ./dsh-browser.sh start
 ./dsh-browser.sh nav "http://127.0.0.1:3095/?t=$(cat web-bridge/.token)"
 ./dsh-browser.sh eval 'document.getElementById("menu").click(); document.getElementById("tlist").innerText.includes("未开始") ? "有 ✅" : "没有 ❌"'
@@ -626,7 +605,7 @@ cd <工作目录>
 ## 6. 回滚
 
 ```bash
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 cp server.mjs.bak-20260923-web-sync            server.mjs
 cp public/index.html.bak-20260923-web-sync     public/index.html
 cp /usr/local/bin/codex-env.bak-20260923-web-sync /usr/local/bin/codex-env
@@ -687,15 +666,15 @@ codex CLI 的模型是「一个进程 = 一个会话写者」，靠 `~/.codex/th
 
 | 文件 | 改了什么 | 备份 |
 |---|---|---|
-| `<bridge 运行目录>/server.mjs` | 重写：改走 app-server 协议 | 同目录 `server.exec.mjs.bak-20260922-1433` |
-| `<bridge 运行目录>/ctl.sh` | 重写：管两个进程 + `check`/`as-url`/`restart` | 同目录 `ctl.exec.sh.bak-20260922-1433` |
-| `<bridge 运行目录>/as-client.mjs` | 新增：app-server 的 WebSocket/JSONL 客户端 | — |
-| `<bridge 运行目录>/selftest.mjs` | 新增：体检 | — |
+| `/root/proj/web-bridge/server.mjs` | 重写：改走 app-server 协议 | 同目录 `server.exec.mjs.bak-20260922-1433` |
+| `/root/proj/web-bridge/ctl.sh` | 重写：管两个进程 + `check`/`as-url`/`restart` | 同目录 `ctl.exec.sh.bak-20260922-1433` |
+| `/root/proj/web-bridge/as-client.mjs` | 新增：app-server 的 WebSocket/JSONL 客户端 | — |
+| `/root/proj/web-bridge/selftest.mjs` | 新增：体检 | — |
 | `/usr/local/bin/codex-env` | 加 `-a [会话id]` + 所有者在线提示 | `/usr/local/bin/codex-env.bak-v2-20260922` |
-| `<bridge 运行目录>/history.mjs` | 未改，已不再被引用（留作降级路径） | — |
-| `<工作目录>/README.md` | 工具表 + 「聊天桥 v2」章节 | — |
-| `<工作目录>/共同工作区/会话同步与终端切换-分析.md` | 新增第六节：改造结果与实测证据 | — |
-| `<安装目录>/` | 本目录：可搬运副本（给 DSH 插件用） | — |
+| `/root/proj/web-bridge/history.mjs` | 未改，已不再被引用（留作降级路径） | — |
+| `/root/proj/README.md` | 工具表 + 「聊天桥 v2」章节 | — |
+| `/root/proj/共同工作区/会话同步与终端切换-分析.md` | 新增第六节：改造结果与实测证据 | — |
+| `/root/proj/second-engine-bridge/` | 本目录：可搬运副本（给 DSH 插件用） | — |
 
 完全没动：codex 二进制、`~/.codex/config.toml`、`~/.codex/keyring.json`、
 任何 DSH 包（`/usr/local/lib/node_modules/@deepseek-ai/*`）。
@@ -714,7 +693,7 @@ codex CLI 的模型是「一个进程 = 一个会话写者」，靠 `~/.codex/th
 ## 怎么恢复（回到 exec 版）
 
 ```bash
-cd <工作目录>/web-bridge
+cd /root/proj/web-bridge
 ./ctl.sh stop
 cp server.exec.mjs.bak-20260922-1433 server.mjs
 cp ctl.exec.sh.bak-20260922-1433 ctl.sh && chmod +x ctl.sh
@@ -732,9 +711,9 @@ chmod +x /usr/local/bin/codex-env
 ## 验证恢复成功
 
 ```bash
-cd <工作目录>/web-bridge && ./ctl.sh start
+cd /root/proj/web-bridge && ./ctl.sh start
 curl -s 127.0.0.1:3095/api/health     # exec 版：JSON 里没有 appServer 字段
-cd <工作目录> && codex-env            # TUI 正常起来
+cd /root/proj && codex-env            # TUI 正常起来
 ```
 
 ## 运行时状态（不用恢复，删了会自己重建）
@@ -749,8 +728,8 @@ cd <工作目录> && codex-env            # TUI 正常起来
 ## 想彻底不要它了
 
 ```bash
-<bridge 运行目录>/ctl.sh stop
-# 再把 <工作目录>/web-bridge 整个目录移走即可
+/root/proj/web-bridge/ctl.sh stop
+# 再把 /root/proj/web-bridge 整个目录移走即可
 # 没有在别处注册任何东西：不写 config.toml、不加开机自启、不进 DSH 包树
 ```
 

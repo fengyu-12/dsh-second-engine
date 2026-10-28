@@ -39,7 +39,9 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync
 import { spawn, execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
-import { createRuntime } from './engine/runtime.js'
+import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId } from './engine/registry.js'
+import { piProbe, piAvailableModels, resolvePiProvider, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
+import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl } from './engine/pi-bridge.js'
 import http from 'node:http'
 import { join, resolve, dirname, delimiter } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1010,7 +1012,8 @@ function configPointsTo(baseUrl) {
 // "长时间无输出"常常只是模型在长生成，据此判死会误杀健康作业。
 // 返回 null = 仍活着（或无法判定）；返回字符串 = 失联原因。
 function probeTaskLost(task) {
-  const pid = task.childPid
+  const rt = rtOf(task)
+  const pid = rt.getChildPid()
   if (!Number.isInteger(pid) || pid <= 0) return null
   try {
     process.kill(pid, 0)
@@ -1019,7 +1022,8 @@ function probeTaskLost(task) {
     return null // EPERM 等：进程还在，只是没权限探测
   }
   const nowStart = readProcStartTime(pid)
-  if (task.childStart !== undefined && task.childStart !== null && nowStart !== null && nowStart !== task.childStart) {
+  const startAt = rt.getChildStart()
+  if (startAt !== undefined && startAt !== null && nowStart !== null && nowStart !== startAt) {
     return 'pid-reused'
   }
   return null
@@ -1049,11 +1053,11 @@ async function reconcileOnce() {
   for (const task of tasks.values()) {
     if (task.status !== 'running') continue
     // P2：取消中的任务内部 status 仍是 running（终态待 finalize），别让探活抢先判失联。
-    if (task.cancelled === true) continue
+    if (rtOf(task).isCancelled()) continue
     const why = probeTaskLost(task)
     if (why === null) continue
-    task.reconcileLost = why
-    if (finalizeTask(task, -1, 'error') && task.cancelled !== true) void notifyTask(task)
+    rtOf(task).setReconcileLost(why)
+    if (finalizeTask(task, -1, 'error') && !rtOf(task).isCancelled()) void notifyTask(task)
     actions.push(`task:${task.id}:${why}`)
   }
 
@@ -1178,6 +1182,36 @@ async function writeCodexConfig(provider) {
 }
 
 // ── API handlers ──
+// P4.5（2026-10-28）：当前引擎**实际会用**的模型。
+// Codex 看 keyring 的 active；Pi 看它认的那个 provider（回落规则与 rtOf 一致）。
+// 面板把它显示出来，否则切到 Pi 后标题还挂着 Codex 的 glm-5.3-flash。
+function activeEngineModel(id) {
+  if (id !== 'pi') {
+    try {
+      const doc = loadKeyring()
+      const p = doc.providers.find((x) => x.id === doc.active)
+      return { providerId: doc.active, model: p?.model || '', fallback: false }
+    } catch { return { providerId: '', model: '', fallback: false } }
+  }
+  const hit = resolvePiProvider()
+  if (hit !== null) return { providerId: hit.id, model: hit.model, fallback: false }
+  return { providerId: '', model: '', fallback: true }
+}
+
+/** 当前引擎的探测 + 能力（status/config 共用，别写两份）。 */
+async function engineView() {
+  const active = activeEngineId()
+  const caps = ENGINES[active] !== undefined ? ENGINES[active].capabilities : null
+  const view = { active, list: engineList(), caps, model: activeEngineModel(active) }
+  if (active === 'pi') {
+    try { view.probe = { pi: await piProbe(), models: await piAvailableModels() } }
+    catch (e) { view.probe = { pi: null, models: null, error: errMsg(e) } }
+  } else {
+    view.probe = { pi: null, models: null }
+  }
+  return view
+}
+
 async function handleStatus(_req, res) {
   try {
     send(res, {
@@ -1192,8 +1226,760 @@ async function handleStatus(_req, res) {
       lastErrors: ERR_LOG.slice(-10),
       // 协作两位 + 派生预设（主 AI 派单前查这里；preset 派生点在 collabPreset）。
       collab: collabStatus(),
+      // P4.3/P4.5：当前引擎 + 能力 + 探测 + 实际模型（面板据此条件渲染）。
+      engine: await engineView(),
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 面板数据（P4.6）：Pi 引擎专用，字段与 lib/pi-cards.js 契约一一对应 ──
+// 为什么单独出口：Codex 的 keyring/config.toml 与 ~/.codex/sessions 在 Pi 下全无意义，
+// 前端若在共享卡片里做行级 if，漏一处就把 Codex 的数字显示在 Pi 面板上（真实踩过）。
+function countPiJsonl(dir) {
+  let count = 0
+  let sizeBytes = 0
+  const walk = (current) => {
+    let entries = []
+    try { entries = readdirSync(current, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const full = join(current, entry.name)
+      if (entry.isDirectory()) { walk(full); continue }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+      try { count += 1; sizeBytes += statSync(full).size } catch { /* skip transient file errors */ }
+    }
+  }
+  walk(dir)
+  return { count, sizeBytes }
+}
+
+async function handlePiPanel(_req, res) {
+  try {
+    // 提供方：以 keyring 为准 —— Pi 的 key 由 rtOf/pi-env 从 keyring 注入，
+    // 插件进程自身的 env 未必带；env 只作补充，避免「明明配了却显示未配」。
+    const krById = new Map()
+    try {
+      const doc = loadKeyring()
+      for (const p of doc.providers) {
+        if (typeof p.id === 'string' && (p.apiKey || p.key)) krById.set(p.id, p)
+      }
+    } catch { /* 读不到 keyring 就当作全没配，不编数 */ }
+    const models = await piAvailableModels().catch(() => null)
+    const modelIds = Array.isArray(models) ? models.map((m) => m && m.id).filter(Boolean) : []
+    const activePi = resolvePiProvider()
+    const providers = PI_PROVIDERS.map((id) => {
+      const env = `${id.toUpperCase()}_API_KEY`
+      const hit = krById.get(id)
+      return {
+        id,
+        label: (hit && hit.name) || id,
+        hasKey: Boolean(hit) || Boolean(process.env[env]),
+        keyEnv: env,
+        // Pi 自报的清单只对当前生效 provider 有效；其余报 0，不把数字张冠李戴。
+        modelCount: activePi !== null && activePi.id === id ? modelIds.length : 0,
+      }
+    })
+
+    // MCP：Pi 读 ~/.pi/agent/mcp.json（docs/mcp.md:32），与 Codex 的 config.toml 无关。
+    const mcpPath = join(homedir(), '.pi', 'agent', 'mcp.json')
+    const mcpExists = existsSync(mcpPath)
+    let mcpServers = []
+    if (mcpExists) {
+      try {
+        const doc = JSON.parse(readFileSync(mcpPath, 'utf8'))
+        const bag = (doc && (doc.mcpServers || doc.servers)) || {}
+        mcpServers = Object.keys(bag).map((name) => {
+          const one = bag[name] || {}
+          return { name, type: one.type || one.transport || 'unknown' }
+        })
+      } catch { mcpServers = [] }
+    }
+
+    // 聊天桥：Pi 用自建 bridge（8788），不是 Codex 的 ctl.sh。
+    const bridgeStatus = await piBridgeStatus()
+    const bridge = {
+      port: bridgeStatus.port,
+      running: bridgeStatus.running,
+      url: bridgeStatus.running ? piBridgeUrl() : null,
+    }
+
+    // 会话：Pi 存 ~/.pi/agent/sessions/<cwd 分组>/*.jsonl（docs/sessions.md:50），按目录递归统计。
+    const sessRoot = join(homedir(), '.pi', 'agent', 'sessions')
+    let sessTotal = { count: 0, sizeBytes: 0 }
+    try {
+      for (const entry of readdirSync(sessRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const one = countPiJsonl(join(sessRoot, entry.name))
+        sessTotal = { count: sessTotal.count + one.count, sizeBytes: sessTotal.sizeBytes + one.sizeBytes }
+      }
+    } catch { /* 不存在 = 0 */ }
+
+    // 模型渠道：Pi 的自定义 provider 落 ~/.pi/agent/models.json（与 PiHub 同位置）。
+    // 渠道除了 id 还要给 baseUrl/api/models —— 前端「设为当前模型」需要具体 model id，
+    // 只给 id 的话下拉里没东西可点（第一版就是这么漏的）。
+    const channels = { path: PI_MODELS_PATH, exists: existsSync(PI_MODELS_PATH), ids: [], list: [] }
+    if (channels.exists) {
+      try {
+        const doc = JSON.parse(readFileSync(PI_MODELS_PATH, 'utf8'))
+        const bag = doc !== null && typeof doc === 'object' ? doc.providers : null
+        if (bag !== null && typeof bag === 'object') {
+          for (const cid of Object.keys(bag)) {
+            const one = bag[cid] !== null && typeof bag[cid] === 'object' ? bag[cid] : {}
+            const mids = Array.isArray(one.models)
+              ? one.models.map((m) => (typeof m === 'string' ? m : (m !== null && typeof m === 'object' ? m.id : ''))).filter((x) => typeof x === 'string' && x !== '')
+              : []
+            channels.ids.push(cid)
+            channels.list.push({ id: cid, name: typeof one.name === 'string' ? one.name : cid, baseUrl: typeof one.baseUrl === 'string' ? one.baseUrl : '', api: typeof one.api === 'string' ? one.api : '', models: mids, hasApiKey: typeof one.apiKey === 'string' && one.apiKey !== '' })
+          }
+        }
+      } catch { channels.ids = []; channels.list = [] }
+    }
+
+    // 默认模型：Pi 的 settings.json（docs/settings.md:13-14 的 defaultProvider/defaultModel）。
+    // 本机此前没有这个文件 → Pi 走 Automatic，落到列表里较前的 deepseek-v4-pro（用户实测报「每次都是 pro」）。
+    const settingsPath = join(homedir(), '.pi', 'agent', 'settings.json')
+    const piSettings = { path: settingsPath, exists: existsSync(settingsPath), defaultProvider: '', defaultModel: '' }
+    if (piSettings.exists) {
+      try {
+        const doc = JSON.parse(readFileSync(settingsPath, 'utf8'))
+        if (doc !== null && typeof doc === 'object') {
+          if (typeof doc.defaultProvider === 'string') piSettings.defaultProvider = doc.defaultProvider
+          if (typeof doc.defaultModel === 'string') piSettings.defaultModel = doc.defaultModel
+        }
+      } catch { /* 坏 JSON 就报空值，不猜也不修 */ }
+    }
+
+    send(res, {
+      ok: true,
+      providers,
+      mcp: { path: mcpPath, exists: mcpExists, servers: mcpServers },
+      bridge,
+      sessions: { dir: sessRoot, exists: existsSync(sessRoot), count: sessTotal.count, sizeBytes: sessTotal.sizeBytes },
+      channels,
+      settings: piSettings,
+      model: activePi,
+    })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 自定义模型渠道（P4.7）：写 ~/.pi/agent/models.json 的 providers.<id> ──
+// 格式依据 Pi docs/models.md:45「Configure a compatible endpoint」：
+//   { providers: { <id>: { baseUrl, api, apiKey, models: [{ id }] } } }
+// apiKey 支持 $ENV 插值；本接口不回显明文、不写日志，文件权限 0600，改动前留 .bak。
+const PI_CHANNEL_APIS = new Set([
+  'openai-completions', 'openai-responses', 'anthropic-messages',
+  'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream',
+])
+
+async function handlePiChannelCreate(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(id)) {
+      send(res, { ok: false, error: 'id 只能用字母/数字/连字符/下划线（首字符不能是符号），最长 40 位' }, 400)
+      return
+    }
+    const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : ''
+    if (!/^https?:\/\/\S+$/i.test(baseUrl)) {
+      send(res, { ok: false, error: 'baseUrl 必须以 http:// 或 https:// 开头' }, 400)
+      return
+    }
+    const api = typeof body.api === 'string' && body.api.trim() !== '' ? body.api.trim() : 'openai-completions'
+    if (!PI_CHANNEL_APIS.has(api)) {
+      send(res, { ok: false, error: `api 只能是：${[...PI_CHANNEL_APIS].join(' / ')}` }, 400)
+      return
+    }
+    const modelsRaw = Array.isArray(body.models) ? body.models : []
+    const models = []
+    for (const one of modelsRaw) {
+      const mid = typeof one === 'string' ? one.trim() : (one !== null && typeof one === 'object' && typeof one.id === 'string' ? one.id.trim() : '')
+      if (mid !== '' && !models.some((m) => m.id === mid)) models.push({ id: mid })
+    }
+    if (models.length === 0) {
+      send(res, { ok: false, error: '至少要给一个模型 id' }, 400)
+      return
+    }
+
+    // 读-改-写：保留文件里其它 provider 与未知字段（该文件用户可能手改过，不许整份覆盖）。
+    let doc = { providers: {} }
+    if (existsSync(PI_MODELS_PATH)) {
+      let cur = null
+      try { cur = JSON.parse(readFileSync(PI_MODELS_PATH, 'utf8')) } catch { cur = null }
+      if (cur === null || typeof cur !== 'object') {
+        send(res, { ok: false, error: `${PI_MODELS_PATH} 不是合法 JSON，已中止（未改动文件），请先手工修好` }, 409)
+        return
+      }
+      doc = cur
+    }
+    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+
+    const prev = doc.providers[id]
+    const entry = { baseUrl, api, models }
+    if (typeof body.name === 'string' && body.name.trim() !== '') entry.name = body.name.trim()
+    const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
+    // 留空 = 沿用已有 key（编辑场景）或走 $ENV 插值（新建场景），不把空串写进文件。
+    if (apiKey !== '') entry.apiKey = apiKey
+    else if (prev !== null && typeof prev === 'object' && prev.apiKey !== undefined) entry.apiKey = prev.apiKey
+    doc.providers[id] = entry
+
+    mkdirSync(dirname(PI_MODELS_PATH), { recursive: true })
+    if (existsSync(PI_MODELS_PATH)) {
+      try { copyFileSync(PI_MODELS_PATH, `${PI_MODELS_PATH}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断写入 */ }
+    }
+    const tmp = `${PI_MODELS_PATH}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
+    renameSync(tmp, PI_MODELS_PATH)
+    try { chmodSync(PI_MODELS_PATH, 0o600) } catch { /* best effort */ }
+
+    send(res, { ok: true, id, providers: Object.keys(doc.providers), hasApiKey: entry.apiKey !== undefined })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 默认模型切换（P4.8）：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel ──
+// 只改这两个键，其余未知键原样保留（settings.json 是 Pi 的公共配置，不止模型）。
+// 对新建会话生效；已在跑的 pi 子进程不受影响（它启动时就读定了）。
+async function handlePiModelSet(req, res) {
+  try {
+    const body = await readBody(req)
+    const provider = typeof body.provider === 'string' ? body.provider.trim() : ''
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    if (provider === '' || model === '') {
+      send(res, { ok: false, error: 'provider 和 model 都不能为空' }, 400)
+      return
+    }
+    if (!PI_PROVIDERS.includes(provider) && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(provider)) {
+      send(res, { ok: false, error: 'provider 不合法' }, 400)
+      return
+    }
+    const settingsPath = join(homedir(), '.pi', 'agent', 'settings.json')
+    let doc = {}
+    if (existsSync(settingsPath)) {
+      let cur = null
+      try { cur = JSON.parse(readFileSync(settingsPath, 'utf8')) } catch { cur = null }
+      if (cur === null || typeof cur !== 'object') {
+        send(res, { ok: false, error: `${settingsPath} 不是合法 JSON，已中止（未改动文件），请先手工修好` }, 409)
+        return
+      }
+      doc = cur
+    }
+    doc.defaultProvider = provider
+    doc.defaultModel = model
+
+    mkdirSync(dirname(settingsPath), { recursive: true })
+    if (existsSync(settingsPath)) {
+      try { copyFileSync(settingsPath, `${settingsPath}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断 */ }
+    }
+    const tmp = `${settingsPath}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
+    renameSync(tmp, settingsPath)
+    try { chmodSync(settingsPath, 0o600) } catch { /* best effort */ }
+
+    // 缓存作废：下次 piAvailableModels 会重新问 Pi（新默认模型可能带新清单）。
+    invalidatePiModelsCache()
+
+    send(res, { ok: true, provider, model, note: '对新建会话生效；已在跑的会话不受影响' })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 聊天桥启停：统一由 src/engine/pi-bridge.js 管理唯一 child 引用与端口。──
+async function handlePiBridge(req, res) {
+  try {
+    const body = await readBody(req)
+    const result = body.action === 'stop' ? await stopPiBridge() : await startPiBridge()
+    send(res, result, result.ok ? 200 : 500)
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 会话清理（P4.10）：删 ~/.pi/agent/sessions 下的 *.jsonl ──
+// 只删会话记录文件，不动 models.json / settings.json / mcp.json / auth.json。
+// 必须 confirm:true —— 这是不可撤销操作，接口层面再挡一次。
+async function handlePiCleanup(req, res) {
+  try {
+    const body = await readBody(req)
+    if (body.confirm !== true) {
+      send(res, { ok: false, error: '需要 confirm:true 才执行（不可撤销）' }, 400)
+      return
+    }
+    const sessRoot = join(homedir(), '.pi', 'agent', 'sessions')
+    let removed = 0
+    let freedBytes = 0
+    const walk = (dir) => {
+      let entries = []
+      try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+      for (const entry of entries) {
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) { walk(full); continue }
+        if (!entry.name.endsWith('.jsonl')) continue
+        try {
+          const st = statSync(full)
+          unlinkSync(full)
+          removed += 1
+          freedBytes += st.size
+        } catch { /* 单个文件失败不阻断整体 */ }
+      }
+    }
+    walk(sessRoot)
+    send(res, { ok: true, removed, freedBytes })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// ── Pi 删除自定义渠道（P4.10）：从 models.json 的 providers 里摘掉一个 id ──
+// 只允许删自定义渠道 —— 内置 provider（deepseek 等）不在 models.json 的 providers 里，
+// 天然删不到，这里无需额外白名单。
+async function handlePiChannelDelete(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') { send(res, { ok: false, error: '缺少 id' }, 400); return }
+    if (!existsSync(PI_MODELS_PATH)) { send(res, { ok: false, error: `${PI_MODELS_PATH} 不存在，无可删` }, 404); return }
+    let doc = null
+    try { doc = JSON.parse(readFileSync(PI_MODELS_PATH, 'utf8')) } catch { doc = null }
+    if (doc === null || typeof doc !== 'object' || doc.providers === null || typeof doc.providers !== 'object') {
+      send(res, { ok: false, error: 'models.json 结构不对，已中止（未改动文件）' }, 409)
+      return
+    }
+    if (doc.providers[id] === undefined) { send(res, { ok: false, error: `没有渠道 ${id}` }, 404); return }
+    delete doc.providers[id]
+    try { copyFileSync(PI_MODELS_PATH, `${PI_MODELS_PATH}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断 */ }
+    const tmp = `${PI_MODELS_PATH}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
+    renameSync(tmp, PI_MODELS_PATH)
+    try { chmodSync(PI_MODELS_PATH, 0o600) } catch { /* best effort */ }
+    send(res, { ok: true, id, providers: Object.keys(doc.providers) })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// 协议选项：由后端下发，前端不写死。Codex 只有两种（completions 需经本地桥翻译），
+// Pi 直连六种原生 api，没有桥的概念 —— 写死两选项会让 Pi 用户缺 anthropic/gemini。
+const CODEX_WIRE_OPTIONS = [
+  { value: 'responses', label: 'responses（直连）', bridged: false },
+  { value: 'completions', label: 'chat（经本地桥）', bridged: true },
+]
+const PI_WIRE_OPTIONS = [
+  { value: 'openai-completions', label: 'OpenAI 兼容（chat completions）', bridged: false },
+  { value: 'openai-responses', label: 'OpenAI Responses', bridged: false },
+  { value: 'anthropic-messages', label: 'Anthropic Messages', bridged: false },
+  { value: 'google-generative-ai', label: 'Google Generative AI', bridged: false },
+  { value: 'azure-openai-responses', label: 'Azure OpenAI Responses', bridged: false },
+  { value: 'bedrock-converse-stream', label: 'AWS Bedrock Converse', bridged: false },
+]
+
+// ── Pi 引擎下的 providers/models 兼容层（P4.11）──
+// 目的：前端 ProviderCard 一行都不改。把 Pi 的 models.json + settings.json 映射成
+// Codex 的 { ok, active, providers:[{id,name,baseUrl,model,apiKey:{configured,preview}}] }。
+// 这样「编辑 / 删除 / 填 Key / 拉模型 / 切当前」全部沿用既有实现 —— 不再维护第二套 UI。
+const PI_SETTINGS_PATH = join(homedir(), '.pi', 'agent', 'settings.json')
+
+function readPiJson(path) {
+  if (!existsSync(path)) return {}
+  try {
+    const doc = JSON.parse(readFileSync(path, 'utf8'))
+    return doc !== null && typeof doc === 'object' ? doc : {}
+  } catch { return {} }
+}
+
+// 写路径专用：区分「文件不存在」与「解析失败」。
+// readPiJson 把两者都折成 {}，拿它当写基线 = 坏 JSON 时把用户整份配置覆盖成空
+// （紫东审查 P0-2/P0-3；同一个文件里 channel/model 两个入口早已是 409 中止，这里对齐）。
+// 返回 null 时**已发过响应**，调用方只需 `if (doc === null) return`。
+function readPiJsonForWrite(path, res) {
+  if (!existsSync(path)) return {}
+  let raw = ''
+  try { raw = readFileSync(path, 'utf8') } catch (e) {
+    send(res, { ok: false, error: `读不到 ${path}：${errMsg(e)}` }, 500)
+    return null
+  }
+  let doc = null
+  try { doc = JSON.parse(raw) } catch {
+    send(res, { ok: false, error: `${path} 不是合法 JSON，已中止（未改动文件）。请先手工修好再加。` }, 409)
+    return null
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    send(res, { ok: false, error: `${path} 顶层不是对象，已中止（未改动文件）。` }, 409)
+    return null
+  }
+  return doc
+}
+
+function writePiJson(path, doc) {
+  mkdirSync(dirname(path), { recursive: true })
+  if (existsSync(path)) {
+    try {
+      const backup = `${path}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`
+      copyFileSync(path, backup)
+    } catch { /* best effort */ }
+  }
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+  writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
+  renameSync(tmp, path)
+  try { chmodSync(path, 0o600) } catch { /* best effort */ }
+}
+
+// wireApi（Codex 术语）↔ api（Pi 术语）
+// 接受三种输入：Codex 的 responses/completions，或 Pi 自己的 api 值（原样直通）。
+const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream'])
+function piApiFromWire(wire) {
+  if (PI_API_SET.has(wire)) return wire
+  return wire === 'responses' ? 'openai-responses' : 'openai-completions'
+}
+
+function piWireFromApi(api) {
+  return api === 'openai-responses' ? 'responses' : 'chat'
+}
+
+/** Pi 快照 → Codex 形状。内置只预设 deepseek（用户要求），其余全在 models.json 里。 */
+/** 模型名不该长成 API Key 的样子（智谱是 id.secret，49 字符）。
+ *  用户实测把 key 填进「模型名」，结果被当模型名写进 models.json 并显示在面板上。 */
+function piLooksLikeApiKey(v) {
+  return typeof v === 'string' && /^[A-Za-z0-9]{16,}\.[A-Za-z0-9]{10,}$/.test(v)
+}
+
+function piRejectKeyAsModel(value) {
+  return piLooksLikeApiKey(value)
+    ? '这看起来是 API Key，不是模型名 —— Key 请填在「API Key」字段（留空=不改）'
+    : ''
+}
+
+function piProvidersSnapshot() {
+  const modelsDoc = readPiJson(PI_MODELS_PATH)
+  const bag = modelsDoc.providers !== null && typeof modelsDoc.providers === 'object' ? modelsDoc.providers : {}
+  const settings = readPiJson(PI_SETTINGS_PATH)
+  const active = typeof settings.defaultProvider === 'string' ? settings.defaultProvider : ''
+  const curModel = typeof settings.defaultModel === 'string' ? settings.defaultModel : ''
+  const kr = resolvePiProvider()
+  // 内置 deepseek 可能与 models.json 里的 providers.deepseek 同时存在：
+  // 后者是我们自己写 key/baseUrl 的落点（piProviderKey 就写这儿）。
+  // 若不合并，面板会出现两条 DeepSeek（用户实测），必须并进内置行、且遍历时跳过。
+  const builtin = bag.deepseek !== null && typeof bag.deepseek === 'object' ? bag.deepseek : {}
+  const builtinKey = typeof builtin.apiKey === 'string' ? builtin.apiKey : ''
+  const providers = [{
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseUrl: typeof builtin.baseUrl === 'string' && builtin.baseUrl !== '' ? builtin.baseUrl : 'https://api.deepseek.com',
+    model: active === 'deepseek' ? curModel : '',
+    apiKey: {
+      configured: (kr !== null && kr.id === 'deepseek') || builtinKey !== '' || Boolean(process.env.DEEPSEEK_API_KEY),
+      preview: builtinKey !== '' ? '已配置' : '',
+    },
+  }]
+  for (const cid of Object.keys(bag)) {
+    if (cid === 'deepseek') continue
+    const one = bag[cid] !== null && typeof bag[cid] === 'object' ? bag[cid] : {}
+    const key = typeof one.apiKey === 'string' ? one.apiKey : ''
+    providers.push({
+      id: cid,
+      name: typeof one.name === 'string' && one.name !== '' ? one.name : cid,
+      baseUrl: typeof one.baseUrl === 'string' ? one.baseUrl : '',
+      // 非激活渠道显示它自己的第一个模型（不是空）：编辑表单用它预填，
+      // 预填空会让「随手点保存」把清单清掉（P4.19 真实事故）。
+      model: active === cid ? curModel : (Array.isArray(one.models) && one.models.length > 0
+        ? String((typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id)) || '')
+        : ''),
+      apiKey: { configured: key !== '', preview: key === '' ? '' : '已配置' },
+    })
+  }
+  return { providers, active, channels: bag, modelsDoc, settings }
+}
+
+function piChannelApiOf(id, snap) {
+  const one = snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
+  return { one, api: typeof one.api === 'string' ? one.api : 'openai-completions' }
+}
+
+async function piProvidersList(_req, res) {
+  try {
+    const snap = piProvidersSnapshot()
+    send(res, { ok: true, active: snap.active, providers: snap.providers, wireApiOptions: PI_WIRE_OPTIONS })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderAdd(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(id)) {
+      send(res, { ok: false, error: '提供方 id 只能用字母/数字/连字符/下划线（首字符不能是符号）' }, 400)
+      return
+    }
+    if (id === 'deepseek') {
+      send(res, { ok: false, error: 'deepseek 是内置预设，不能重复添加；要改模型请编辑该行' }, 409)
+      return
+    }
+    const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : ''
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    // 只要求 baseUrl：知道地址就能先建渠道，模型留空 → 展开该行填 Key →
+    // 点「获取模型列表」从远端拉再选。强制先填模型名等于逼用户背服务商的模型 id。
+    if (baseUrl === '') {
+      send(res, { ok: false, error: 'baseUrl 必填（模型可留空，建好后点「获取模型列表」选）' }, 400)
+      return
+    }
+    const keyAsModel = piRejectKeyAsModel(model)
+    if (keyAsModel !== '') {
+      send(res, { ok: false, error: keyAsModel }, 400)
+      return
+    }
+    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
+    if (doc === null) return
+    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+    if (doc.providers[id] !== undefined) {
+      send(res, { ok: false, error: `提供方 ${id} 已存在` }, 409)
+      return
+    }
+    const entry = {
+      name: typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim() : id,
+      baseUrl,
+      api: piApiFromWire(typeof body.wireApi === 'string' ? body.wireApi : 'openai-completions'),
+      models: model !== '' ? [{ id: model }] : [],
+    }
+    if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') entry.apiKey = body.apiKey.trim()
+    doc.providers[id] = entry
+    writePiJson(PI_MODELS_PATH, doc)
+    invalidatePiModelsCache()
+    send(res, { ok: true, id, providers: Object.keys(doc.providers) })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderKey(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
+    if (id === '') { send(res, { ok: false, error: '缺少 id' }, 400); return }
+    if (apiKey === '') { send(res, { ok: false, error: 'apiKey 不能为空' }, 400); return }
+    // 内置 deepseek 也写 models.json：Pi 支持用 models.json 覆盖原生 provider 的凭据，
+    // 只写 apiKey 不写 models 时会保留内置模型清单（docs/custom-provider.md「Redirect an existing provider」）。
+    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
+    if (doc === null) return
+    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+    const prev = doc.providers[id] !== null && typeof doc.providers[id] === 'object' ? doc.providers[id] : {}
+    doc.providers[id] = { ...prev, apiKey }
+    writePiJson(PI_MODELS_PATH, doc)
+    invalidatePiModelsCache()
+    send(res, { ok: true, id, preview: '已配置' })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderActive(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') { send(res, { ok: false, error: '缺少 id' }, 400); return }
+    const snap = piProvidersSnapshot()
+    // 写基线必须严格读：snap.settings 来自宽松读，坏 JSON 时是 {}，
+    // 直接写回会把用户 settings.json 里其它键（不止 defaultProvider/Model）全丢掉（P0-3）。
+    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
+    if (settings === null) return
+    settings.defaultProvider = id
+    // 切提供方时把 defaultModel 也落到该提供方的第一个模型，否则 Pi 会拿旧 model 配新 provider。
+    if (id === 'deepseek') {
+      if (typeof settings.defaultModel !== 'string' || settings.defaultModel === '') settings.defaultModel = 'deepseek-flash'
+    } else {
+      const one = snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
+      const first = Array.isArray(one.models) && one.models.length > 0
+        ? (typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id))
+        : ''
+      if (typeof first === 'string' && first !== '') settings.defaultModel = first
+    }
+    writePiJson(PI_SETTINGS_PATH, settings)
+    invalidatePiModelsCache()
+    send(res, { ok: true, active: id, model: typeof settings.defaultModel === 'string' ? settings.defaultModel : '' })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderDelete(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === 'deepseek') {
+      send(res, { ok: false, error: 'deepseek 是内置预设，不能删除' }, 400)
+      return
+    }
+    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
+    if (doc === null) return
+    const bag = doc.providers !== null && typeof doc.providers === 'object' ? doc.providers : {}
+    if (bag[id] === undefined) { send(res, { ok: false, error: `没有提供方 ${id}` }, 404); return }
+    delete bag[id]
+    doc.providers = bag
+    writePiJson(PI_MODELS_PATH, doc)
+    // 删掉的正好是当前激活的 → 回落到 deepseek，避免 settings 指向不存在的 provider。
+    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
+    if (settings === null) return
+    if (settings.defaultProvider === id) {
+      settings.defaultProvider = 'deepseek'
+      writePiJson(PI_SETTINGS_PATH, settings)
+    }
+    invalidatePiModelsCache()
+    send(res, { ok: true, id, providers: Object.keys(bag) })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderUpdate(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    if (id === '') { send(res, { ok: false, error: '缺少 id' }, 400); return }
+    const snap = piProvidersSnapshot()
+    if (id !== 'deepseek' && snap.channels[id] === undefined) {
+      send(res, { ok: false, error: `没有提供方 ${id}` }, 404)
+      return
+    }
+    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
+    if (doc === null) return
+    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+    const prev = doc.providers[id] !== null && typeof doc.providers[id] === 'object' ? doc.providers[id] : {}
+    const entry = { ...prev }
+    if (typeof body.name === 'string' && body.name.trim() !== '') entry.name = body.name.trim()
+    if (typeof body.baseUrl === 'string' && body.baseUrl.trim() !== '') entry.baseUrl = body.baseUrl.trim()
+    if (typeof body.wireApi === 'string' && body.wireApi !== '') entry.api = piApiFromWire(body.wireApi)
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    const keyAsModel = piRejectKeyAsModel(model)
+    if (keyAsModel !== '') {
+      send(res, { ok: false, error: keyAsModel }, 400)
+      return
+    }
+    if (model !== '') {
+      const existing = Array.isArray(prev.models)
+        ? prev.models.map((m) => String((typeof m === 'string' ? m : (m && m.id)) || ''))
+        : []
+      // 内置 provider（deepseek 等）在 models.json 里通常只有 { apiKey } 覆盖层、没有 models。
+      // 此时若写 models:[{id}]，等于把 Pi 的**内置清单**在覆盖层里砍成 1 个（紫东审查 P0-5）。
+      // 所以：内置且原本无 models → 不生成 models 字段，只让 defaultModel 生效。
+      const isBuiltin = PI_PROVIDERS.includes(id)
+      const hasOwnModels = Array.isArray(prev.models)
+      if (isBuiltin && !hasOwnModels) {
+        // 保留覆盖层原样（可能只有 apiKey/baseUrl），不添加 models
+      } else if (!existing.includes(model)) {
+        entry.models = [{ id: model }]
+      }
+    }
+    if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') entry.apiKey = body.apiKey.trim()
+    doc.providers[id] = entry
+    writePiJson(PI_MODELS_PATH, doc)
+    // 改了当前激活项的模型 → 同步 defaultModel，否则 Pi 还用旧 model 名。
+    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
+    if (settings === null) return
+    if (settings.defaultProvider === id && model !== '') {
+      settings.defaultModel = model
+      writePiJson(PI_SETTINGS_PATH, settings)
+    }
+    invalidatePiModelsCache()
+    send(res, { ok: true, id })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piModels(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+
+    if (id === '' || id === 'deepseek') {
+      // 内置：问 Pi 自己（RPC get_available_models），拿不到给空数组，不编造。
+      // ⚠️ 必须返回字符串数组：ProviderCard 用 h('option', { value: m }, m) 直接渲染元素，
+      // 传对象会让 React 抛 "Objects are not valid as a React child"，整个设置面板被弹掉（真实事故）。
+      // ⚠️ get_available_models 返回的是**全局**清单（含所有 provider 的模型）。
+      // 实测：deepseek 行会混进 zhi 的 glm-5.3 —— 必须按每项的 provider 字段过滤，
+      // 否则「拉 DeepSeek 的模型」等于「列出 Pi 认识的所有模型」（P4.20 真实事故）。
+      const want = id === '' ? ((resolvePiProvider() || {}).id || 'deepseek') : id
+      const list = await piAvailableModels().catch(() => null)
+      const raw = Array.isArray(list) ? list : []
+      const models = raw
+        .filter((m) => m !== null && typeof m === 'object' && typeof m.provider === 'string' && m.provider === want)
+        .map((m) => String(m.id === undefined ? '' : m.id))
+        .filter((x) => x !== '')
+      send(res, { ok: true, id: want, models })
+      return
+    }
+
+    const snap = piProvidersSnapshot()
+    const one = snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
+    const baseUrl = typeof one.baseUrl === 'string' ? one.baseUrl.trim() : ''
+    const apiKey = typeof one.apiKey === 'string' ? one.apiKey.trim() : ''
+    const localModels = Array.isArray(one.models)
+      ? one.models
+          .map((m) => (typeof m === 'string' ? m : (m !== null && typeof m === 'object' && m.id !== undefined ? String(m.id) : '')))
+          .filter((x) => x !== '')
+      : []
+
+    // 从远端拉：复用 Codex 的 modelsUrl / bigmodelAuxModelsUrl / extractModels（三者都返回字符串），
+    // 不再另写一套解析 —— 上一版就是另写才把对象数组漏进了 option。
+    if (typeof fetch === 'function' && baseUrl !== '' && apiKey !== '') {
+      const urls = [modelsUrl(baseUrl)]
+      const auxUrl = bigmodelAuxModelsUrl(baseUrl)
+      if (auxUrl !== null && auxUrl !== urls[0]) urls.push(auxUrl)
+      const models = []
+      let primaryError = ''
+      for (let k = 0; k < urls.length; k += 1) {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 15000)
+        try {
+          const r = await fetch(urls[k], {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+            signal: controller.signal,
+          })
+          const text = await r.text()
+          clearTimeout(timer)
+          let json = null
+          try { json = JSON.parse(text) } catch { json = null }
+          if (json !== null) {
+            for (const mid of extractModels(json)) {
+              if (typeof mid === 'string' && mid !== '' && !models.includes(mid)) models.push(mid)
+            }
+          }
+          // 不 break：智谱同时有两个端点 —— /api/v1/models 只回 3 个旧模型，
+          // /api/coding/paas/v4/models 回完整清单。拿到第一个就停会少一半（用户实测 3 vs 11）。
+          // 两个都拉、合并去重，宁多不丢。
+          // 只在「还没拿到任何模型」时记录首个错误 —— 用于两个端点都失败时的回落提示。
+          if (models.length === 0 && primaryError === '') {
+            primaryError = r.ok ? '接口成功但未解析出模型（可能不是 OpenAI 兼容的 /models）' : `HTTP ${r.status}`
+          }
+        } catch (e) {
+          clearTimeout(timer)
+          if (k === 0) primaryError = errMsg(e)
+        }
+      }
+      if (models.length > 0) {
+        send(res, { ok: true, id, models, sources: urls })
+        return
+      }
+      // 远端拉不到 → 回落本地已配，并把失败原因说清楚（不假装成功、不编模型名）。
+      send(res, {
+        ok: true,
+        id,
+        models: localModels,
+        note: `远端拉取失败（${primaryError === '' ? '未知原因' : primaryError}），下面显示 models.json 里已配置的模型`,
+      })
+      return
+    }
+
+    // No remote lookup is possible until both baseUrl and apiKey are configured.
+    const note = baseUrl === ''
+      ? '未配置 baseUrl，无法从远端拉取'
+      : (apiKey === '' ? '未配置 apiKey，无法从远端拉取' : '')
+    send(res, { ok: true, id, models: localModels, note })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProviderModel(req, res) {
+  try {
+    const body = await readBody(req)
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    if (id === '' || model === '') { send(res, { ok: false, error: 'id 和 model 都必填' }, 400); return }
+    const keyAsModel = piRejectKeyAsModel(model)
+    if (keyAsModel !== '') { send(res, { ok: false, error: keyAsModel }, 400); return }
+    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
+    if (settings === null) return
+    settings.defaultProvider = id
+    settings.defaultModel = model
+    writePiJson(PI_SETTINGS_PATH, settings)
+    invalidatePiModelsCache()
+    send(res, { ok: true, id, model })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function piProvidersRoot(req, res) {
+  if (req.method === 'POST') return piProviderAdd(req, res)
+  return piProvidersList(req, res)
 }
 
 // 兼容旧面板：POST { provider, key } 等价于给该预设提供方设置 apiKey。
@@ -1223,7 +2009,7 @@ async function handleKey(req, res) {
 async function handleProvidersList(_req, res) {
   try {
     const doc = loadKeyring()
-    send(res, { ok: true, active: doc.active, providers: doc.providers.map(providerView) })
+    send(res, { ok: true, active: doc.active, providers: doc.providers.map(providerView), wireApiOptions: CODEX_WIRE_OPTIONS })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -1258,6 +2044,7 @@ async function handleProviderAdd(req, res) {
 
 // /api/providers 同 path 两个方法：GET 列表 / POST 新增，其余 405。
 async function handleProvidersRoot(req, res) {
+  if (activeEngineId() === 'pi') return piProvidersRoot(req, res)
   if (req.method === 'POST') return handleProviderAdd(req, res)
   if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') return handleProvidersList(req, res)
   return send(res, { ok: false, error: 'method not allowed' }, 405)
@@ -1265,6 +2052,7 @@ async function handleProvidersRoot(req, res) {
 
 // POST /providers/key：设置指定提供方的 apiKey（文件保持 0600）。
 async function handleProviderKey(req, res) {
+  if (activeEngineId() === 'pi') return piProviderKey(req, res)
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
@@ -1282,6 +2070,7 @@ async function handleProviderKey(req, res) {
 
 // POST /providers/active：切换激活并提供 config.toml（写前备份一次）。
 async function handleProviderActive(req, res) {
+  if (activeEngineId() === 'pi') return piProviderActive(req, res)
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
@@ -1309,6 +2098,7 @@ async function handleProviderActive(req, res) {
 // POST /providers/delete：核心默认（deepseek/zhipu）不可删；自定义提供方均可删。删除 active 时回落并同步 config.toml。
 const PROTECTED_IDS = new Set(['deepseek', 'zhipu'])
 async function handleProviderDelete(req, res) {
+  if (activeEngineId() === 'pi') return piProviderDelete(req, res)
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
@@ -1340,6 +2130,7 @@ async function handleProviderDelete(req, res) {
 // POST /providers/update：编辑既有提供方。apiKey 省略 = 不改，其余字段只更新出现的。
 // 该提供方为 active 且 baseUrl/wireApi/model 有变化时重写 config.toml（这些值会影响 config.toml）。
 async function handleProviderUpdate(req, res) {
+  if (activeEngineId() === 'pi') return piProviderUpdate(req, res)
   try {
     const body = await readBody(req)
     const ignored = Object.keys(body)
@@ -1442,6 +2233,7 @@ function extractModels(json) {
 
 // POST /models：body { id }（缺省 = active）。带 Bearer 拉取该提供方模型清单。
 async function handleModels(req, res) {
+  if (activeEngineId() === 'pi') return piModels(req, res)
   try {
     if (typeof fetch !== 'function') {
       return send(res, { ok: false, error: '当前 Node 运行时不支持 fetch（需要 Node 18+）' })
@@ -1507,6 +2299,7 @@ async function handleModels(req, res) {
 // POST /model：body { id, model }（id 缺省 = active）。写入 provider.model；
 // 若该提供方正是 active，则同步重写 config.toml，使引擎立刻用上新模型。
 async function handleProviderModel(req, res) {
+  if (activeEngineId() === 'pi') return piProviderModel(req, res)
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' && body.id.trim() !== '' ? body.id.trim() : ''
@@ -1727,16 +2520,18 @@ async function handleCleanup(req, res) {
 // 但用户点取消后必须立刻看到结果 —— 所以视图层把「意图已成立 + 事实上仍在跑」映射成
 // 对外的 cancelled。内部 task.status 在子进程真正退出前保持 running。
 function viewStatus(task) {
-  if (task.cancelled === true && task.status === 'running') return 'cancelled'
+  if (rtOf(task).isCancelled() && task.status === 'running') return 'cancelled'
   return task.status
 }
 
 function taskView(task) {
+  // P3.6：视图字段统一从 runtime.snapshot() 取，不再直读 task.<字段>。
+  const snap = rtOf(task).snapshot()
   const view = {
     id: task.id,
     kind: task.kind === 'review' ? 'review' : 'task',
-    status: viewStatus(task),
-    exitCode: task.exitCode,
+    status: snap.status,
+    exitCode: snap.exitCode,
     startedAt: task.startedAt,
     endedAt: task.endedAt,
     workdir: task.workdir,
@@ -1744,19 +2539,19 @@ function taskView(task) {
   }
   // 实时进度可见性：exec 模式看 liveBytes（过程流字节数，在涨=在动），
   // appserver 模式另加 progress（归一化事件）。
-  if (task.live !== undefined && task.live !== null) view.liveBytes = task.live.bytes ?? 0
-  if (task.mode === 'appserver') {
+  if (snap.liveBytes !== undefined) view.liveBytes = snap.liveBytes
+  if (snap.mode === 'appserver') {
     // T5：app-server 模式的实时进度（归一化事件，最近 20 条），供界面做流式展示。
     // progress 封闭投影（2026-10-28）：对外只发 {kind, text, at} 三字段。事件里其余的
     // 引擎专有形状（tool / usage / done / meta.eventType / itemId / contentIndex /
     // summaryIndex / willRetry）一律不外发 —— 那是 Codex app-server 的词表，第二个引擎
     // 一进 progress，消费端就得按引擎分支。排障用的原文见 task.engineEvents（不进本视图）。
     view.mode = 'appserver'
-    view.progress = projectProgress(task.progress)
+    view.progress = projectProgress(snap.progress)
   }
   // P1.1：活性时间 —— 与看门狗判据用同一个值（task.activityAt：事件心跳 ∨ 产物 mtime）。
   // stuckSuspect 是看门狗「上次采样」的结论，二者可能短暂不一致（例如产物被清理后归 0）。
-  view.activityAt = Number.isFinite(task.activityAt) ? task.activityAt : 0
+  view.activityAt = snap.activityAt
   if (view.kind === 'review') {
     // 互审进度：第 N/上限轮 + 每轮 {issues,verdict} 全量（issues 体量小，列表也带上，展开即见）。
     view.round = Number.isInteger(task.round) ? task.round : 0
@@ -1785,13 +2580,13 @@ function taskView(task) {
     // ① 接力链：上一轮复核任务 id（谱系可追）。
     if (typeof task.prevId === 'string' && task.prevId !== '') view.prevId = task.prevId
   }
-  if (task.stuckSuspect === true) view.stuckSuspect = true
-  if (task.lastSignal) view.lastSignal = task.lastSignal
+  if (snap.stuckSuspect) view.stuckSuspect = true
+  if (snap.lastSignal) view.lastSignal = snap.lastSignal
   // ① 对账 tick 判失联的原因（'process-gone' | 'pid-reused'）——不暴露就没法验收探活。
-  if (typeof task.reconcileLost === 'string' && task.reconcileLost !== '') view.reconcileLost = task.reconcileLost
-  if (typeof task.error === 'string' && task.error !== '') view.error = task.error
+  if (typeof snap.reconcileLost === 'string' && snap.reconcileLost !== '') view.reconcileLost = snap.reconcileLost
+  if (typeof snap.error === 'string' && snap.error !== '') view.error = snap.error
   // appserver 模式的失败原因记在 appError（原先不外发，外部无从诊断）。
-  if (view.error === undefined && typeof task.appError === 'string' && task.appError !== '') view.error = task.appError
+  if (view.error === undefined && typeof snap.appError === 'string' && snap.appError !== '') view.error = snap.appError
   return view
 }
 
@@ -1820,7 +2615,16 @@ const runtimes = new WeakMap()
 function rtOf(task) {
   let rt = runtimes.get(task)
   if (rt === undefined) {
-    rt = createRuntime(task, { notify, readProcStartTime })
+    const eng = engineOf(task)
+    const deps = { notify, readProcStartTime }
+    if (eng.id === 'pi') {
+      const usable = resolvePiProvider(typeof task.piProvider === 'string' ? task.piProvider : '')
+      if (usable !== null) deps.env = { [`${usable.id.toUpperCase()}_API_KEY`]: usable.key }
+      deps.provider = typeof task.piProvider === 'string' && task.piProvider !== '' ? task.piProvider : usable?.id
+      deps.model = typeof task.piModel === 'string' && task.piModel !== '' ? task.piModel : usable?.model
+      if (usable === null) noteErr('pi-env', new Error('没有可用的 Pi provider/API Key'))
+    }
+    rt = eng.create(task, deps)
     runtimes.set(task, rt)
   }
   return rt
@@ -1894,7 +2698,7 @@ function finalizeJob(task, exitCode, status, extra) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
   stopWatchdog(task)
   // exitCode 省略 = 保留调用方已记的值：复核每轮在 runReview 里自记 exitCode，不能覆盖。
-  if (exitCode !== undefined) task.exitCode = exitCode
+  if (exitCode !== undefined) rtOf(task).setExitCode(exitCode)
   task.status = status
   if (extra) {
     for (const [k, v] of Object.entries(extra)) {
@@ -1904,12 +2708,13 @@ function finalizeJob(task, exitCode, status, extra) {
   }
   // 读 -o 输出（头尾截断），成功才覆盖：复核轮文件在 readReviewOut 里逐轮已删、
   // 工单也可能没生成输出文件 —— 读不到时保留现有 output，这是常态不是错误。
-  try { task.output = readHeadTail(task.outPath, TASK_OUTPUT_CLIP) } catch { /* 保留现有 output */ }
+  const jobOutPath = rtOf(task).getOutPath()
+  try { task.output = readHeadTail(jobOutPath, TASK_OUTPUT_CLIP) } catch { /* 保留现有 output */ }
   // A 方案（2026-10-17 用户定）：过程流 `.live` 同样在收尾时删除 —— ephemeral 工单跑完
   // 不在磁盘留任何输出。要事后回看过程就勾「保留会话」（ephemeral:false，走 rollout）。
   // 复核被熔断时本轮 -o 文件还在（readReviewOut 没跑到），这里一并回收，不再单靠 keepDays。
-  try { unlinkSync(task.outPath) } catch { /* 文件可能本就没生成/已被逐轮清理，忽略 */ }
-  try { unlinkSync(`${task.outPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
+  try { unlinkSync(jobOutPath) } catch { /* 文件可能本就没生成/已被逐轮清理，忽略 */ }
+  try { unlinkSync(`${jobOutPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
   // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
   // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
   try { appendConsultBlock(task) } catch (e) { noteErr('consult', e) }
@@ -1939,7 +2744,8 @@ function notify(text, title = '第二引擎') {
 
 function notifyTask(task) {
   const label = task.kind === 'review' ? '复核' : '任务'
-  const exit = Number.isInteger(task.exitCode) ? ` (exit ${task.exitCode})` : ''
+  const exCode = rtOf(task).getExitCode()
+  const exit = Number.isInteger(exCode) ? ` (exit ${exCode})` : ''
   let text = `${label} ${task.id.slice(-6)} ${task.status}${exit}`
   // 阻断硬档（2026-10-26）：通知层就要醒目——这是「必须停手」档，不能只靠 taskView 查。
   if (task.kind === 'review' && task.stopReason === 'blocked') {
@@ -2241,7 +3047,6 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     startedAt: Date.now(),
     endedAt: null,
     workdir,
-    child: null,
     outPath,
     cancelled: false,
     mode: 'appserver',
@@ -2259,8 +3064,7 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     onEvent: (evt) => {
       // progress 封闭投影（2026-10-28）：不再 `{...evt}` 展开 —— 原先除 meta.raw 之外的
       // 引擎专有字段（tool/usage/done/meta.eventType/itemId/…）会整条漏进对外响应。
-      task.progress.push(progressEntry(evt, Date.now()))
-      if (task.progress.length > PROGRESS_LIMIT) task.progress.shift()
+      rtOf(task).pushProgress(progressEntry(evt, Date.now()), PROGRESS_LIMIT)
       // meta 原文另存一份给排障（task.engineEvents）：不进 taskView，只在直读 tasks Map 的
       // 诊断路径可见。meta.raw 是原始 JSON-RPC 帧（可能很大）且是模型/工具正文的副本
       // （-o 文件与 output 字段已有），故同样剔除；其余（eventType/itemId/status/…）保留。
@@ -2291,28 +3095,28 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
       rtOf(task).heartbeat()
     },
   })
-  task.child = handle.child
-  task.app = handle
+  rtOf(task).setChild(handle.child)
+  rtOf(task).setApp(handle)
   tasks.set(id, task)
   pruneTasks()
   startWatchdog(task)
 
   handle.run.catch((e) => {
-    task.appError = errMsg(e)
+    rtOf(task).setAppError(errMsg(e))
     // P1.2（2026-10-28 补漏）：取消在 appserver 分支走的是 handle.done 的 reject，
     // 不经过 exec 的 child.on('exit')。三处收尾都要认 task.cancelled，否则取消仍落 'error'。
-    const cancelled = task.cancelled === true
+    const cancelled = rtOf(task).isCancelled()
     if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
   })
   handle.done
     .then((r) => {
-      const cancelled = task.cancelled === true
+      const cancelled = rtOf(task).isCancelled()
       const ok = r.status === 'completed' && !cancelled
       if (finalizeTask(task, cancelled ? -1 : (ok ? 0 : 1), cancelled ? 'cancelled' : (ok ? 'done' : 'error')) && !cancelled) void notifyTask(task)
     })
     .catch((e) => {
-      task.appError = errMsg(e)
-      const cancelled = task.cancelled === true
+      rtOf(task).setAppError(errMsg(e))
+      const cancelled = rtOf(task).isCancelled()
       if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
     })
 
@@ -2332,6 +3136,27 @@ async function handleTaskCreate(req, res) {
     if (!existsSync(workdir)) {
       return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
     }
+    // P4.2（2026-10-28）：按引擎分流。Pi 走自己的 provider（env/models.json），
+    // 不依赖 Codex 的 keyring，所以这一支必须在 loadKeyring 之前。
+    const engineId = (typeof body.engine === 'string' && body.engine !== '') ? body.engine : activeEngineId()
+    if (engineId === 'pi') {
+      const requestedPiProvider = typeof body.provider === 'string' ? body.provider.trim() : ''
+      const piProvider = resolvePiProvider(requestedPiProvider)
+      if (piProvider === null) {
+        return send(res, { ok: false, error: '没有可用的 Pi provider/API Key；请先在第二引擎设置中配置 provider' }, 400)
+      }
+      const piId = newId()
+      return startPiTask({
+        res,
+        id: piId,
+        outPath: join(CODEX_DIR, `task-${piId}.out`),
+        workdir,
+        prompt,
+        model: typeof body.model === 'string' ? body.model : undefined,
+        provider: typeof body.provider === 'string' ? body.provider : undefined,
+      })
+    }
+
     const doc = loadKeyring()
     const active = doc.providers.find((p) => p.id === doc.active)
     if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
@@ -2409,7 +3234,6 @@ async function handleTaskCreate(req, res) {
       startedAt: Date.now(),
       endedAt: null,
       workdir,
-      child,
       outPath,
       live,
       cancelled: false,
@@ -2417,17 +3241,20 @@ async function handleTaskCreate(req, res) {
       }
     tasks.set(id, task)
     pruneTasks()
+    // P3.3 修正（2026-10-28）：exec 工单的 child 原先只在对象字面量里，没交给 runtime ——
+    // 导致 handleTaskCancel 的 rtOf(task).kill() 拿到 null，进程杀不死、终态永不落定。
+    rtOf(task).setChild(child)
     startWatchdog(task)
 
     child.on('exit', (code, signal) => {
       // 被取消的任务固定 cancelled/-1；其余按真实退出码判定。
       // 2026-10-28（P1.2）：取消是独立终态，不再与失败混用 'error' —— 客户端
       // lib/client.js:1349/:1509 已把 'cancelled' 当合法值（显示「已取消」）。
-      const cancelled = task.cancelled === true
+      const cancelled = rtOf(task).isCancelled()
       const exitCode = cancelled ? -1 : (Number.isInteger(code) ? code : -1)
       const status = cancelled ? 'cancelled' : (exitCode === 0 ? 'done' : 'error')
       // 记录终止信号：exitCode=-1 时只有它能区分「外部 SIGTERM/SIGKILL」与「spawn 失败」。
-      if (signal) task.lastSignal = signal
+      rtOf(task).setLastSignal(signal)
       // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
       if (finalizeTask(task, exitCode, status) && !cancelled) void notifyTask(task)
       try { liveStream.end() } catch { /* best effort */ }
@@ -2442,6 +3269,62 @@ async function handleTaskCreate(req, res) {
 
     send(res, { ok: true, id })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// Pi 任务启动（P4.2，2026-10-28）：与 Codex 的 exec / appserver 分支并列，
+// 共用同一套 tasks / pruneTasks / watchdog / finalizeTask —— 这正是 P3 归零的回报。
+// 终态按 A 方案：runtime 只 resolve `done` 给证据，**写终态仍是 finalizeTask**。
+function startPiTask({ res, id, outPath, workdir, prompt, model, provider }) {
+  const task = {
+    id,
+    kind: 'task',
+    engine: 'pi',
+    status: 'running',
+    exitCode: null,
+    output: '',
+    startedAt: Date.now(),
+    endedAt: null,
+    workdir,
+    outPath,
+    cancelled: false,
+    progress: [],
+    activityAt: Date.now(),
+    stuckSuspect: false,
+    signal: null,
+    forcedKill: false,
+    childPid: null,
+    childStart: null,
+    // Pi 的 provider/model 来自统一 resolver，避免设置页与任务实际运行脱节。
+    piProvider: provider,
+    piModel: model,
+  }
+  tasks.set(id, task)
+  pruneTasks()
+  const rt = rtOf(task)
+  startWatchdog(task)
+  void (async () => {
+    try {
+      await rt.start({ prompt, workdir, outPath })
+    } catch (e) {
+      rt.setAppError(errMsg(e))
+      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+      send(res, { ok: false, error: errMsg(e) })
+      return
+    }
+    send(res, { ok: true, id, engine: 'pi' })
+    // 事件流 → 进度（封闭投影由 pi-runtime 的 mapPiEvent 负责，这里只入环）
+    void (async () => {
+      try {
+        for await (const ev of rt.events()) rt.pushProgress(ev)
+      } catch { /* 流随进程关闭，正常 */ }
+    })()
+    // 终态唯一落定点
+    try {
+      const ev = await rt.done
+      const status = ev.aborted || task.cancelled === true ? 'cancelled' : (ev.exitCode === 0 ? 'done' : 'error')
+      if (finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
+    } catch { /* 已在上面 catch 收尾 */ }
+  })()
 }
 
 // GET /task?id=：单条全量（含 output）。
@@ -2480,20 +3363,17 @@ async function handleTaskCancel(req, res) {
     // P2（2026-10-28）：这里只写「取消意图」，不预置终态 —— 终态唯一由 finalizeJob 写。
     // 用户反馈靠 viewStatus() 立刻可见（cancelled 信号 + 仍是 running → 对外显示 cancelled）；
     // output 留给 exit 回调收尾，那样能拿到进程退出前的完整输出。
-    task.cancelled = true
+    rtOf(task).setCancelled()
     // T5：app-server 模式先发 turn/interrupt（优雅结束当前 turn），kill 作为兜底。
-    if (task.app !== undefined && typeof task.app.interrupt === 'function') {
-      // interrupt 可能 reject（连接已断等）：吞掉，取消路径靠 SIGTERM/SIGKILL 兜底。
-      void Promise.resolve(task.app.interrupt()).catch(() => {})
-    }
-    try { task.child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+    rtOf(task).interrupt()
+    rtOf(task).kill('SIGTERM')
     // 兜底（2026-09-27 实测：codex 子进程偶有 SIGTERM 后残留）：3s 后仍未退出则 SIGKILL。
-    const child = task.child
+    const child = rtOf(task).child()
     const killTimer = setTimeout(() => {
       try {
         if (child !== null && child !== undefined && child.exitCode === null && child.signalCode === null) {
           child.kill('SIGKILL')
-          task.forcedKill = true
+          rtOf(task).setForcedKill()
         }
       } catch { /* best effort */ }
     }, 3000)
@@ -3130,7 +4010,7 @@ async function runReview(task, active) {
   task.dirtyAtStart = await gitPorcelain(task.workdir)
   try {
     for (;;) {
-      if (task.status === 'cancelled' || task.cancelled === true) break
+      if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
       const round = task.rounds.length + 1
       if (round > task.maxRounds) break
       task.round = round
@@ -3155,16 +4035,16 @@ async function runReview(task, active) {
       // 号，故每轮都注入（旧版只注首轮——轮内下标第 2 轮就失配，这是本次修的病根）。
       const prompt = buildReviewPrompt(task.content, prev, task.reviewContext, task.dialogue === true ? task.reply : undefined)
       const outPath = join(CODEX_DIR, `review-${task.id}-r${round}.out`)
-      task.outPath = outPath
+      rtOf(task).setOutPath(outPath)
       // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
       rtOf(task).heartbeat()
       const { child, wait, getUsage } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
-      task.child = child
+      rtOf(task).setChild(child)
       // 互审的探活身份：startWatchdog 在首轮 spawn 前就启动（那时 child 还是 null）记不到
       // pid —— 每轮 spawn 后补记；轮间空窗（child 已退、下一轮未起）清掉，
       // 否则对账 tick 会把已退出的旧 pid 误判成失联、误杀多轮复核。
-      task.childPid = Number.isInteger(child.pid) ? child.pid : null
-      task.childStart = task.childPid === null ? null : readProcStartTime(task.childPid)
+      rtOf(task).setChildPid(Number.isInteger(child.pid) ? child.pid : null)
+      rtOf(task).setChildStart(rtOf(task).getChildPid() === null ? null : readProcStartTime(rtOf(task).getChildPid()))
       // 单轮墙钟兜底：硬预算只在循环顶部检查，若首轮 codex 挂死（进程活着不退出），
       // await wait 永不返回 → 30 分钟硬预算形同虚设。到点强杀本轮子进程。
       const roundWallMs = wallMs - (Date.now() - startedAt)
@@ -3180,10 +4060,10 @@ async function runReview(task, active) {
       if (wallTimer !== null) clearTimeout(wallTimer)
       // 本轮 codex 自报用量累加进总账（抽不到记 0 —— 宁可少算也不误停）。
       tokensUsed += getUsage()
-      task.child = null
-      task.childPid = null
-      task.childStart = null
-      task.exitCode = task.cancelled === true ? -1 : code
+      rtOf(task).setChild(null)
+      rtOf(task).setChildPid(null)
+      rtOf(task).setChildStart(null)
+      rtOf(task).setExitCode(rtOf(task).isCancelled() ? -1 : code)
       const raw = readReviewOut(outPath)
       // 墙钟到点被强杀：按 wallclock 正常收尾（而非落进下面的 unparsed 解析失败分支）。
       if (task.wallHit === true) {
@@ -3191,7 +4071,7 @@ async function runReview(task, active) {
         await finishReview(task, 'done', 'wallclock')
         return
       }
-      if (task.status === 'cancelled' || task.cancelled === true) break
+      if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
       const parsed = parseReviewJson(raw)
       if (!parsed.ok) {
         task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: parsed.raw })
@@ -3493,10 +4373,10 @@ async function handleReviewCancel(req, res) {
       return send(res, { ok: false, error: `复核已结束（${task.status}），无需取消` }, 400)
     }
     // 先置熔断标记：循环每轮结束（及下一轮 spawn 前）都会检查，确保不再推进。
-    task.cancelled = true
+    rtOf(task).setCancelled()
     // P2：不预置 status（终态归 finalizeJob）；verdict 是复核裁决标记，与任务状态无关，保留。
     task.verdict = 'cancelled'
-    const child = task.child
+    const child = rtOf(task).child()
     if (child !== null && child !== undefined) {
       try { child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
       // 同 /task/cancel：codex 偶有 SIGTERM 后残留，3s 兜底 SIGKILL，防子进程泄漏。
@@ -3524,7 +4404,7 @@ async function handleTaskRoot(req, res) {
 async function handleConfigGet(_req, res) {
   try {
     const doc = loadKeyring()
-    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit, wallMsMin: REVIEW_MIN_WALL_MS, tokenLimitMin: REVIEW_MIN_TOKEN_LIMIT, collab: collabStatus() })
+    send(res, { ok: true, reviewRounds: doc.reviewRounds, roundsChoices: REVIEW_ROUNDS_CHOICES, reviewWallMs: doc.reviewWallMs, reviewTokenLimit: doc.reviewTokenLimit, wallMsMin: REVIEW_MIN_WALL_MS, tokenLimitMin: REVIEW_MIN_TOKEN_LIMIT, collab: collabStatus(), engine: await engineView() })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
@@ -3581,8 +4461,11 @@ async function handleConfigSet(req, res) {
       }
       collabBits = { voice: v, longtask: l }
     }
-    if (rounds === null && wallMs === null && tokenLimit === null && collabBits === null) {
-      return send(res, { ok: false, error: '没给任何可设置字段（reviewRounds / preset / voice+longtask）' }, 400)
+    // P4.3 修（2026-10-28 实测）：engine-only 请求曾被这条前置检查挡成 400，
+    // 导致面板切引擎静默失败（engine 处理在函数末尾）。这里把 engine 也算作可设置字段。
+    const hasEngine = typeof body.engine === 'string' && body.engine !== ''
+    if (rounds === null && wallMs === null && tokenLimit === null && collabBits === null && !hasEngine) {
+      return send(res, { ok: false, error: '没给任何可设置字段（reviewRounds / preset / voice+longtask / engine）' }, 400)
     }
     const doc = loadKeyring()
     if (rounds !== null) doc.reviewRounds = rounds
@@ -3599,13 +4482,23 @@ async function handleConfigSet(req, res) {
       ensureVoiceProtocol()
       try { agentsWritten = readFileSync(join(CODEX_DIR, 'AGENTS.md'), 'utf8').includes(VOICE_MARK) } catch { agentsWritten = false }
     }
+    // P4.3：切换当前引擎（写 ~/.dsh/second-engine-engine.txt，一行 id）
+    let engineSwitched = null
+    if (typeof body.engine === 'string' && body.engine !== '') {
+      if (ENGINES[body.engine] === undefined) {
+        return send(res, { ok: false, error: `未知引擎：${body.engine}（可选 ${Object.keys(ENGINES).join(' / ')}）` }, 400)
+      }
+      engineSwitched = setActiveEngineId(body.engine)
+    }
     send(res, {
       ok: true,
       reviewRounds: doc.reviewRounds,
       reviewWallMs: doc.reviewWallMs,
       reviewTokenLimit: doc.reviewTokenLimit,
       collab: collabStatus(),
+      engine: await engineView(),
       ...(agentsWritten !== null ? { agentsWritten } : {}),
+      ...(engineSwitched !== null ? { engineSwitched } : {}),
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -3658,12 +4551,21 @@ async function handleConsultsList(_req, res) {
 
 // ── /websearch：原生联网搜索开关（config.toml 顶层 web_search）──
 // GET 回显当前档位（无字段 → disabled）；POST 写入，非法档位 400。
+// Pi 没有 web_search 开关：全库 docs 搜不到该词，内置工具只有
+// read/bash/powershell/edit/write/grep/find/ls（+codemode/tool_search）。
+// 它的联网能力走 MCP。这里如实回 disabled + 说明，不假装支持。
 async function handleWebSearchGet(_req, res) {
+  if (activeEngineId() === 'pi') {
+    return send(res, { ok: true, value: 'disabled', note: 'Pi 没有 web_search 开关；联网搜索请通过下方 MCP 接入' })
+  }
   try { send(res, { ok: true, value: readWebSearch() }) }
   catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
 async function handleWebSearchSet(req, res) {
+  if (activeEngineId() === 'pi') {
+    return send(res, { ok: false, error: 'Pi 没有 web_search 开关（联网能力走 MCP），此项对 Pi 引擎不适用' }, 400)
+  }
   try {
     const body = await readBody(req)
     const value = typeof body.value === 'string' ? body.value.trim() : ''
@@ -3682,17 +4584,121 @@ async function handleWebSearchRoot(req, res) {
   return send(res, { ok: false, error: 'method not allowed' }, 405)
 }
 
+// ── Pi 引擎下的 MCP 兼容层（P4.22）──
+// 前端 WebSearchMcpCard 一行不改：把 ~/.pi/agent/mcp.json 的 mcpServers
+// 映射成 Codex 的 [{ name, url, enabled }] 形状。
+// Pi 的 mcp.json 格式见 docs/mcp.md:47 —— url 型是 { url }，stdio 型是 { command, args }，
+// 禁用是条目里 { enabled: false }（与 Codex 的 enabled 语义一致，无需额外映射）。
+const PI_MCP_PATH = join(homedir(), '.pi', 'agent', 'mcp.json')
+
+function readPiMcp() {
+  if (!existsSync(PI_MCP_PATH)) return { mcpServers: {} }
+  try {
+    const doc = JSON.parse(readFileSync(PI_MCP_PATH, 'utf8'))
+    if (doc === null || typeof doc !== 'object') return { mcpServers: {} }
+    if (doc.mcpServers === null || typeof doc.mcpServers !== 'object') doc.mcpServers = {}
+    return doc
+  } catch { return { mcpServers: {} } }
+}
+
+function writePiMcp(doc) {
+  mkdirSync(dirname(PI_MCP_PATH), { recursive: true })
+  if (existsSync(PI_MCP_PATH)) {
+    try { copyFileSync(PI_MCP_PATH, `${PI_MCP_PATH}.bak-${Date.now()}`) } catch { /* 备份失败不阻断 */ }
+  }
+  const tmp = `${PI_MCP_PATH}.tmp-${process.pid}`
+  writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
+  renameSync(tmp, PI_MCP_PATH)
+  try { chmodSync(PI_MCP_PATH, 0o600) } catch { /* best effort */ }
+}
+
+function piMcpServers() {
+  const doc = readPiMcp()
+  const out = []
+  for (const name of Object.keys(doc.mcpServers)) {
+    const one = doc.mcpServers[name] !== null && typeof doc.mcpServers[name] === 'object' ? doc.mcpServers[name] : {}
+    let url = ''
+    if (typeof one.url === 'string' && one.url !== '') url = one.url
+    else if (typeof one.command === 'string' && one.command !== '') url = `stdio: ${one.command}`
+    out.push({ name, url, enabled: one.enabled !== false })
+  }
+  return out
+}
+
+function handlePiMcpList(_req, res) {
+  try { send(res, { ok: true, servers: piMcpServers() }) }
+  catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function handlePiMcpAdd(req, res) {
+  try {
+    const body = await readBody(req)
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const url = typeof body.url === 'string' ? body.url.trim() : ''
+    if (name === '') { send(res, { ok: false, error: 'name 不能为空' }, 400); return }
+    if (!MCP_NAME_PATTERN.test(name)) {
+      send(res, { ok: false, error: 'name 只允许字母、数字、下划线和连字符' }, 400)
+      return
+    }
+    if (!/^https?:\/\//.test(url)) {
+      send(res, { ok: false, error: 'url 必须以 http:// 或 https:// 开头' }, 400)
+      return
+    }
+    const doc = readPiMcp()
+    if (doc.mcpServers[name] !== undefined) {
+      send(res, { ok: false, error: `已存在同名 MCP 服务器 '${name}'` }, 409)
+      return
+    }
+    doc.mcpServers[name] = { url }
+    writePiMcp(doc)
+    send(res, { ok: true, servers: piMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+function handlePiMcpDelete(res, name) {
+  try {
+    const doc = readPiMcp()
+    if (name === '' || doc.mcpServers[name] === undefined) {
+      send(res, { ok: false, error: `未找到 MCP 服务器 '${name}'` }, 404)
+      return
+    }
+    delete doc.mcpServers[name]
+    writePiMcp(doc)
+    send(res, { ok: true, servers: piMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+async function handlePiMcpToggle(req, res, name) {
+  try {
+    const body = await readBody(req)
+    const enabled = body.enabled === true
+    const doc = readPiMcp()
+    const one = doc.mcpServers[name]
+    if (one === undefined) {
+      send(res, { ok: false, error: `未找到 MCP 服务器 '${name}'` }, 404)
+      return
+    }
+    const entry = one !== null && typeof one === 'object' ? one : {}
+    entry.enabled = enabled
+    doc.mcpServers[name] = entry
+    writePiMcp(doc)
+    send(res, { ok: true, servers: piMcpServers() })
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
 // ── /mcp：MCP 服务器增删查（config.toml 的 [mcp_servers.*] 段）──
 // 注册为 prefix 路由（'prefix' 同时命中 /mcp 与 /mcp/<name>），按方法+子路径分发。
 const MCP_ROUTE_PREFIX = '/second-engine/api/mcp'
 
 // 新增返回 false 表示重名（handler 据此回 409，不做覆盖）。
 function handleMcpList(_req, res) {
+  if (activeEngineId() === 'pi') return handlePiMcpList(_req, res)
   try { send(res, { ok: true, servers: listMcpServers() }) }
   catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
 async function handleMcpAdd(req, res) {
+  if (activeEngineId() === 'pi') return handlePiMcpAdd(req, res)
   try {
     const body = await readBody(req)
     const name = typeof body.name === 'string' ? body.name.trim() : ''
@@ -3713,6 +4719,7 @@ async function handleMcpAdd(req, res) {
 }
 
 function handleMcpDelete(res, name) {
+  if (activeEngineId() === 'pi') return handlePiMcpDelete(res, name)
   try {
     if (name === '' || !removeMcpServer(name)) {
       return send(res, { ok: false, error: `未找到 MCP 服务器 '${name}'` }, 404)
@@ -3724,6 +4731,7 @@ function handleMcpDelete(res, name) {
 // 启用/禁用（保留配置段，不删除）：POST /mcp/<name> { enabled: bool }
 // 依据 Codex 官方字段 [mcp_servers.*] enabled = true|false；禁用后新会话不再连接它。
 async function handleMcpToggle(req, res, name) {
+  if (activeEngineId() === 'pi') return handlePiMcpToggle(req, res, name)
   try {
     const body = await readBody(req)
     if (typeof body.enabled !== 'boolean') {
@@ -3951,6 +4959,12 @@ export function apply(ctx) {
   ctx.inject(['webServer'], (wctx) => {
     // method/desc 内联进注册条目：GET /_meta 遍历本数组自动生成路由清单，别另手抄第二份。
     const routes = [
+      { kind: 'exact', method: 'GET', path: '/second-engine/api/pi-panel', desc: 'Pi 引擎面板数据（提供方/MCP/聊天桥/会话/模型渠道）', handler: handlePiPanel },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel', desc: 'Pi 自定义模型渠道：写入 ~/.pi/agent/models.json 的 providers.<id>（写前 .bak、0600）', handler: handlePiChannelCreate },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-model', desc: 'Pi 默认模型切换：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel（新建会话生效）', handler: handlePiModelSet },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-bridge', desc: 'Pi 聊天桥启停 { action: start|stop }（起后真探活 8788 再回报）', handler: handlePiBridge },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-cleanup', desc: 'Pi 会话清理 { confirm: true }：删 ~/.pi/agent/sessions 下 *.jsonl', handler: handlePiCleanup },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel-delete', desc: 'Pi 删除自定义渠道 { id }（写前 .bak、0600）', handler: handlePiChannelDelete },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/status', desc: '引擎/密钥/会话占用概览', handler: handleStatus },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/providers', desc: 'GET 提供方列表（apiKey 脱敏）+ active；POST 新增自定义提供方', handler: handleProvidersRoot },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/providers/key', desc: '设置指定提供方 apiKey（keyring 0600）', handler: handleProviderKey },

@@ -3,6 +3,8 @@ import { execFile } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { activeEngineId } from './engine/registry.js'
+import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl } from './engine/pi-bridge.js'
 
 /** 插件根目录（src/ 的上一级），默认桥目录随包走，装到 node_modules 里也成立。 */
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -111,7 +113,34 @@ function methodNotAllowed(res, allowedMethods) {
   }, 405)
 }
 
+// ── Pi 引擎的聊天桥（P4.21）──
+// Pi 不用 ctl.sh，而是自建的 bridge/pi/server.mjs（默认 8788，自己从 keyring 取 key）。
+// 路由前缀与 Codex 完全相同，前端 BridgeCard 因此零改动 —— 按钮自然对齐（启动/打开网页/停止/刷新状态）。
+// Pi bridge lifecycle and child ownership live in one shared module.
+
+
+async function handlePiBridgeStatus(_req, res) {
+  const web = await piBridgeStatus()
+  return sendJson(res, { ok: true, web }, 200)
+}
+
+async function handlePiBridgeStart(_req, res) {
+  const result = await startPiBridge()
+  return sendJson(res, result, result.ok ? 200 : 500)
+}
+
+async function handlePiBridgeStop(_req, res) {
+  const result = await stopPiBridge()
+  return sendJson(res, result, result.ok ? 200 : 500)
+}
+
+async function handlePiBridgeUrl(_req, res) {
+  if (!(await piBridgeStatus()).running) return sendJson(res, { ok: false, error: '未运行' }, 400)
+  return sendJson(res, { ok: true, url: piBridgeUrl() }, 200)
+}
+
 async function handleBridgeStatus(req, res) {
+  if (activeEngineId() === 'pi') return handlePiBridgeStatus(req, res)
   if ((req.method ?? 'GET') !== 'GET') return methodNotAllowed(res, 'GET')
   const result = await runBridgeCommand('status-json')
   if (!result.ok) {
@@ -131,6 +160,7 @@ async function handleBridgeStatus(req, res) {
 }
 
 async function handleBridgeStart(req, res) {
+  if (activeEngineId() === 'pi') return handlePiBridgeStart(req, res)
   if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
   const result = await runBridgeCommand('start')
   return sendBridgeResult(res, result, (passed) => ({ ok: true, output: passed.output }), {
@@ -140,6 +170,7 @@ async function handleBridgeStart(req, res) {
 }
 
 async function handleBridgeStop(req, res) {
+  if (activeEngineId() === 'pi') return handlePiBridgeStop(req, res)
   if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
   const result = await runBridgeCommand('stop')
   return sendBridgeResult(res, result, (passed) => ({ ok: true, output: passed.output }), {
@@ -149,6 +180,7 @@ async function handleBridgeStop(req, res) {
 }
 
 async function handleBridgeUrl(req, res) {
+  if (activeEngineId() === 'pi') return handlePiBridgeUrl(req, res)
   if ((req.method ?? 'GET') !== 'GET') return methodNotAllowed(res, 'GET')
   const result = await runBridgeCommand('url')
   return sendBridgeResult(res, result, (passed) => ({ ok: true, url: passed.output.trim() }), {
