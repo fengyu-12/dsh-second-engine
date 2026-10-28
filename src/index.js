@@ -4805,6 +4805,11 @@ async function handleMcpRoot(req, res) {
 // 本机 `codex --version` 与 GitHub 最新 release 对比。远端结果做模块级缓存 60 分钟：
 // 设置页会反复刷新，匿名调用 api.github.com 的配额经不起每次请求都打一次。
 const CODEX_RELEASES_URL = 'https://api.github.com/repos/openai/codex/releases/latest'
+// P4.28（2026-10-29）：Pi 的版本源是 npm registry（capabilities.versionCheck === 'npm'）。
+// 与 GitHub release 同语义：本机 pi 版本 vs 最新发布版，有新版就在面板与浮球亮徽标。
+const PI_NPM_LATEST_URL = 'https://registry.npmjs.org/@earendil-works%2Fpi-coding-agent/latest'
+const PI_NPM_PAGE_URL = 'https://www.npmjs.com/package/@earendil-works/pi-coding-agent'
+let latestPiVersionCache = { at: 0, version: '' }
 const VERSION_FETCH_TIMEOUT_MS = 15000
 const VERSION_CACHE_TTL_MS = 60 * 60 * 1000
 let latestVersionCache = { at: 0, version: '' }
@@ -4856,19 +4861,57 @@ async function latestCodexVersion() {
   return version
 }
 
+async function latestPiVersion() {
+  if (latestPiVersionCache.version !== '' && Date.now() - latestPiVersionCache.at < VERSION_CACHE_TTL_MS) {
+    return latestPiVersionCache.version
+  }
+  const resp = await fetch(PI_NPM_LATEST_URL, {
+    headers: { 'User-Agent': 'dsh-second-engine', Accept: 'application/json' },
+    signal: AbortSignal.timeout(VERSION_FETCH_TIMEOUT_MS),
+  })
+  if (!resp.ok) throw new Error(`npm registry 返回 ${resp.status}`)
+  const json = await resp.json()
+  const version = parseVersion(json?.version)
+  if (version === null) throw new Error('npm 包没有 x.y.z 版本号')
+  latestPiVersionCache = { at: Date.now(), version }
+  return version
+}
+
 // GET /version：{ current, latest, updateAvailable }。
 // GitHub 不可达（离线/限流）不算失败：本机版本照回，原因放 error。
 async function handleVersion(_req, res) {
   try {
+    // P4.28：按引擎分流 —— Codex 查 GitHub release，Pi 查 npm registry；
+    // 返回同形状 {engine,current,latest,updateAvailable,htmlUrl}，前端只按引擎换标签与链接。
+    if (activeEngineId() === 'pi') {
+      const probe = await piProbe().catch(() => null)
+      const current = probe && typeof probe.version === 'string' ? probe.version : ''
+      let latest = ''
+      let error = ''
+      try { latest = await latestPiVersion() } catch (e) { error = errMsg(e) }
+      const payload = {
+        ok: true,
+        engine: 'pi',
+        current,
+        latest,
+        updateAvailable: compareVersions(latest, current) > 0,
+        htmlUrl: PI_NPM_PAGE_URL,
+        checkedAt: latestPiVersionCache.at,
+      }
+      if (error !== '') payload.error = error
+      return send(res, payload)
+    }
     const current = await localCodexVersion()
     let latest = ''
     let error = ''
     try { latest = await latestCodexVersion() } catch (e) { error = errMsg(e) }
     const payload = {
       ok: true,
+      engine: 'codex',
       current: current === null ? '' : current,
       latest,
       updateAvailable: compareVersions(latest, current) > 0,
+      htmlUrl: 'https://github.com/openai/codex/releases/latest',
       checkedAt: latestVersionCache.at,
     }
     if (error !== '') payload.error = error
