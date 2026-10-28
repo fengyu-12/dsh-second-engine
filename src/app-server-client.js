@@ -106,7 +106,7 @@ const terminalFromResponse = (value, tid) => {
 const PROVIDER_DEFAULT_MODELS = new Set(['', 'default', 'auto', 'codex-default', 'provider-default'])
 const isProviderDefaultModel = (m) => m === undefined || m === null || PROVIDER_DEFAULT_MODELS.has(String(m).trim().toLowerCase())
 
-export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexArgs = [], model, codexBinary = 'codex' }) {
+export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexArgs = [], model = '', codexBinary = 'codex' }) {
   const desiredModel = typeof model === 'string' ? model.trim() : ''
   // codexArgs：可选的 codex 全局参数（如 -c model_provider=... ），便于离线/多 provider 测试；
   // 生产路径留空，走 ~/.codex/config.toml 的 active provider。

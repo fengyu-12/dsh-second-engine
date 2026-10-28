@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const PLUGIN_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
