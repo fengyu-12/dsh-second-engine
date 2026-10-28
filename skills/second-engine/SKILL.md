@@ -45,10 +45,15 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 | **多轮批判复核**（`/review`、协作提议） | **Codex** | Pi 无复核链路，面板会隐藏该卡（点了必失败） |
 | **流式进度 + 真打断**（长任务看过程、要能取消） | **Codex** | app-server 模式；Pi 走 exec，取消只能靠 SIGTERM |
 | **`web_search`** | **Codex** | Pi 内置工具无联网（read/bash/edit/grep/find/ls），联网得自己配 MCP |
-| **换模型 / 复用已有 API key / 省体积** | **Pi** | 22 MB vs 223 MB CLI；原生 15+ provider，按 `<PROVIDER>_API_KEY` 取凭据 |
+| **多 provider 并存、随时切** | **Pi** | `models.json` 可存多个 provider 各自模型，切换只改 `defaultProvider/defaultModel` |
+| **省体积** | **Pi** | 22 MB vs 223 MB CLI（Codex 是 223 MB + 70 MB sidecar）|
 | 只要一个**独立第二意见** | 都行 | 用当前 active 的，别为选型来回切 |
 
-一句话：**要"审"走 Codex，要"跑另一个模型"走 Pi。**
+一句话：**要"审"走 Codex；要"几个厂商的模型并存、随时横向比"走 Pi。**
+
+⚠️ **别把"能换模型"当成 Pi 的卖点** —— **Codex 同样能换**（改 `config.toml` 的 `model_provider` + `model`，本机现为 zhipu/glm-5.3-flash）。真实差别是：Codex 一次一个 active provider，Pi 可并存多个。
+
+> 判据：**引擎能力看 CLI/配置文件，不看 Web 控件列几个**。下拉只显示当前值属 UI 层（缺陷记待办），别据此推断"这个引擎不能换模型"。
 
 两条容易踩的：
 - 切换即时生效（`~/.dsh/second-engine-engine.txt`），但**会话不迁移** —— 已开的工单留在原引擎，切完看不到旧单。
