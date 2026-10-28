@@ -120,23 +120,23 @@ install -m 0755 /tmp/codex-code-mode-host-* \
 ## 长什么样
 
 <p align="center">
-  <img src="docs/images/float-panel.jpg" width="46%" alt="悬浮球面板">
-  <img src="docs/images/settings-panel.jpg" width="46%" alt="设置页">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/float-panel.jpg" width="46%" alt="悬浮球面板">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/settings-panel.jpg" width="46%" alt="设置页">
   <br>
   <sub>左：<b>悬浮球</b> —— 三档协作模式一点即切，底部是 Codex 版本与会话占用两行 kv，有新版才亮徽标。
   <br>右：<b>设置页</b> —— 引擎状态、协作模式、四家模型提供方、联网搜索与 MCP、浏览器聊天桥。</sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/web-chat.jpg" width="46%" alt="浏览器聊天桥">
-  <img src="docs/images/terminal.jpg" width="46%" alt="终端 TUI">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/web-chat.jpg" width="46%" alt="浏览器聊天桥">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/terminal.jpg" width="46%" alt="终端 TUI">
   <br>
   <sub>左：<b>浏览器聊天桥</b> —— 手机浏览器里直接和 Codex 对话，与终端共享同一批会话。
   <br>右：<b>终端 TUI</b> —— 原生 Codex，YOLO mode 全功能。</sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/settings-model.jpg" width="46%" alt="界面风格与模型思考">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/settings-model.jpg" width="46%" alt="界面风格与模型思考">
   <br>
   <sub><b>界面风格</b>（Codex 蓝 / Claude 陶土色）· 字号 · 模型与思考等级</sub>
 </p>
@@ -290,7 +290,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 ## 版本记录（择要）
 
-最新版本 **3.7.0** —— 双引擎能力契约 + Pi 运行时接入。完整版本历史见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
+最新版本 **3.7.0** —— 双引擎能力契约 + Pi 运行时接入。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## 已知限制
 
