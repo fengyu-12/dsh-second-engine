@@ -32,7 +32,10 @@ const resolveProvider = () => resolvePiProvider()
 // ── RPC 客户端：严格 JSONL，命令 id 关联（rpc.md「Correlate commands and responses」）──
 class PiRpc {
   constructor({ provider, model, key, cwd }) {
-    const args = ['--mode', 'rpc', '--no-session']
+    // P4.26（2026-10-29）：去掉 --no-session —— 网页对话也要落盘，
+    // 与 CLI 会话同源（~/.pi/agent/sessions/<cwd 编码>/*.jsonl），便于事后回溯。
+    // 会话目录默认即 agentDir/sessions；需要隔离时用 --session-dir 覆盖。
+    const args = ['--mode', 'rpc']
     if (provider) args.push('--provider', provider)
     if (model) args.push('--model', model)
     const env = { ...process.env }

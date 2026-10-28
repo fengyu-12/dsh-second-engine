@@ -55,6 +55,13 @@ import { createHash, randomBytes } from 'node:crypto'
 export const name = 'second-engine'
 
 const CODEX_DIR = join(homedir(), '.codex')
+// P4.26（2026-10-29）：AGENTS.md 的写入目标不只有 Codex。
+// Pi 同样认 AGENTS.md：全局在 agentDir（~/.pi/agent/AGENTS.md），项目级从 cwd 向上逐级查找；
+// 两引擎写同一段协作文案，各文件里的成对标记保证幂等、互不干扰。
+const PI_AGENT_DIR = join(homedir(), '.pi', 'agent')
+function agentsTargets() {
+  return [join(CODEX_DIR, 'AGENTS.md'), join(PI_AGENT_DIR, 'AGENTS.md')]
+}
 // codex 可执行文件解析（#7，2026-10-25）：状态灯与实际 spawn 此前可能指向不同二进制——
 // 状态灯只看固定路径，spawn 却走 PATH。统一从这里取：
 //   env CODEX_BINARY（显式覆盖；文件不存在也照用，让 spawn error 自己暴露配错）
@@ -543,20 +550,21 @@ const AGENTS_V1_TAIL_ANCHORS = ['- 只在指定工作副本内写文件；最终
 
 function ensureAgentsProtocol() {
   try {
-    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
-    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
-    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
-    mkdirSync(CODEX_DIR, { recursive: true })
-    const path = join(CODEX_DIR, 'AGENTS.md')
-    let existing = ''
-    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
-    // A2：v1 → v2 升级并入同一条管线。v1 段先按三级降级纯摘除 —— 旧代码在末句锚未命中时
-    // 会把 v1 段之后直到文件尾的内容静默丢掉；现在三级全不命中就告警不动手。
-    const noV1 = stripManagedSection(existing, AGENTS_V1_MARK, AGENTS_V1_END, AGENTS_V1_TAIL_ANCHORS, 'agents-protocol')
-    if (noV1 === null) return
-    const next = replaceManagedSection(noV1, AGENTS_MARK, AGENTS_END, AGENTS_TAIL_ANCHORS, AGENTS_SECTION, 'agents-protocol')
-    if (next === null || next === existing) return
-    atomicWriteFileSync(path, next)
+    // P4.26：目标不只 Codex —— Pi 也认 AGENTS.md（全局 ~/.pi/agent/AGENTS.md）。
+    for (const path of agentsTargets()) {
+      // ⚠️ 先建目录：对应用户可能还没装该引擎；目录不存在会让 atomicWriteFileSync 抛 ENOENT
+      // 并被外层 catch 静默吞掉，AGENTS.md 永不写入（2026-10-26 查实）。
+      mkdirSync(dirname(path), { recursive: true })
+      let existing = ''
+      try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
+      // A2：v1 → v2 升级并入同一条管线。v1 段先按三级降级纯摘除 —— 旧代码在末句锚未命中时
+      // 会把 v1 段之后直到文件尾的内容静默丢掉；现在三级全不命中就告警不动手。
+      const noV1 = stripManagedSection(existing, AGENTS_V1_MARK, AGENTS_V1_END, AGENTS_V1_TAIL_ANCHORS, 'agents-protocol')
+      if (noV1 === null) continue
+      const next = replaceManagedSection(noV1, AGENTS_MARK, AGENTS_END, AGENTS_TAIL_ANCHORS, AGENTS_SECTION, 'agents-protocol')
+      if (next === null || next === existing) continue
+      atomicWriteFileSync(path, next)
+    }
   } catch (e) { noteErr('agents-protocol', e) /* best effort：写入失败不阻断插件启动 */ }
 }
 
@@ -584,16 +592,14 @@ const BOARD_TAIL_ANCHORS = [sectionTailLine(BOARD_SECTION, BOARD_END)]
 
 function ensureBoardProtocol() {
   try {
-    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
-    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
-    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
-    mkdirSync(CODEX_DIR, { recursive: true })
-    const path = join(CODEX_DIR, 'AGENTS.md')
-    let existing = ''
-    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
-    const next = replaceManagedSection(existing, BOARD_MARK, BOARD_END, BOARD_TAIL_ANCHORS, BOARD_SECTION, 'board-protocol')
-    if (next === null || next === existing) return
-    atomicWriteFileSync(path, next)
+    for (const path of agentsTargets()) {
+      mkdirSync(dirname(path), { recursive: true })
+      let existing = ''
+      try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则新建 */ }
+      const next = replaceManagedSection(existing, BOARD_MARK, BOARD_END, BOARD_TAIL_ANCHORS, BOARD_SECTION, 'board-protocol')
+      if (next === null || next === existing) continue
+      atomicWriteFileSync(path, next)
+    }
   } catch (e) { noteErr('board-protocol', e) /* best effort：写入失败不阻断插件启动 */ }
 }
 
@@ -644,19 +650,17 @@ function collabStatus() {
 }
 function ensureVoiceProtocol() {
   try {
-    // ⚠️ 先建目录：用户可能「装了插件、还没装 Codex CLI」——此时 ~/.codex 不存在，
-    // 下面的 atomicWriteFileSync 会抛 ENOENT，被外层 catch 静默吞掉，AGENTS.md 永不写入；
-    // 等他后来装了 Codex，插件早已启动完、apply() 不会重跑 ⇒ 永久缺失（2026-10-26 查实）。
-    mkdirSync(CODEX_DIR, { recursive: true })
-    const path = join(CODEX_DIR, 'AGENTS.md')
-    let existing = ''
-    try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则视为空 */ }
-    // 先摘除旧段（含标记本身），再按档位决定是否追加：on=刷新，off=移除。
-    const stripped = existing.replace(VOICE_SECTION_RE, '')
-    const next = voiceMode() !== 'on' ? stripped
-      : (stripped.endsWith('\n') || stripped === '' ? stripped + VOICE_SECTION : stripped + '\n\n' + VOICE_SECTION)
-    if (next === existing) return
-    atomicWriteFileSync(path, next)
+    for (const path of agentsTargets()) {
+      mkdirSync(dirname(path), { recursive: true })
+      let existing = ''
+      try { existing = readFileSync(path, 'utf8') } catch { /* 不存在则视为空 */ }
+      // 先摘除旧段（含标记本身），再按档位决定是否追加：on=刷新，off=移除。
+      const stripped = existing.replace(VOICE_SECTION_RE, '')
+      const next = voiceMode() !== 'on' ? stripped
+        : (stripped.endsWith('\n') || stripped === '' ? stripped + VOICE_SECTION : stripped + '\n\n' + VOICE_SECTION)
+      if (next === existing) continue
+      atomicWriteFileSync(path, next)
+    }
   } catch (e) { noteErr('voice-protocol', e) }
 }
 
