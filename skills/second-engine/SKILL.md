@@ -36,6 +36,24 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 
 ✅ 收尾时**本任务期间**的求助会自动以 `[SECOND_ENGINE_CONSULT]` 块追加进 `task.output`（2026-10-14 起，收单读 output 即见）。仍会漏的两场景：① 任务永不结束（`finalizeTask` 不跑）→ 看 `GET /api/task` 的 **`stuckSuspect:true`**（看门狗 300s 无输出置位）就转去查 consults；② review 内部循环 → 2026-10-25 起 `finalizeReview` 已统一走 `finalizeJob`，不再单独漏。
 
+### 选哪个引擎（Pi vs Codex，2026-10-29 补 —— 此前只有"怎么操作"，没有"为什么用这个"）
+
+判据按**你要什么能力**，不按哪个"更好"：
+
+| 你要的 | 选 | 依据（不是偏好） |
+|---|---|---|
+| **多轮批判复核**（`/review`、协作提议） | **Codex** | Pi 无复核链路，面板会隐藏该卡（点了必失败） |
+| **流式进度 + 真打断**（长任务看过程、要能取消） | **Codex** | app-server 模式；Pi 走 exec，取消只能靠 SIGTERM |
+| **`web_search`** | **Codex** | Pi 内置工具无联网（read/bash/edit/grep/find/ls），联网得自己配 MCP |
+| **换模型 / 复用已有 API key / 省体积** | **Pi** | 22 MB vs 223 MB CLI；原生 15+ provider，按 `<PROVIDER>_API_KEY` 取凭据 |
+| 只要一个**独立第二意见** | 都行 | 用当前 active 的，别为选型来回切 |
+
+一句话：**要"审"走 Codex，要"跑另一个模型"走 Pi。**
+
+两条容易踩的：
+- 切换即时生效（`~/.dsh/second-engine-engine.txt`），但**会话不迁移** —— 已开的工单留在原引擎，切完看不到旧单。
+- Pi 下复核/工单/版本这类卡片会被隐藏，**不是故障**（面板按引擎渲染）。
+
 ### C. 用哪条通道派（2026-10-15 · 官方原生工具 vs 本插件）
 
 DSH 侧**两条路都能叫到 Codex**，别混：
