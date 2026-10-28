@@ -1433,38 +1433,21 @@ async function handlePiChannelCreate(req, res) {
     }
 
     // 读-改-写：保留文件里其它 provider 与未知字段（该文件用户可能手改过，不许整份覆盖）。
-    let doc = { providers: {} }
-    if (existsSync(PI_MODELS_PATH)) {
-      let cur = null
-      try { cur = JSON.parse(readFileSync(PI_MODELS_PATH, 'utf8')) } catch { cur = null }
-      if (cur === null || typeof cur !== 'object') {
-        send(res, { ok: false, error: `${PI_MODELS_PATH} 不是合法 JSON，已中止（未改动文件），请先手工修好` }, 409)
-        return
-      }
-      doc = cur
-    }
-    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
-
-    const prev = doc.providers[id]
+    // 整段已搬进锁内：基线读取、其它 provider 的保留、apiKey 沿用均以**当前最新**那份为准。
     const entry = { baseUrl, api, models }
     if (typeof body.name === 'string' && body.name.trim() !== '') entry.name = body.name.trim()
     const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
-    // 留空 = 沿用已有 key（编辑场景）或走 $ENV 插值（新建场景），不把空串写进文件。
-    if (apiKey !== '') entry.apiKey = apiKey
-    else if (prev !== null && typeof prev === 'object' && prev.apiKey !== undefined) entry.apiKey = prev.apiKey
-    doc.providers[id] = entry
-
-    mkdirSync(dirname(PI_MODELS_PATH), { recursive: true })
-    if (existsSync(PI_MODELS_PATH)) {
-      try { copyFileSync(PI_MODELS_PATH, `${PI_MODELS_PATH}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断写入 */ }
-    }
-    const tmp = `${PI_MODELS_PATH}.tmp-${process.pid}`
-    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
-    renameSync(tmp, PI_MODELS_PATH)
-    try { chmodSync(PI_MODELS_PATH, 0o600) } catch { /* best effort */ }
-
-    send(res, { ok: true, id, providers: Object.keys(doc.providers), hasApiKey: entry.apiKey !== undefined })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
+      if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+      const prev = doc.providers[id]
+      // 留空 = 沿用已有 key（编辑场景）或走 $ENV 插值（新建场景），不把空串写进文件。
+      if (apiKey !== '') entry.apiKey = apiKey
+      else if (prev !== null && typeof prev === 'object' && prev.apiKey !== undefined) entry.apiKey = prev.apiKey
+      doc.providers[id] = entry
+      return doc
+    })
+    send(res, { ok: true, id, providers: Object.keys(readPiJson(PI_MODELS_PATH).providers || {}), hasApiKey: entry.apiKey !== undefined })
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 // ── Pi 默认模型切换（P4.8）：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel ──
@@ -1484,33 +1467,16 @@ async function handlePiModelSet(req, res) {
       return
     }
     const settingsPath = join(homedir(), '.pi', 'agent', 'settings.json')
-    let doc = {}
-    if (existsSync(settingsPath)) {
-      let cur = null
-      try { cur = JSON.parse(readFileSync(settingsPath, 'utf8')) } catch { cur = null }
-      if (cur === null || typeof cur !== 'object') {
-        send(res, { ok: false, error: `${settingsPath} 不是合法 JSON，已中止（未改动文件），请先手工修好` }, 409)
-        return
-      }
-      doc = cur
-    }
-    doc.defaultProvider = provider
-    doc.defaultModel = model
-
-    mkdirSync(dirname(settingsPath), { recursive: true })
-    if (existsSync(settingsPath)) {
-      try { copyFileSync(settingsPath, `${settingsPath}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断 */ }
-    }
-    const tmp = `${settingsPath}.tmp-${process.pid}`
-    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
-    renameSync(tmp, settingsPath)
-    try { chmodSync(settingsPath, 0o600) } catch { /* best effort */ }
-
-    // 缓存作废：下次 piAvailableModels 会重新问 Pi（新默认模型可能带新清单）。
-    invalidatePiModelsCache()
+    // 整段进锁（与 provider/model 写入口共用同一把 settings.json 锁）：
+    // 旧版这里用 `${settingsPath}.tmp-${process.pid}` 与 writePiJson 的临时文件**同进程必撞名**。
+    await piWriteJson(settingsPath, (doc) => {
+      doc.defaultProvider = provider
+      doc.defaultModel = model
+      return doc
+    })
 
     send(res, { ok: true, provider, model, note: '对新建会话生效；已在跑的会话不受影响' })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 // ── Pi 聊天桥启停：统一由 src/engine/pi-bridge.js 管理唯一 child 引用与端口。──
@@ -1564,21 +1530,19 @@ async function handlePiChannelDelete(req, res) {
     const id = typeof body.id === 'string' ? body.id.trim() : ''
     if (id === '') { send(res, { ok: false, error: '缺少 id' }, 400); return }
     if (!existsSync(PI_MODELS_PATH)) { send(res, { ok: false, error: `${PI_MODELS_PATH} 不存在，无可删` }, 404); return }
-    let doc = null
-    try { doc = JSON.parse(readFileSync(PI_MODELS_PATH, 'utf8')) } catch { doc = null }
-    if (doc === null || typeof doc !== 'object' || doc.providers === null || typeof doc.providers !== 'object') {
-      send(res, { ok: false, error: 'models.json 结构不对，已中止（未改动文件）' }, 409)
-      return
-    }
-    if (doc.providers[id] === undefined) { send(res, { ok: false, error: `没有渠道 ${id}` }, 404); return }
-    delete doc.providers[id]
-    try { copyFileSync(PI_MODELS_PATH, `${PI_MODELS_PATH}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`) } catch { /* 备份失败不阻断 */ }
-    const tmp = `${PI_MODELS_PATH}.tmp-${process.pid}`
-    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
-    renameSync(tmp, PI_MODELS_PATH)
-    try { chmodSync(PI_MODELS_PATH, 0o600) } catch { /* best effort */ }
-    send(res, { ok: true, id, providers: Object.keys(doc.providers) })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    // 同上：整段进锁，不再用锁外 JSON.parse + `${path}.tmp-${pid}`（同进程名字必撞）。
+    const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
+      if (doc.providers === null || typeof doc.providers !== 'object') {
+        return { __piAbort: { status: 409, error: 'models.json 结构不对，已中止（未改动文件）' } }
+      }
+      if (doc.providers[id] === undefined) return { __piAbort: { status: 404, error: `没有渠道 ${id}` } }
+      delete doc.providers[id]
+      return doc
+    })
+    if (out.__piAbort !== undefined) { send(res, { ok: false, error: out.__piAbort.error }, out.__piAbort.status); return }
+    invalidatePiModelsCache()
+    send(res, { ok: true, id, providers: Object.keys(readPiJson(PI_MODELS_PATH).providers || {}) })
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 // 协议选项：由后端下发，前端不写死。Codex 只有两种（completions 需经本地桥翻译），
@@ -1610,41 +1574,80 @@ function readPiJson(path) {
   } catch { return {} }
 }
 
-// 写路径专用：区分「文件不存在」与「解析失败」。
-// readPiJson 把两者都折成 {}，拿它当写基线 = 坏 JSON 时把用户整份配置覆盖成空
-// （紫东审查 P0-2/P0-3；同一个文件里 channel/model 两个入口早已是 409 中止，这里对齐）。
-// 返回 null 时**已发过响应**，调用方只需 `if (doc === null) return`。
-function readPiJsonForWrite(path, res) {
+// ── Pi 配置文件写入的并发保护（2026-10-29 任务 1）────────────────────────
+// 问题：六个写入口（piProviderAdd / piProviderKey / piProviderDelete / piProviderUpdate /
+// piProviderActive / piProviderModel）各自都是「读整份 → 改一个键 → 写整份」，入口之间
+// 没有任何互斥。面板与浮球并发点两下 = 后一次用自己的**旧读**覆盖前一次的结果（丢写）；
+// 两个 handler 同毫秒抢同一份 `${path}.tmp-${process.pid}`（同进程同 pid，名字**必然撞**），
+// rename 之后 tmp 已被顶走 → ENOENT 半途失败；`.bak-<ts>` 同毫秒也互相覆盖。
+// 做法：per-path  promise 链（进程内串行队列）。只在本进程内串行，不是跨进程文件锁
+// （那需要新依赖，本轮禁止）；跨进程仍靠原子 rename 保证「不出现半截文件」。
+const PI_WRITE_QUEUES = new Map()
+function piWithPathLock(path, fn) {
+  const prev = PI_WRITE_QUEUES.get(path) || Promise.resolve()
+  // 前一个任务无论成败都要放行下一个 —— 失败不能让队列永久卡死。
+  const run = prev.then(fn, fn)
+  PI_WRITE_QUEUES.set(path, run.then(() => undefined, () => undefined))
+  return run
+}
+
+// 严格读（写基线专用）：坏 JSON / 读不到 → 抛 PiWriteAborted，**绝不**拿 {} 当基线。
+// 与旧 readPiJsonForWrite 同一口径（紫东审查 P0-2/P0-3），只是把「已发响应」改成抛错，
+// 好让它在 piWriteJson 的锁内闭包里复用。
+class PiWriteAborted extends Error {
+  constructor(message, status) { super(message); this.status = status === undefined ? 409 : status }
+}
+function readPiJsonStrict(path) {
   if (!existsSync(path)) return {}
   let raw = ''
   try { raw = readFileSync(path, 'utf8') } catch (e) {
-    send(res, { ok: false, error: `读不到 ${path}：${errMsg(e)}` }, 500)
-    return null
+    throw new PiWriteAborted(`读不到 ${path}：${errMsg(e)}`, 500)
   }
   let doc = null
   try { doc = JSON.parse(raw) } catch {
-    send(res, { ok: false, error: `${path} 不是合法 JSON，已中止（未改动文件）。请先手工修好再加。` }, 409)
-    return null
+    throw new PiWriteAborted(`${path} 不是合法 JSON，已中止（未改动文件）。请先手工修好再加。`, 409)
   }
   if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    send(res, { ok: false, error: `${path} 顶层不是对象，已中止（未改动文件）。` }, 409)
-    return null
+    throw new PiWriteAborted(`${path} 顶层不是对象，已中止（未改动文件）。`, 409)
   }
   return doc
 }
 
-function writePiJson(path, doc) {
-  mkdirSync(dirname(path), { recursive: true })
-  if (existsSync(path)) {
-    try {
-      const backup = `${path}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`
-      copyFileSync(path, backup)
-    } catch { /* best effort */ }
-  }
-  const tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
-  writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 })
-  renameSync(tmp, path)
-  try { chmodSync(path, 0o600) } catch { /* best effort */ }
+// 唯一的 Pi JSON 写入口：锁内「严格读 → mutate → 原子写」，mutate 在**拿到锁之后**才跑，
+// 所以基线一定是队列里最新的那份（跨入口丢写的根因就在这）。mutate 返回的对象即最终落盘内容；
+// 返回带 `__piResult` 的 { __piAbort } 语义见各调用点（用返回值的 __piAbort 表达 404/409）。
+// 备份文件名带 pid + 随机后缀，同毫秒两次写不再互相覆盖；tmp 同样带随机后缀，不再撞名。
+function piWriteJson(path, mutate) {
+  return piWithPathLock(path, () => {
+    const doc = readPiJsonStrict(path)
+    const next = mutate(doc)
+    if (next !== null && typeof next === 'object' && next.__piAbort !== undefined) return next
+    const out = JSON.stringify(next, null, 2)
+    // 内容没变 → 不写、不备份、不作废缓存（连续两次「设为当前」不再刷出一串同内容 .bak）。
+    let unchanged = false
+    if (existsSync(path)) {
+      try { unchanged = readFileSync(path, 'utf8') === out } catch { unchanged = false }
+    }
+    if (!unchanged) {
+      mkdirSync(dirname(path), { recursive: true })
+      if (existsSync(path)) {
+        try {
+          copyFileSync(path, `${path}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`)
+        } catch { /* 备份失败不阻断写入 */ }
+      }
+      const tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+      writeFileSync(tmp, out, { mode: 0o600 })
+      chmodSync(tmp, 0o600)
+      try {
+        renameSync(tmp, path)
+      } catch (e) {
+        try { unlinkSync(tmp) } catch { /* best effort */ }
+        throw e
+      }
+    }
+    invalidatePiModelsCache()
+    return { __piOk: true, unchanged }
+  })
 }
 
 // wireApi（Codex 术语）↔ api（Pi 术语）
@@ -1750,13 +1753,7 @@ async function piProviderAdd(req, res) {
       send(res, { ok: false, error: keyAsModel }, 400)
       return
     }
-    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
-    if (doc === null) return
-    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
-    if (doc.providers[id] !== undefined) {
-      send(res, { ok: false, error: `提供方 ${id} 已存在` }, 409)
-      return
-    }
+    // 查重交给锁内闭包（见下），这里不再用锁外读做准入判断。
     const entry = {
       name: typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim() : id,
       baseUrl,
@@ -1764,11 +1761,22 @@ async function piProviderAdd(req, res) {
       models: model !== '' ? [{ id: model }] : [],
     }
     if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') entry.apiKey = body.apiKey.trim()
-    doc.providers[id] = entry
-    writePiJson(PI_MODELS_PATH, doc)
-    invalidatePiModelsCache()
-    send(res, { ok: true, id, providers: Object.keys(doc.providers) })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    // 锁内重读基线再查「已存在」：snap 是锁外快照，并发下拿它查重会误判/漏判。
+    const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
+      if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+      if (doc.providers[id] !== undefined) return { __piAbort: { status: 409, error: `提供方 ${id} 已存在` } }
+      doc.providers[id] = entry
+      return doc
+    })
+    if (out.__piAbort !== undefined) { send(res, { ok: false, error: out.__piAbort.error }, out.__piAbort.status); return }
+    send(res, { ok: true, id, providers: Object.keys(readPiJson(PI_MODELS_PATH).providers || {}) })
+  } catch (e) { sendPiWriteError(res, e) }
+}
+
+// Pi 写入口统一错误出口：PiWriteAborted 带自己的 status（409/500），其余按 200 + ok:false（与历史一致）。
+function sendPiWriteError(res, e) {
+  const status = e instanceof PiWriteAborted ? e.status : 200
+  send(res, { ok: false, error: errMsg(e) }, status)
 }
 
 async function piProviderKey(req, res) {
@@ -1780,15 +1788,14 @@ async function piProviderKey(req, res) {
     if (apiKey === '') { send(res, { ok: false, error: 'apiKey 不能为空' }, 400); return }
     // 内置 deepseek 也写 models.json：Pi 支持用 models.json 覆盖原生 provider 的凭据，
     // 只写 apiKey 不写 models 时会保留内置模型清单（docs/custom-provider.md「Redirect an existing provider」）。
-    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
-    if (doc === null) return
-    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
-    const prev = doc.providers[id] !== null && typeof doc.providers[id] === 'object' ? doc.providers[id] : {}
-    doc.providers[id] = { ...prev, apiKey }
-    writePiJson(PI_MODELS_PATH, doc)
-    invalidatePiModelsCache()
+    await piWriteJson(PI_MODELS_PATH, (doc) => {
+      if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
+      const prev = doc.providers[id] !== null && typeof doc.providers[id] === 'object' ? doc.providers[id] : {}
+      doc.providers[id] = { ...prev, apiKey }
+      return doc
+    })
     send(res, { ok: true, id, preview: '已配置' })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 async function piProviderActive(req, res) {
@@ -1799,23 +1806,23 @@ async function piProviderActive(req, res) {
     const snap = piProvidersSnapshot()
     // 写基线必须严格读：snap.settings 来自宽松读，坏 JSON 时是 {}，
     // 直接写回会把用户 settings.json 里其它键（不止 defaultProvider/Model）全丢掉（P0-3）。
-    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
-    if (settings === null) return
-    settings.defaultProvider = id
-    // 切提供方时把 defaultModel 也落到该提供方的第一个模型，否则 Pi 会拿旧 model 配新 provider。
-    if (id === 'deepseek') {
-      if (typeof settings.defaultModel !== 'string' || settings.defaultModel === '') settings.defaultModel = 'deepseek-flash'
-    } else {
-      const one = snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
-      const first = Array.isArray(one.models) && one.models.length > 0
-        ? (typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id))
-        : ''
-      if (typeof first === 'string' && first !== '') settings.defaultModel = first
-    }
-    writePiJson(PI_SETTINGS_PATH, settings)
-    invalidatePiModelsCache()
-    send(res, { ok: true, active: id, model: typeof settings.defaultModel === 'string' ? settings.defaultModel : '' })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    const out = await piWriteJson(PI_SETTINGS_PATH, (settings) => {
+      settings.defaultProvider = id
+      // 切提供方时把 defaultModel 也落到该提供方的第一个模型，否则 Pi 会拿旧 model 配新 provider。
+      if (id === 'deepseek') {
+        if (typeof settings.defaultModel !== 'string' || settings.defaultModel === '') settings.defaultModel = 'deepseek-flash'
+      } else {
+        const one = snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
+        const first = Array.isArray(one.models) && one.models.length > 0
+          ? (typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id))
+          : ''
+        if (typeof first === 'string' && first !== '') settings.defaultModel = first
+      }
+      return settings
+    })
+    const savedModel = readPiJson(PI_SETTINGS_PATH).defaultModel
+    send(res, { ok: true, active: id, model: typeof savedModel === 'string' ? savedModel : '' })
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 async function piProviderDelete(req, res) {
@@ -1826,23 +1833,24 @@ async function piProviderDelete(req, res) {
       send(res, { ok: false, error: 'deepseek 是内置预设，不能删除' }, 400)
       return
     }
-    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
-    if (doc === null) return
-    const bag = doc.providers !== null && typeof doc.providers === 'object' ? doc.providers : {}
-    if (bag[id] === undefined) { send(res, { ok: false, error: `没有提供方 ${id}` }, 404); return }
-    delete bag[id]
-    doc.providers = bag
-    writePiJson(PI_MODELS_PATH, doc)
+    // models.json 与 settings.json 是两把锁，不能合并成一次持锁（piWriteJson 只接一个 path），
+    // 所以按**固定顺序**取锁（models → settings）：只有乱序才会死锁，固定序不会。
+    const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
+      const bag = doc.providers !== null && typeof doc.providers === 'object' ? doc.providers : {}
+      if (bag[id] === undefined) return { __piAbort: { status: 404, error: `没有提供方 ${id}` } }
+      delete bag[id]
+      doc.providers = bag
+      return doc
+    })
+    if (out.__piAbort !== undefined) { send(res, { ok: false, error: out.__piAbort.error }, out.__piAbort.status); return }
     // 删掉的正好是当前激活的 → 回落到 deepseek，避免 settings 指向不存在的 provider。
-    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
-    if (settings === null) return
-    if (settings.defaultProvider === id) {
-      settings.defaultProvider = 'deepseek'
-      writePiJson(PI_SETTINGS_PATH, settings)
+    let fellBack = false
+    if (readPiJsonStrict(PI_SETTINGS_PATH).defaultProvider === id) {
+      await piWriteJson(PI_SETTINGS_PATH, (doc) => { doc.defaultProvider = 'deepseek'; return doc })
+      fellBack = true
     }
-    invalidatePiModelsCache()
-    send(res, { ok: true, id, providers: Object.keys(bag) })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+    send(res, { ok: true, id, providers: Object.keys(readPiJson(PI_MODELS_PATH).providers || {}), fellBackToDefault: fellBack })
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 async function piProviderUpdate(req, res) {
@@ -1855,48 +1863,50 @@ async function piProviderUpdate(req, res) {
       send(res, { ok: false, error: `没有提供方 ${id}` }, 404)
       return
     }
-    const doc = readPiJsonForWrite(PI_MODELS_PATH, res)
-    if (doc === null) return
-    if (doc.providers === null || typeof doc.providers !== 'object') doc.providers = {}
-    const prev = doc.providers[id] !== null && typeof doc.providers[id] === 'object' ? doc.providers[id] : {}
-    const entry = { ...prev }
-    if (typeof body.name === 'string' && body.name.trim() !== '') entry.name = body.name.trim()
-    if (typeof body.baseUrl === 'string' && body.baseUrl.trim() !== '') entry.baseUrl = body.baseUrl.trim()
-    if (typeof body.wireApi === 'string' && body.wireApi !== '') entry.api = piApiFromWire(body.wireApi)
+    // 准入查重与字段合并全交给下面的锁内闭包：锁外 snap / 锁外 prev 与锁内基线
+    // 可能已经不一致（并发建删/并发改同一 id），所以这里**不预读基线**，只校验入参。
     const model = typeof body.model === 'string' ? body.model.trim() : ''
     const keyAsModel = piRejectKeyAsModel(model)
     if (keyAsModel !== '') {
       send(res, { ok: false, error: keyAsModel }, 400)
       return
     }
-    if (model !== '') {
-      const existing = Array.isArray(prev.models)
-        ? prev.models.map((m) => String((typeof m === 'string' ? m : (m && m.id)) || ''))
-        : []
-      // 内置 provider（deepseek 等）在 models.json 里通常只有 { apiKey } 覆盖层、没有 models。
-      // 此时若写 models:[{id}]，等于把 Pi 的**内置清单**在覆盖层里砍成 1 个（紫东审查 P0-5）。
-      // 所以：内置且原本无 models → 不生成 models 字段，只让 defaultModel 生效。
-      const isBuiltin = PI_PROVIDERS.includes(id)
-      const hasOwnModels = Array.isArray(prev.models)
-      if (isBuiltin && !hasOwnModels) {
-        // 保留覆盖层原样（可能只有 apiKey/baseUrl），不添加 models
-      } else if (!existing.includes(model)) {
-        entry.models = [{ id: model }]
+    // （字段合并与内置无 models 的 P0-5 语义已挪进锁内闭包，见下）
+    const out = await piWriteJson(PI_MODELS_PATH, (fresh) => {
+      if (fresh.providers === null || typeof fresh.providers !== 'object') fresh.providers = {}
+      if (id !== 'deepseek' && fresh.providers[id] === undefined && !PI_PROVIDERS.includes(id)) {
+        return { __piAbort: { status: 404, error: `没有提供方 ${id}` } }
       }
-    }
-    if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') entry.apiKey = body.apiKey.trim()
-    doc.providers[id] = entry
-    writePiJson(PI_MODELS_PATH, doc)
+      // prev 语义（内置无 models 不生成 models）以**锁内基线**为准，不用锁外那份 entry 直接顶：
+      // 否则并发下会用旧 prev 把别人刚写的 models/apiKey 擦掉。
+      const prev = fresh.providers[id] !== null && typeof fresh.providers[id] === 'object' ? fresh.providers[id] : {}
+      const merged = { ...prev }
+      if (typeof body.name === 'string' && body.name.trim() !== '') merged.name = body.name.trim()
+      if (typeof body.baseUrl === 'string' && body.baseUrl.trim() !== '') merged.baseUrl = body.baseUrl.trim()
+      if (typeof body.wireApi === 'string' && body.wireApi !== '') merged.api = piApiFromWire(body.wireApi)
+      if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') merged.apiKey = body.apiKey.trim()
+      if (model !== '') {
+        const existing = Array.isArray(prev.models)
+          ? prev.models.map((m) => String((typeof m === 'string' ? m : (m && m.id)) || ''))
+          : []
+        const isBuiltin = PI_PROVIDERS.includes(id)
+        const hasOwnModels = Array.isArray(prev.models)
+        if (isBuiltin && !hasOwnModels) {
+          // 保留覆盖层原样（可能只有 apiKey/baseUrl），不添加 models（紫东审查 P0-5）
+        } else if (!existing.includes(model)) {
+          merged.models = [{ id: model }]
+        }
+      }
+      fresh.providers[id] = merged
+      return fresh
+    })
+    if (out.__piAbort !== undefined) { send(res, { ok: false, error: out.__piAbort.error }, out.__piAbort.status); return }
     // 改了当前激活项的模型 → 同步 defaultModel，否则 Pi 还用旧 model 名。
-    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
-    if (settings === null) return
-    if (settings.defaultProvider === id && model !== '') {
-      settings.defaultModel = model
-      writePiJson(PI_SETTINGS_PATH, settings)
+    if (model !== '' && readPiJsonStrict(PI_SETTINGS_PATH).defaultProvider === id) {
+      await piWriteJson(PI_SETTINGS_PATH, (settings) => { settings.defaultModel = model; return settings })
     }
-    invalidatePiModelsCache()
     send(res, { ok: true, id })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 async function piModels(req, res) {
@@ -1975,21 +1985,62 @@ async function piModels(req, res) {
         return
       }
       // 远端拉不到 → 回落本地已配，并把失败原因说清楚（不假装成功、不编模型名）。
+      // 文案与下面「没得可查」那一支共用 piModelsEmptyReason，不再两处各写一份。
       send(res, {
         ok: true,
         id,
         models: localModels,
-        note: `远端拉取失败（${primaryError === '' ? '未知原因' : primaryError}），下面显示 models.json 里已配置的模型`,
+        ...piModelsEmptyReason({ baseUrl, apiKey, localCount: localModels.length, fetchError: primaryError }),
       })
       return
     }
 
-    // No remote lookup is possible until both baseUrl and apiKey are configured.
-    const note = baseUrl === ''
-      ? '未配置 baseUrl，无法从远端拉取'
-      : (apiKey === '' ? '未配置 apiKey，无法从远端拉取' : '')
-    send(res, { ok: true, id, models: localModels, note })
+    // baseUrl / apiKey 缺一个就没法问远端。旧版这里只给人读 note，且**两者都缺时只报 baseUrl**、
+    // 两者都配了（走到不到这里）不管。现在统一走 piModelsEmptyReason()：人读 note + 机读 code/hint。
+    send(res, {
+      ok: true,
+      id,
+      models: localModels,
+      ...piModelsEmptyReason({ baseUrl, apiKey, localCount: localModels.length, fetchError: '' }),
+    })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// 「拿不到模型名单」的结构化原因（2026-10-29 任务 3）：返 { code, note, hint }。
+// note 仍是人读一句话（旧前端只用 note，行为不变），code/hint 给新前端做分流。
+// 五种情况互斥：前三是「没得可查」，后两是「查了但空」——
+//   no_base_url       渠道没配 baseUrl      → 去编辑行补地址
+//   no_api_key        配了地址没配 Key      → 去展开行填 Key
+//   remote_failed     两者都配了、远端拉失败 → 下面给的是 models.json 本地清单
+//   empty_everywhere  远端没拉回且本地也没配 → 真·零模型（旧版就在这一档把 note 落为空串）
+function piModelsEmptyReason({ baseUrl, apiKey, localCount, fetchError }) {
+  if (baseUrl === '') {
+    return {
+      code: 'no_base_url',
+      note: '未配置 baseUrl，无法从远端拉取，也无法确定可用模型',
+      hint: '编辑该渠道补上 baseUrl（形如 https://api.example.com/v1），保存后重试',
+    }
+  }
+  if (apiKey === '') {
+    return {
+      code: 'no_api_key',
+      note: '未配置 apiKey，无法从远端拉取',
+      hint: '展开该行填入 API Key 后重试（Key 只写进 0600 的 models.json）',
+    }
+  }
+  const err = fetchError === '' ? '未知原因' : fetchError
+  if (localCount > 0) {
+    return {
+      code: 'remote_failed',
+      note: `远端拉取失败（${err}），下面显示 models.json 里已配置的模型`,
+      hint: '下面列的是 models.json 本地清单，不代表远端实际可用',
+    }
+  }
+  return {
+    code: 'empty_everywhere',
+    note: `远端拉取失败（${err}），且 models.json 里也没配模型`,
+    hint: '先在渠道里手写模型 id，或确认 baseUrl 的路径层级是不是少了 /v1',
+  }
 }
 
 async function piProviderModel(req, res) {
@@ -2000,14 +2051,13 @@ async function piProviderModel(req, res) {
     if (id === '' || model === '') { send(res, { ok: false, error: 'id 和 model 都必填' }, 400); return }
     const keyAsModel = piRejectKeyAsModel(model)
     if (keyAsModel !== '') { send(res, { ok: false, error: keyAsModel }, 400); return }
-    const settings = readPiJsonForWrite(PI_SETTINGS_PATH, res)
-    if (settings === null) return
-    settings.defaultProvider = id
-    settings.defaultModel = model
-    writePiJson(PI_SETTINGS_PATH, settings)
-    invalidatePiModelsCache()
+    await piWriteJson(PI_SETTINGS_PATH, (settings) => {
+      settings.defaultProvider = id
+      settings.defaultModel = model
+      return settings
+    })
     send(res, { ok: true, id, model })
-  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+  } catch (e) { sendPiWriteError(res, e) }
 }
 
 async function piProvidersRoot(req, res) {
