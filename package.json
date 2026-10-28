@@ -20,9 +20,6 @@
     "skills",
     "cordis.patch.yml",
     "README.md",
-    "docs/CHANGELOG.md",
-    "docs/images",
-    "docs/task-runtime-contract.md",
     "tools/wait-task.sh",
     "tools/t-tool.sh",
     "tools/web-base.sh"

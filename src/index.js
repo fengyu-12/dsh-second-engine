@@ -4,24 +4,24 @@
 //   GET    /second-engine/api/status            引擎/密钥/会话占用概览
 //   GET    /second-engine/api/providers         提供方列表（apiKey 脱敏）+ active
 //   POST   /second-engine/api/providers         新增自定义提供方
-//   POST   /second-engine/api/providers/key     设置指定提供方 apiKey（keyring 0600）
-//   POST   /second-engine/api/providers/active  切换激活并生成 config.toml（先备份）
-//   POST   /second-engine/api/providers/delete  删除自定义提供方（预设不可删）
-//   POST   /second-engine/api/providers/update  编辑提供方（apiKey 省略=不改；active 改地址/模型时重写 config.toml）
-//   POST   /second-engine/api/models            拉取该提供方 /models 模型清单（缺省 active）
-//   POST   /second-engine/api/model             更新该提供方 model（active 时重写 config.toml）
-//   POST   /second-engine/api/key               兼容旧面板：给预设提供方写 key
+//   POST   /second-engine/api/providers/key     设置指定提供方 apiKey { id, apiKey }（keyring 0600）
+//   POST   /second-engine/api/providers/active  切换激活并生成 config.toml（先备份）{ id }
+//   POST   /second-engine/api/providers/delete  删除自定义提供方（预设不可删）{ id }
+//   POST   /second-engine/api/providers/update  编辑提供方 { id, name?, baseUrl?, wireApi?, apiKey? }（apiKey 省略=不改；active 改地址/模型时重写 config.toml）
+//   POST   /second-engine/api/models            拉取该提供方 /models 模型清单 { id? }（缺省 active）
+//   POST   /second-engine/api/model             更新该提供方 model { id, model }（active 时重写 config.toml）
+//   POST   /second-engine/api/key               兼容旧面板：给预设提供方写 key { provider, key }
 //   POST   /second-engine/api/cleanup           按 mtime 清理旧会话 *.jsonl（body 带 codexLogs:true 时顺带清 Codex logs_2.sqlite）
 //   POST   /second-engine/api/task              下发异步工单（后台 codex exec，完成弹 App 通知；ephemeral 缺省 true）
 //   GET    /second-engine/api/task?id=          单条工单全量（含 output）
 //   GET    /second-engine/api/tasks             最近 10 条工单摘要（不含 output）
-//   POST   /second-engine/api/task/cancel       取消运行中的工单（SIGTERM）
+//   POST   /second-engine/api/task/cancel       取消运行中的工单 { id }（SIGTERM）
 //   POST   /second-engine/api/review            双向互审：对产出做多轮批判性复核（kind:'review'；可带 prev=<上一轮复核id> 接力；可带 reply=[{issueId,decision,reason}] 按账本序号 id（i<N>）逐条回辩——任意轮可用、映射进跨轮 issue ledger；兼容 v1 哈希 id（经 aliases 命中）与旧 issueIndex）
-//   POST   /second-engine/api/review/cancel     熔断取消复核任务（SIGTERM）
+//   POST   /second-engine/api/review/cancel     熔断取消复核任务 { id }（SIGTERM）
 //   GET    /second-engine/api/reviews?limit=    复核历史（~/.codex/reviews 持久化记录，倒序）
 //   GET    /second-engine/api/config            读插件配置（复核轮数 reviewRounds）
 //   POST   /second-engine/api/config            写插件配置 { reviewRounds: 1|3|5 }
-//   POST   /second-engine/api/consult           Codex 卡点求助入队（内存 20 条 + 弹 App 通知）
+//   POST   /second-engine/api/consult           Codex 卡点求助入队 { from, task, taskId?, stuckContext }（内存 20 条 + 弹 App 通知）
 //   GET    /second-engine/api/consults          求助列表（不脱敏，给主 AI 收卷）
 //   GET    /second-engine/api/version           本机 codex 版本 vs GitHub 最新 release（updateAvailable）
 //   GET    /second-engine/api/plugin-version    插件自身版本 vs GitHub 最新 release（失败静默，无更新不提示）
@@ -5215,13 +5215,13 @@ export function apply(ctx) {
     // method/desc 内联进注册条目：GET /_meta 遍历本数组自动生成路由清单，别另手抄第二份。
     const routes = [
       { kind: 'exact', method: 'GET', path: '/second-engine/api/pi-panel', desc: 'Pi 引擎面板数据（提供方/MCP/聊天桥/会话/模型渠道）', handler: handlePiPanel },
-      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel', desc: 'Pi 自定义模型渠道：写入 ~/.pi/agent/models.json 的 providers.<id>（写前 .bak、0600）', handler: handlePiChannelCreate },
-      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-model', desc: 'Pi 默认模型切换：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel（新建会话生效）', handler: handlePiModelSet },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel', desc: 'Pi 自定义模型渠道 { id, baseUrl, api?, models[], name?, apiKey? }：写入 ~/.pi/agent/models.json 的 providers.<id>（写前 .bak、0600）', handler: handlePiChannelCreate },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-model', desc: 'Pi 默认模型切换 { provider, model }：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel（新建会话生效）', handler: handlePiModelSet },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-bridge', desc: 'Pi 聊天桥启停 { action: start|stop }（起后真探活 8788 再回报）', handler: handlePiBridge },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-cleanup', desc: 'Pi 会话清理 { confirm: true }：删 ~/.pi/agent/sessions 下 *.jsonl', handler: handlePiCleanup },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel-delete', desc: 'Pi 删除自定义渠道 { id }（写前 .bak、0600）', handler: handlePiChannelDelete },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/status', desc: '引擎/密钥/会话占用概览', handler: handleStatus },
-      { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/providers', desc: 'GET 提供方列表（apiKey 脱敏）+ active；POST 新增自定义提供方', handler: handleProvidersRoot },
+      { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/providers', desc: 'GET 提供方列表（apiKey 脱敏）+ active；POST 新增自定义提供方 { id, baseUrl, api, apiKey, name? }', handler: handleProvidersRoot },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/providers/key', desc: '设置指定提供方 apiKey（keyring 0600）', handler: handleProviderKey },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/providers/active', desc: '切换激活并生成 config.toml（先备份）', handler: handleProviderActive },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/providers/delete', desc: '删除自定义提供方（预设不可删）', handler: handleProviderDelete },
@@ -5230,10 +5230,10 @@ export function apply(ctx) {
       { kind: 'exact', method: 'POST', path: '/second-engine/api/model', desc: '更新该提供方 model（active 时重写 config.toml）', handler: handleProviderModel },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/key', desc: '兼容旧面板：给预设提供方写 key', handler: handleKey },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/cleanup', desc: '按 mtime 清理旧会话 *.jsonl（body 带 codexLogs:true 时顺带清 Codex logs_2.sqlite：删超期行 + 碎片超 30% 且安全闸全过才 VACUUM）', handler: handleCleanup },
-      { kind: 'exact', method: 'POST|GET', path: '/second-engine/api/task', desc: 'POST 下发异步工单（后台 codex exec，完成弹 App 通知；ephemeral 缺省 true）；GET ?id= 单条工单全量（含 output）', handler: handleTaskRoot },
+      { kind: 'exact', method: 'POST|GET', path: '/second-engine/api/task', desc: 'POST 下发异步工单 { prompt, workdir?, ephemeral?, engine?, provider? }（后台跑，完成弹通知；GET ?id= 单条全量）', handler: handleTaskRoot },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/tasks', desc: '最近 10 条工单摘要（不含 output）', handler: handleTaskList },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/task/cancel', desc: '取消运行中的工单（SIGTERM）', handler: handleTaskCancel },
-      { kind: 'exact', method: 'POST', path: '/second-engine/api/review', desc: '双向互审：多轮批判复核；可带 prev=<上一轮复核id> 接力、reply=[{issueId,decision,reason}] 按账本序号 i<N> 逐条回辩（兼容 v1 哈希 id 与旧 issueIndex）', handler: handleReviewCreate },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/review', desc: '双向互审 { content, workdir?, rounds? }：多轮批判复核；可带 prev=<上一轮复核id> 接力、reply=[{issueId,decision,reason}] 按账本序号 i<N> 逐条回辩（兼容 v1 哈希 id 与旧 issueIndex）', handler: handleReviewCreate },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/review/cancel', desc: '熔断取消复核任务（SIGTERM）', handler: handleReviewCancel },
       // #8-10：复核历史（落盘记录倒序；内存 tasks Map 重启即失，这里是持久真值）。
       { kind: 'exact', method: 'GET', path: '/second-engine/api/reviews', desc: '复核历史（~/.codex/reviews 持久化记录，倒序；?limit=）', handler: handleReviewsList },
