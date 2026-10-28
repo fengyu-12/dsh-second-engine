@@ -613,7 +613,7 @@ try {
     <div class="empty-hero" id="emptyhero" hidden>
       <span class="eh-ico"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15z"/></svg></span>
       <h3>这个会话还没有内容</h3>
-      <p>在下方输入框发第一条消息；终端里聊过的会话可以从左侧列表切换进来。</p>
+      <p>在下方输入框发第一条消息，<b class="engine-name">Codex</b> 的回答会出现在这里；终端里聊过的会话可以从左侧列表切换进来。</p>
     </div>
   </div>
 
@@ -715,6 +715,51 @@ if (fromUrl) {
   history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
 }
 const TOKEN = localStorage.getItem('bridge_token') || '';
+
+// ── 引擎身份（P5.1，2026-10-29 阶段 B）───────────────────────────────
+// 页面由两套桥共用（Codex 桥 bridge/web/server.mjs:36 默认 3095 / Pi 桥 bridge/pi/server.mjs:22 默认 8788，
+// Pi 桥直接复用本文件：bridge/pi/server.mjs:129-151），所以不能把 AI 署名写死成 Codex。
+// 取值一律**不推断**：
+//   1) GET /api/health —— 两桥都有：Codex server.mjs:671（该端点在 token 门禁 server.mjs:699 之前，
+//      无需 token；但响应里**没有** engine 字段，所以它只能当连通性兜底）、Pi server.mjs:122（带 engine:'pi'）；
+//   2) GET /api/config —— 只有 Pi 桥带 engine（server.mjs:171-173）；Codex 桥的 /api/config 是 config.toml
+//      字段集（server.mjs:515-524，无 engine）且文件缺失时 500（handleGetConfig:503-509），不能当唯一来源。
+// 兜底 'Codex'：拿不到身份时维持改造前行为（v1 任务书 §7.2 口径），不猜成 Pi。
+// ⚠️ 这里的 'codex' 是**引擎标识**，与 data-skin=codex/claude 那套配色皮肤名无关（红线：皮肤名不改）。
+let engineId = '';
+let engineName = 'Codex';
+const ENGINE_LABELS = { codex: 'Codex', pi: 'Pi' };
+const engineHeaders = () => ({ 'x-bridge-token': TOKEN });
+
+function applyEngineIdentity() {
+  document.querySelectorAll('.engine-name').forEach((node) => { node.textContent = engineName; });
+}
+
+// 只认服务端明说的 engine 字段；两个端点都没给 → 保持 Codex 兜底。
+function noteEngineIdentity(raw) {
+  const id = String((raw && raw.engine) || '').toLowerCase();
+  if (id !== 'pi' && id !== 'codex') return;
+  if (id === engineId) return;
+  engineId = id;
+  engineName = ENGINE_LABELS[id] || 'Codex';
+  applyEngineIdentity();
+}
+
+async function loadEngineIdentity() {
+  if (!TOKEN) return;   // 无 token 时请求只会被 401，白刷一次控制台
+  const attempts = [
+    () => fetch('/api/health', { headers: engineHeaders() }),
+    () => fetch('/api/config', { headers: engineHeaders() }),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const resp = await attempt();
+      const raw = await resp.json().catch(() => null);
+      if (resp.ok && raw && raw.engine !== undefined) { noteEngineIdentity(raw); return; }
+    } catch { /* 桥未起 / 网络异常：下一个端点，最后落到 Codex 兜底 */ }
+  }
+}
+
 let threadId = localStorage.getItem('bridge_thread') || null;
 let controller = null;
 let lastBubble = null;
@@ -839,10 +884,14 @@ function renderConvoList() {
       meta.appendChild(busyTag);
     }
     if (t.pending) meta.appendChild(el('span', 'tag new', '未开始'));
-    // 会话 ID 芯片：点一下复制完整 id（终端里 codex-env -a <id> 要用）
+    // 会话 ID 芯片：点一下复制完整 id
     const shortId = String(t.id || '').slice(0, 8);
     const idChip = el('span', 'tag idchip', shortId);
-    idChip.title = '点击复制完整会话 ID：' + t.id;
+    // 提示按引擎（P5.1）：codex-env -a <id> 只对 Codex 有意义，Pi 桥下不提示这个命令
+    // （Pi 侧的会话管理命令本包未提供，宁可不提示，不编造）。
+    idChip.title = engineId === 'pi'
+      ? '点击复制完整会话 ID：' + t.id
+      : '点击复制完整会话 ID（终端里 codex-env -a <id> 要用）：' + t.id;
     idChip.addEventListener('click', (ev) => {
       ev.stopPropagation();
       copyText(t.id, () => {
@@ -1112,7 +1161,8 @@ function scroll(force) { if (force || nearBottom()) log.scrollTop = log.scrollHe
 
 function addMessage(who, text, restore) {
   const box = el('div', 'msg ' + who);
-  box.appendChild(el('div', 'who', who === 'me' ? '你' : 'Codex'));
+  // 署名跟引擎走（P5.1）：原来写死 'Codex'，Pi 桥（8788）复用同一页面时会把 Pi 答成 Codex。
+  box.appendChild(el('div', 'who', who === 'me' ? '你' : engineName));
   const bubble = el('div', 'bubble', text);
   box.appendChild(bubble);
   log.appendChild(box);
@@ -1384,6 +1434,11 @@ replay();
 renderConvoList();
 loadThreads();
 loadRuntimeSettings();
+// 引擎身份取到后：重画静态署名，并把已经渲染出来的气泡署名一并纠正
+// （replay() 在身份回来前就跑完了，不补这一步，历史消息会停在兜底的 Codex 上）。
+loadEngineIdentity().then(() => {
+  log.querySelectorAll('.msg.ai > .who').forEach((node) => { node.textContent = engineName; });
+});
 
 if (!TOKEN) addNote('没有 token：请用启动时打印的完整网址打开本页', 'error');
 else setStatus(threadId ? '已接上一轮对话' : '就绪');

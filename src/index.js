@@ -39,7 +39,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync
 import { spawn, execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
-import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId } from './engine/registry.js'
+import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
 import { piProbe, piAvailableModels, resolvePiProvider, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
 import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl } from './engine/pi-bridge.js'
 import http from 'node:http'
@@ -1202,7 +1202,7 @@ function activeEngineModel(id) {
 async function engineView() {
   const active = activeEngineId()
   const caps = ENGINES[active] !== undefined ? ENGINES[active].capabilities : null
-  const view = { active, list: engineList(), caps, model: activeEngineModel(active) }
+  const view = { active, list: engineList(), caps, model: activeEngineModel(active), cleanup: cleanupTarget(active) }
   if (active === 'pi') {
     try { view.probe = { pi: await piProbe(), models: await piAvailableModels() } }
     catch (e) { view.probe = { pi: null, models: null, error: errMsg(e) } }

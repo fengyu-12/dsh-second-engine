@@ -50,6 +50,24 @@ interface EngineCapabilities {
   readonly resume: boolean;                           // 能否续会话
   readonly checkpoint: boolean;
   readonly usage: boolean;                            // 是否报 token 用量
+  // ── P4.24（2026-10-29）面板能力适配：语义已定死，不得互推 ──
+  readonly chatBridge: boolean;                       // 用户**是否可用** Web 聊天桥（不是「怎么实现」）
+  readonly chatBridgeMode: 'app-server' | 'pi-rpc' | 'none'; // 实现模式；与 chatBridge 两个维度
+  readonly modelSwitch: 'config-file' | 'runtime-command';   // 模型切换方式（仅描述切换）
+  readonly versionCheck: 'github' | 'npm';                   // 版本检查源；非 github 不得请 /api/version
+  readonly mcp: 'config-toml' | 'pi-config' | 'none';        // MCP 配置真源；**不得**由 modelSwitch 推导
+  readonly webSearch: boolean;                        // 原生联网搜索开关可用性；与 mcp 独立
+}
+
+/**
+ * 清理目标（P4.24）。**不**塞进 capabilities：`resume` 与「删哪个目录」无因果关系。
+ * 实现在 src/engine/registry.js 的 CLEANUP_TARGETS，唯一出口是 engineView() 的 `engine.cleanup`。
+ */
+interface CleanupTarget {
+  readonly dir: string;              // 绝对路径（直接给 UI 显示，不让用户猜）
+  readonly filePattern: string;      // 如 '*.jsonl'
+  readonly appliesToEngine: string;  // 该目标属于哪个引擎
+  readonly confirmRequired: boolean; // 破坏性确认（Pi 走 POST /api/pi-cleanup 的 confirm:true）
 }
 
 interface ViewEvent { kind: 'status' | 'text' | 'reasoning' | 'tool' | 'usage' | 'done'; text: string; at: number }
@@ -110,6 +128,8 @@ interface TaskRuntime {
 |---|---|---|
 | `descriptor.transport` | `task.mode` 判断 `:1749`、赋值 `:2281`；`task.child:2328`、`task.app:2329` | 由「有没有 child / app」推导，替代字符串枚举 |
 | `capabilities` | 目前**无承载点** → 新增字段，落 `taskView:1735` 与 `/status` 响应 | 纯增量，UI 按能力降级 |
+| `capabilities.chatBridge` / `chatBridgeMode` / `mcp` / `webSearch`（P4.24） | 定义 `registry.js:ENGINES[*].capabilities` → 出口 `index.js:1202 engineView()` → 消费 `client.js:418` 兜底 | 同一提交内同步四处（任务书 v2 §4.5）；新字段对旧前端是惰性增量 |
+| `CleanupTarget`（P4.24） | `registry.js:CLEANUP_TARGETS` → `engineView().cleanup`；实际删除仍是 `handleCleanup:2492` / `handlePiCleanup:1495` | UI 必须显示 `dir`；`resume` 与清理不得互推 |
 | `start()` | `startAppServerTask:2267`、`spawnReviewRound:3089`、exec 的 `child.on('exit'):2456`、复核的 `:3116` | 三入口收敛成一个；child 归 runtime 持有 |
 | `cancel()` | `handleTaskCancel:2504`（写意图 `:2517`）、`handleReviewCancel:3518`（`:3530`） | 两处只写意图，不预置终态（已经是现状） |
 | `heartbeat()` | `onEvent` 写 `activityAt` `:2325`、`startWatchdog:1838` 判据 `:1851-1853`、`outFileMtimeMs:1826` | 看门狗不再直接读 mtime，改调 heartbeat |
@@ -189,7 +209,9 @@ class FixedRuntime {
 ## 五、未定项（实施时再决，不阻塞合同）
 
 1. `events()` 的序号语义：用递增 seq 还是时间戳游标（Codex 建议 cursor，可重放）。
-2. `capabilities` 放哪：`taskView` 顶层还是嵌在 `engine` 字段下（影响前端改动面）。
+2. ~~`capabilities` 放哪：`taskView` 顶层还是嵌在 `engine` 字段下（影响前端改动面）。~~
+   **已定（P4.24，2026-10-29）**：面板侧嵌在 `/status` 与 `/config` 的 `engine.caps` 下（出口 `engineView():1202`）；
+   `taskView` 侧仍待收编。清理范围**不入** `capabilities`，走 `engine.cleanup: CleanupTarget`。
 3. review 域的 `details` 类型：目前 `rounds/issues/verdict` 形状未定，先用 `unknown`。
 
 ---
