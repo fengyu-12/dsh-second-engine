@@ -344,7 +344,7 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 ```
 -c model_provider=relay -c model="<模型名>" \
 -c 'model_providers.relay.name="relay"' \
--c 'model_providers.relay.base_url="https://laneai.dev/v1"' \
+-c 'model_providers.relay.base_url="<你的中转站 base_url>"' \
 -c 'model_providers.relay.wire_api="responses"' \
 -c 'model_providers.relay.env_key="RELAY_API_KEY"'
 ```
