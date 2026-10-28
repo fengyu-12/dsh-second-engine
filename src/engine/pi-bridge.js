@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,10 +29,15 @@ export async function startPiBridge() {
   if (await probe()) return { ok: true, running: true, port: PI_BRIDGE_PORT, note: '已在运行' }
   const script = join(PLUGIN_ROOT, 'bridge', 'pi', 'server.mjs')
   if (!existsSync(script)) return { ok: false, error: `找不到聊天桥脚本：${script}` }
+  // P4.26（2026-10-29）：桥的 cwd 决定两件事——会话落盘分区（sessions/<cwd 编码>/）
+  // 与项目级 AGENTS.md 的向上查找起点。默认给独立工作区，避免落进 DSH 进程 cwd（可能是 ~ 或插件目录）；
+  // 需要换目录时设 PI_BRIDGE_CWD（与 Codex 的工程工作区混用会让两引擎改同一批文件）。
+  const bridgeCwd = process.env.PI_BRIDGE_CWD || join(homedir(), 'pi-workspace')
+  try { mkdirSync(bridgeCwd, { recursive: true }) } catch { /* best effort */ }
   const proc = spawn(process.execPath, [script], {
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, PI_BRIDGE_PORT: String(PI_BRIDGE_PORT), PI_BRIDGE_HOST: '127.0.0.1' },
+    env: { ...process.env, PI_BRIDGE_PORT: String(PI_BRIDGE_PORT), PI_BRIDGE_HOST: '127.0.0.1', PI_BRIDGE_CWD: bridgeCwd },
   })
   proc.unref()
   child = proc

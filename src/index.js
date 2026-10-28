@@ -456,6 +456,14 @@ const AGENTS_BASE_URL = (() => {
   }
   return 'http://127.0.0.1:3080'
 })()
+// P4.26：Pi 的通知段用 Pi 的身份（标题与 from 字段），其余文案两引擎通用。
+// 只替换这两处 —— 段里其它「Codex」字样出现在历史/对照语境，不影响 Pi 照做。
+function agentsSectionFor(targetPath) {
+  if (!String(targetPath).startsWith(PI_AGENT_DIR)) return AGENTS_SECTION
+  return AGENTS_SECTION
+    .replace('# Codex 全局协作协议（by dsh-second-engine）', '# Pi 全局协作协议（by dsh-second-engine）')
+    .replace('"from":"codex"', '"from":"pi"')
+}
 const AGENTS_SECTION = `${AGENTS_MARK}
 # Codex 全局协作协议（by dsh-second-engine）
 
@@ -561,7 +569,7 @@ function ensureAgentsProtocol() {
       // 会把 v1 段之后直到文件尾的内容静默丢掉；现在三级全不命中就告警不动手。
       const noV1 = stripManagedSection(existing, AGENTS_V1_MARK, AGENTS_V1_END, AGENTS_V1_TAIL_ANCHORS, 'agents-protocol')
       if (noV1 === null) continue
-      const next = replaceManagedSection(noV1, AGENTS_MARK, AGENTS_END, AGENTS_TAIL_ANCHORS, AGENTS_SECTION, 'agents-protocol')
+      const next = replaceManagedSection(noV1, AGENTS_MARK, AGENTS_END, AGENTS_TAIL_ANCHORS, agentsSectionFor(path), 'agents-protocol')
       if (next === null || next === existing) continue
       atomicWriteFileSync(path, next)
     }
