@@ -9,7 +9,7 @@
 import { EventEmitter } from 'node:events';
 
 export class AppServerClient extends EventEmitter {
-  constructor(url, { clientInfo = { name: 'web-bridge', version: '2.0' }, log = () => {} } = {}) {
+  constructor(url, { clientInfo = { name: 'web-bridge', version: '2.0' }, log = (_msg = '') => {} } = {}) {
     super();
     this.url = url;
     this.clientInfo = clientInfo;
