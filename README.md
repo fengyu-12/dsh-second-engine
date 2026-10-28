@@ -260,7 +260,7 @@ curl -s -X POST "$W/second-engine/api/task" \
   末轮未决问题同时以 `[REVIEW_ISSUES]` 块追加进该复核任务的 `output`。带 `reviewDirty` 时通知也会提示
   （复核窗口内工作区新增改动＝**证据**：含任何写入者的改动，不归因、不阻断——起点已脏的路径不计入）。
 
-## 支持能力一览（v3.6.2）
+## 支持能力一览（v3.7.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -289,6 +289,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 
 | 版本 | 关键点 |
 |---|---|
+| **3.7.0** | **Pi 第二引擎运行时接入阶段 + 文档三处对齐**。① 新增 `src/engine/pi-runtime.js` / `pi-rpc-runtime.js` / `pi-bridge.js` / `pi-probe.js` / `registry.js` 与 `lib/pi-cards.js`、`bridge/pi/`；② `src/app-server-client.js` / `src/bridge-routes.js` / `src/engine/runtime.js` 等随阶段改动，新增 `tools/lint-undef.config.mjs`；③ 文档新增「文件地图 · 哪份是真身」，三处版本号统一 **3.7.0**（①②逐字节相同、③剔私）。 |
 | **3.6.2** | **补第二批「端口 / 注释」缺陷 + 固化冒烟**。① `tools/wait-task.sh`（连环境变量兜底都没有）与 `tools/dual-board/dispatch.sh` 的 Web 地址默认写死 `127.0.0.1:3080`，动态端口下派单/等待直接连不通 → 新增 `tools/web-base.sh`，优先级 `SECOND_ENGINE_BASE_URL` > `DSH_WEB_URL` > 运行中宿主 `--port` > 3080。② 行尾注释保留改**引号感知**（新 `bridge/web/toml-comment.mjs`）：值含 ` # ` 时不再从引号内部切开，`#` 前无空格的尾注也能保留。③ 新增 `tools/smoke.sh`：干净环境冒烟（语法 / 端口解析 / wait-task 联调 / 看板全链路 / dispatch 草稿 / install dry-run / 注释单测 / 三处落点对齐）。④ 版本记录计数口径统一：3.6.1 实为 **14 处**（5+2+2+1+3+1）。 |
 | **3.6.1** | **修「干净环境一跑就崩」的 14 处**（3.6.0 包里它们在新装用户第一次运行时全部踩中；作者机因目录早已手建从未触发）：`install.sh` 按旧布局找路径等 5 处 · `board_tool.py` 不建数据目录 + **12 个子命令无一能建板** 2 处 · `dispatch.sh` 收件箱缺失即报错 + 用数据目录找随包脚本 2 处 · `package.json` 的 `files` 漏 `wait-task.sh`/`t-tool.sh` 1 处 · 3 个注入函数补 `mkdirSync(CODEX_DIR)` 3 处 · 网页桥 `updateConfigToml` 保留行尾注释 1 处。**验收**：`DUAL_BOARD_DIR=$(mktemp -d)` → `board.sh new` → `dispatch.sh` 双 exit 0。 |
 | **3.6.0** | **债务清算 + 实现优化**。修三处**不报错**的静默失效：① 卡点求助地址写死 3080（新版 DSH 改动态端口后一直连不通，只靠文本兜底）→ 改从宿主 `--port` 解析；② `~/.codex/AGENTS.md` 的 v2/board 段「标记存在就跳过」⇒ 老用户永远拿不到新内容 → 补结束标记 + 摘除重写 + 三级边界（末命中则告警不动手），`v1→v2` 不再静默截断；③ `rounds[].verdict` 与终止判据口径不一致。补两处**写了但从没跑到**的清理：`.live` 被 200 MB 阈值挡在后面（10-17 起未执行）→ 从阈值摘出；Codex 日志库按时间清 + 碎片回收（`node:sqlite`，五道安全闸）。优化：复核**首轮**提示词补三条硬要求 · 复核新增 `blocked` 硬档（识别即终止）· 只读 `independentSources`/`quorumNote`（不参与收敛判定）· 写入统一原子化 · `config.toml` 备份轮转留 5 份 · 新增 `GET /api/_meta` 路由自描述。 |
