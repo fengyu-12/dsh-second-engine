@@ -2,7 +2,7 @@
 # dual-board 派单 wrapper（v1.2）—— 由 board.sh 生态配套使用
 #
 # 作用：派单前自动做三件事，避免"协议写了但没人执行"：
-#   1) 注入 inbox-codex.md 的全部未读段（解决「Codex 被动唤醒看不到留言」）
+#   1) 注入目标角色收件箱的全部未读段
 #   2) 附固定【派单纪律】尾段
 #   3) 派单「之前」记录 workdir 基线 commit + write_scopes → .dispatch/<task id>.base（供 board.sh scope-check 用）
 #
@@ -37,7 +37,6 @@ from pathlib import Path
 BOARD_DIR = Path(os.environ.get("DUAL_BOARD_DIR") or (Path.home() / "proj" / "dual-board"))
 # heredoc 从 stdin 跑，__file__ 是 '<stdin>' 拿不到脚本路径，故由外层 bash 导出随包脚本目录
 SCRIPT_DIR = Path(os.environ["DUAL_BOARD_SCRIPT_DIR"])
-INBOX = BOARD_DIR / "inbox-codex.md"
 DISPATCH_DIR = BOARD_DIR / ".dispatch"
 API_URL = (os.environ.get("SECOND_ENGINE_BASE_URL") or os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/") + "/second-engine/api/task"
 
@@ -66,12 +65,13 @@ def unread_segments(text):
 
 
 def build_prompt(task, context, self_test, scopes):
+    inbox = inbox_for_role(ROLE, required=True)
     try:
-        inbox_text = INBOX.read_text(encoding="utf-8")
+        inbox_text = inbox.read_text(encoding="utf-8")
     except FileNotFoundError:
         inbox_text = ""  # 收件箱还没建 = 没有未读消息，不是错误
     except OSError as error:
-        raise RuntimeError(f"无法读取收件箱 {INBOX}: {error}") from error
+        raise RuntimeError(f"无法读取收件箱 {inbox}: {error}") from error
 
     parts = []
     segments = unread_segments(inbox_text)
@@ -89,6 +89,31 @@ def build_prompt(task, context, self_test, scopes):
     )
     parts.append("【自测/验收】\n" + self_test)
     return "\n\n".join(parts), segments
+
+def roles_from_board():
+    """读取 board.json 的 roles；板不存在时回落到默认两角色（不写盘）。"""
+    default = {"lead": {"inbox": "inbox-lead.md", "engine": "dsh"},
+               "codex": {"inbox": "inbox-codex.md", "engine": "codex"}}
+    try:
+        with open(BOARD_DIR / "board.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"无法读取角色配置：{error}")
+    return data.get("roles") or default
+
+def inbox_for_role(role, required=False):
+    roles = roles_from_board()
+    spec = roles.get(role)
+    if not spec:
+        raise RuntimeError(f"角色不存在：{role}")
+    if spec.get("engine") != "codex":
+        raise RuntimeError(f"角色 {role} 的 engine={spec.get('engine')} 暂无派单适配器")
+    path = BOARD_DIR / spec.get("inbox", "")
+    if required and not path.name:
+        raise RuntimeError(f"角色 {role} inbox 配置无效")
+    return path
 
 
 def validate_workorder(args, scopes):
@@ -231,8 +256,7 @@ def auto_archive():
     """
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # v1.3：完成即出板 → 不再 archive completed；改为把 channel 归到窗口大小
-    jobs = [["inbox-read", "codex"], ["inbox-archive", "codex"],
-            ["inbox-archive", "lead"], ["channel-trim", "--keep", "10"]]
+    jobs = [["inbox-read", ROLE], ["inbox-archive", ROLE], ["channel-trim", "--keep", "10"]]
     for argv in jobs:
         try:
             proc = subprocess.run(["bash", str(SCRIPT_DIR / "board.sh")] + argv,
@@ -243,9 +267,9 @@ def auto_archive():
         except Exception as error:
             print(f"[自动归档] 跳过 {' '.join(argv)}: {error}", file=sys.stderr)
     try:
-        lines = sum(1 for _ in open(BOARD_DIR / "inbox-lead.md", encoding="utf-8"))
+        lines = sum(1 for _ in open(inbox_for_role(ROLE), encoding="utf-8"))
         if lines > 100:
-            print(f"[提醒] lead 收件箱已 {lines} 行：读完后跑 board.sh inbox-read lead 再归档",
+            print(f"[提醒] {ROLE} 收件箱已 {lines} 行：读完后跑 board.sh inbox-read {ROLE} 再归档",
                   file=sys.stderr)
     except Exception:
         pass
@@ -263,11 +287,14 @@ def main():
     parser.add_argument("--board-id", default=None,
                         help="看板任务 id（如 T5）：写一份 <board-id>.base 别名，"
                              "让 scope-check 能按看板 id 找到基线（v1.3）")
+    parser.add_argument("--to", default="codex")
     parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args()
+    global ROLE
+    ROLE = args.to
 
     if args.help:
-        print('用法: dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--dry-run]')
+        print('用法: dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--to ROLE] [--dry-run]')
         return 0
     if not args.task or not args.task.strip():
         usage(parser)
@@ -291,6 +318,11 @@ def main():
     scopes = [s for s in args.scope.split(",") if s.strip()]
 
     try:
+        try:
+            inbox_for_role(args.to)
+        except RuntimeError as error:
+            print(f"派单被拒：{error}", file=sys.stderr)
+            return 2
         prompt, _ = build_prompt(args.task, args.context, args.self_test, scopes)
         if args.dry_run:
             print(prompt)

@@ -32,14 +32,16 @@ BOARD_DIR = os.environ.get("DUAL_BOARD_DIR") or os.path.dirname(os.path.abspath(
 BOARD = os.path.join(BOARD_DIR, "board.json")
 LOCK = os.path.join(BOARD_DIR, "board.json.lock")
 ARCHIVE_DIR = os.path.join(BOARD_DIR, "archive")
+AUDIT_DIR = os.path.join(BOARD_DIR, "audit")   # 完成审计（人确认留痕）；与 archive 语义分开，见 PROTOCOL §12.2
 DISPATCH_DIR = os.path.join(BOARD_DIR, ".dispatch")
 STALE_SEC = 600
 LOCK_TRIES = 50          # 50 × 0.1s = 5s
 LOCK_SLEEP = 0.1
-INBOX = {"codex": "inbox-codex.md", "lead": "inbox-lead.md"}
+DEFAULT_ROLES = {"lead": {"inbox": "inbox-lead.md", "engine": "dsh"},
+                 "codex": {"inbox": "inbox-codex.md", "engine": "codex"}}
 VALID_STATUS = ("pending", "in_progress", "blocked", "completed", "abandoned")
 TERMINAL = ("completed", "abandoned")
-TASK_TEMPLATE_KEYS = ("frame", "session", "write_scopes", "blocked_by", "acceptance", "result")
+TASK_TEMPLATE_KEYS = ("frame", "session", "write_scopes", "blocked_by", "acceptance", "result", "steps")
 FRAME = "双方都是用户目标的执行者，质疑前提是分内事不是越权。"
 
 
@@ -117,6 +119,39 @@ def load_board(create: bool = False) -> dict:
     return data
 
 
+_ROLE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,23}$")
+def validate_roles(roles: object) -> None:
+    if not isinstance(roles, dict) or not roles:
+        raise ValueError("roles 必须是非空对象")
+    inboxes = set()
+    for role, spec in roles.items():
+        if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
+            raise ValueError(f"非法角色名：{role!r}")
+        if not isinstance(spec, dict):
+            raise ValueError(f"角色 {role} 配置必须是对象")
+        inbox, engine = spec.get("inbox"), spec.get("engine")
+        if not isinstance(inbox, str) or not inbox or os.path.basename(inbox) != inbox or ".." in inbox:
+            raise ValueError(f"角色 {role} inbox 必须是单个文件名")
+        if inbox in inboxes:
+            raise ValueError(f"inbox 重复：{inbox}")
+        inboxes.add(inbox)
+        if engine not in ("dsh", "codex", "pi"):
+            raise ValueError(f"角色 {role} engine 非法：{engine!r}")
+
+def load_roles(data: dict) -> dict:
+    roles = data.get("roles", DEFAULT_ROLES)
+    validate_roles(roles)
+    return roles
+
+def role_exists(roles: dict, role: str) -> bool:
+    return role in roles
+
+def inbox_path(roles: dict, role: str) -> str:
+    if not role_exists(roles, role):
+        die(5, f"角色不存在：{role}")
+    return os.path.join(BOARD_DIR, roles[role]["inbox"])
+
+
 def save_board(data: dict) -> None:
     """原子写：临时文件 + os.replace，避免半截 JSON。"""
     fd, tmp = tempfile.mkstemp(dir=BOARD_DIR, prefix=".board.tmp-")
@@ -165,7 +200,40 @@ def fill_template(task: dict) -> dict:
     task.setdefault("blocked_by", [])
     task.setdefault("acceptance", "")
     task.setdefault("result", "")
+    task.setdefault("steps", [])
     return task
+
+
+def parse_steps(value: str) -> list[dict]:
+    """Parse comma-separated task steps without changing task lifecycle state."""
+    if not value:
+        die(2, "steps 不能为空，至少需要 1 项")
+    if len(value) > 4000:
+        die(2, f"steps 总长度超限：{len(value)} 字符（上限 4000）")
+    raw_items = value.split(",")
+    if len(raw_items) > 20:
+        die(2, f"steps 项数超限：{len(raw_items)} 项（上限 20）")
+    if any(not item.strip() for item in raw_items):
+        die(2, "steps 含空条目（请检查首尾逗号、连续逗号或空白项）")
+    parsed = []
+    for index, item in enumerate(raw_items, 1):
+        if item.count("::") > 1:
+            die(2, f"steps 第 {index} 项格式错误：最多只能包含一个 ::")
+        if "::" in item:
+            description, status = item.rsplit("::", 1)
+            description = description.strip()
+            status = status.strip()
+            if status not in ("pending", "done"):
+                die(2, f"steps 第 {index} 项状态非法：{status!r}（只接受 pending 或 done）")
+        else:
+            description = item.strip()
+            status = "pending"
+        if not description:
+            die(2, f"steps 第 {index} 项描述不能为空")
+        if len(description) > 200:
+            die(2, f"steps 第 {index} 项描述超限：{len(description)} 字符（上限 200）")
+        parsed.append({"text": description, "status": status})
+    return parsed
 
 
 # ---------------------------------------------------------------- 子命令
@@ -187,6 +255,7 @@ def cmd_new(a) -> None:
             "blocked_by": [s for s in (a.blocked or "").split(",") if s],
             "acceptance": a.acceptance or "",
             "session": a.session,
+            "engine": a.engine,
             "result": "",
             "updated_at": now_utc(),
         })
@@ -199,6 +268,9 @@ def cmd_claim(a) -> None:
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
+        roles = load_roles(data)
+        if not role_exists(roles, a.owner):
+            die(5, f"角色不存在：{a.owner}")
         t = find_task(data, a.id)
         check_deps(data, t)
         if t.get("status") not in ("pending", "blocked"):
@@ -211,6 +283,13 @@ def cmd_claim(a) -> None:
 
 
 def cmd_complete(a) -> None:
+    reviewed = getattr(a, "reviewed_by", None)
+    keep = getattr(a, "keep", False)
+    if reviewed is not None and reviewed != "human":
+        die(5, "--reviewed-by 只接受 human（Agent 自报不算）")
+    if not keep and reviewed != "human":
+        die(5, "未经人确认的完成不算完成：出板需要 --reviewed-by human（Agent 自报不算）；"
+               "自动化交付请用 --keep 留在板等人审")
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
@@ -221,16 +300,23 @@ def cmd_complete(a) -> None:
             die(2, "complete 必须给 --result（产出位置 + 摘要）")
         if t.get("owner") and a.owner and t["owner"] != a.owner and not a.force:
             die(5, f"{a.id} owner 是 {t['owner']}，{a.owner} 无权完成（--force 可覆盖）")
+        reviewed_at = now_utc()
         t["status"] = "completed"
         t["owner"] = t.get("owner") or a.owner
         t["result"] = a.result
-        t["updated_at"] = now_utc()
+        t["updated_at"] = reviewed_at
+        if reviewed == "human":
+            t["reviewed_by"] = "human"
+            t["reviewed_at"] = reviewed_at
         summary = a.result.strip().splitlines()[0][:120]
         if getattr(a, "keep", False):
             commit(data, f"{a.id} 完成（--keep 保留在板）")
             save_board(data)
             print(f"ok: {a.id} 完成（按要求保留在板）")
             return
+        month = month_bj()
+        _append_jsonl(os.path.join(AUDIT_DIR, f"completed-{month}.jsonl"),
+                      [dict(t, recorded_at=now_utc())])
         # v1.3 §12.1：完成即出板，板上只留在办/挂起；§12.4：channel 只留窗口
         data["tasks"] = [x for x in data["tasks"] if x.get("id") != a.id]
         commit(data, f"{a.id} 完成（目的达成）· 出板")
@@ -268,11 +354,12 @@ def cmd_abandon(a) -> None:
 
 
 def cmd_set(a) -> None:
-    allow = {"owner", "session", "result", "acceptance", "subject", "context", "status",
-             "write_scopes", "blocked_by"}
+    allow = {"owner", "session", "engine", "result", "acceptance", "subject", "context", "status",
+             "write_scopes", "blocked_by", "steps"}
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
+        roles = load_roles(data)
         t = find_task(data, a.id)
         for pair in a.pairs:
             if "=" not in pair:
@@ -284,7 +371,14 @@ def cmd_set(a) -> None:
                 die(5, f"非法状态：{v}")
             if k == "status" and v == "completed" and t.get("status") in TERMINAL:
                 die(5, "completed 不可复改")
-            t[k] = [x for x in v.split(",") if x] if k in ("write_scopes", "blocked_by") else v
+            if k == "owner" and v and not role_exists(roles, v):
+                die(5, f"角色不存在：{v}")
+            if k == "engine" and v not in ("dsh", "codex", "pi"):
+                die(5, f"engine 非法：{v}")
+            if k == "steps":
+                t[k] = parse_steps(v)
+            else:
+                t[k] = [x for x in v.split(",") if x] if k in ("write_scopes", "blocked_by") else v
         t["updated_at"] = now_utc()
         commit(data, f"{a.id} 字段更新")
         save_board(data)
@@ -339,21 +433,25 @@ def cmd_show(a) -> None:
         if a.id:
             print(f"    task: {t.get('task','')}")
             print(f"    scopes: {t.get('write_scopes')}  session: {t.get('session')}")
+            for index, step in enumerate(t.get("steps") or [], 1):
+                print(f"    {index}. [{step.get('status', '')}] {step.get('text', '')}")
             print(f"    acceptance: {t.get('acceptance','')}")
             print(f"    result: {(t.get('result') or '').strip()[:400]}")
 
 
-def _inbox_path(who: str) -> str:
-    return os.path.join(BOARD_DIR, INBOX[who])
+def _roles_for_command() -> dict:
+    return load_roles(load_board())
 
 
 def cmd_inbox_append(a) -> None:
-    path = _inbox_path(a.who)
+    roles = _roles_for_command(); path = inbox_path(roles, a.who)
+    if not role_exists(roles, a.sender):
+        die(2, f"sender 不是已知角色：{a.sender}")
     head = f"\n## [{now_bj()}] 来自 {a.sender}\n"
     body = a.text if a.text is not None else sys.stdin.read()
     with open(path, "a", encoding="utf-8") as f:
         f.write(head + body.rstrip("\n") + "\n")
-    print(f"ok: 追加到 {INBOX[a.who]}（{a.sender}）")
+    print(f"ok: 追加到 {roles[a.who]['inbox']}（{a.sender}）")
 
 
 _SECTION_RE = re.compile(r"^## \[", re.M)
@@ -361,7 +459,7 @@ _SECTION_RE = re.compile(r"^## \[", re.M)
 
 def read_sections(who: str):
     """返回 [(段文本, 是否已读)]，按标题行是否含 [已读] 判定。"""
-    path = _inbox_path(who)
+    path = inbox_path(_roles_for_command(), who)
     if not os.path.exists(path):
         return []
     text = open(path, encoding="utf-8").read()
@@ -375,16 +473,17 @@ def read_sections(who: str):
 
 
 def cmd_inbox_unread(a) -> None:
+    roles = _roles_for_command()
     segs = [s for s, read in read_sections(a.who) if not read]
     if not segs:
-        print(f"（{INBOX[a.who]} 无未读）", file=sys.stderr)
+        print(f"（{roles[a.who]['inbox']} 无未读）", file=sys.stderr)
         return
     print("\n\n".join(segs))
 
 
 def cmd_inbox_read(a) -> None:
     """给未读段标题行追加 [已读] 标注（本工具代劳，避免手改整行出错）。"""
-    path = _inbox_path(a.who)
+    roles = _roles_for_command(); path = inbox_path(roles, a.who)
     if not os.path.exists(path):
         die(1, f"收件箱不存在：{path}")
     lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
@@ -402,7 +501,7 @@ def cmd_inbox_read(a) -> None:
         return
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
-    print(f"ok: 标注 {marked} 条已读 → {INBOX[a.who]}")
+    print(f"ok: 标注 {marked} 条已读 → {roles[a.who]['inbox']}")
 
 
 def _append_jsonl(path: str, records: list[dict]) -> None:
@@ -505,7 +604,7 @@ def cmd_archive(a) -> None:
 def cmd_inbox_archive(a) -> None:
     """把某收件箱里已读的段转档，正文按月切 JSONL，活跃文件只留未读。"""
     month = a.month or month_bj()
-    path = _inbox_path(a.who)
+    path = inbox_path(_roles_for_command(), a.who)
     if not os.path.exists(path):
         die(1, f"收件箱不存在：{path}")
     text = open(path, encoding="utf-8").read()
@@ -676,6 +775,22 @@ def cmd_doctor(a) -> None:
         age = int(time.time() - os.path.getmtime(LOCK))
         problems.append(f"残留锁 board.json.lock（age={age}s，>600s 可自动接管）")
     data = load_board()
+    try:
+        roles = load_roles(data)
+    except ValueError as error:
+        roles = {}
+        problems.append(f"roles schema：{error}")
+    if roles:
+        owners = set(roles)
+        for t in data["tasks"]:
+            if t.get("owner") and t.get("owner") not in owners:
+                problems.append(f"{t.get('id')} owner 不在 roles：{t.get('owner')}")
+            session = t.get("session")
+            engine = t.get("engine")
+            if session and engine is not None and engine not in ("dsh", "codex", "pi"):
+                problems.append(f"{t.get('id')} engine 非法：{engine!r}")
+            if session and engine is None:
+                problems.append(f"{t.get('id')} session 非空但缺 engine（兼容旧板，视同 codex）")
     if not isinstance(data.get("revision"), int):
         problems.append(f"revision 非整数：{data.get('revision')!r}")
     seen = set()
@@ -694,6 +809,29 @@ def cmd_doctor(a) -> None:
             problems.append(f"{tid} in_progress 但无 owner")
         if st == "completed" and not (t.get("result") or "").strip():
             problems.append(f"{tid} completed 但 result 为空")
+        steps = t.get("steps")
+        if not isinstance(steps, list):
+            problems.append(f"{tid} steps 不是数组")
+        else:
+            if len(steps) > 20:
+                problems.append(f"{tid} steps 项数超限：{len(steps)}（上限 20）")
+            total_length = 0
+            for index, step in enumerate(steps, 1):
+                if not isinstance(step, dict):
+                    problems.append(f"{tid} steps 第 {index} 项不是对象")
+                    continue
+                text = step.get("text")
+                status = step.get("status")
+                if not isinstance(text, str) or not text.strip():
+                    problems.append(f"{tid} steps 第 {index} 项 text 为空或非字符串")
+                else:
+                    total_length += len(text)
+                    if len(text) > 200:
+                        problems.append(f"{tid} steps 第 {index} 项 text 超限：{len(text)}（上限 200）")
+                if status not in ("pending", "done"):
+                    problems.append(f"{tid} steps 第 {index} 项 status 非法：{status!r}")
+            if total_length > 4000:
+                problems.append(f"{tid} steps 总文本长度超限：{total_length}（上限 4000）")
     print(f"board: revision={data['revision']} tasks={len(data['tasks'])}")
     if problems:
         print(f"发现 {len(problems)} 个问题：")
@@ -717,15 +855,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--task", required=True); sp.add_argument("--context", default="")
     sp.add_argument("--scope", default=""); sp.add_argument("--blocked", default="")
     sp.add_argument("--acceptance", default=""); sp.add_argument("--session", default=None)
+    sp.add_argument("--engine", choices=["dsh", "codex", "pi"], default=None)
     add_cas(sp); sp.set_defaults(func=cmd_new)
 
     sp = sub.add_parser("claim", help="认领（设 owner + in_progress）")
-    sp.add_argument("id"); sp.add_argument("--owner", required=True, choices=["lead", "codex"])
+    sp.add_argument("id"); sp.add_argument("--owner", required=True)
     add_cas(sp); sp.set_defaults(func=cmd_claim)
 
     sp = sub.add_parser("complete", help="完成（目的达成 → 出板；v1.3）")
-    sp.add_argument("id"); sp.add_argument("--owner", choices=["lead", "codex"])
+    sp.add_argument("id"); sp.add_argument("--owner")
     sp.add_argument("--result", required=True); sp.add_argument("--force", action="store_true")
+    sp.add_argument("--reviewed-by", default=None, help="人工确认：只接受 human（Agent 自报不算）")
     sp.add_argument("--keep", action="store_true", help="保留在板（默认完成即出板）")
     add_cas(sp); sp.set_defaults(func=cmd_complete)
 
@@ -755,20 +895,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser("inbox-append", help="向收件箱追加消息")
-    sp.add_argument("who", choices=["codex", "lead"])
-    sp.add_argument("--sender", required=True, choices=["lead", "codex"])
+    sp.add_argument("who")
+    sp.add_argument("--sender", required=True)   # 角色合法性在 cmd_inbox_append 内动态校验
     sp.add_argument("--text", default=None, help="缺省读 stdin")
     sp.set_defaults(func=cmd_inbox_append)
 
     sp = sub.add_parser("inbox-unread", help="打印未读段（供 dispatch.sh 注入）")
-    sp.add_argument("who", choices=["codex", "lead"]); sp.set_defaults(func=cmd_inbox_unread)
+    sp.add_argument("who"); sp.set_defaults(func=cmd_inbox_unread)
 
     sp = sub.add_parser("inbox-read", help="给未读段标注 [已读]")
-    sp.add_argument("who", choices=["codex", "lead"]); sp.add_argument("--match", default=None)
+    sp.add_argument("who"); sp.add_argument("--match", default=None)
     sp.set_defaults(func=cmd_inbox_read)
 
     sp = sub.add_parser("inbox-archive", help="已读段转档 archive/inbox-<who>-YYYY-MM.jsonl")
-    sp.add_argument("who", choices=["codex", "lead"]); sp.add_argument("--month", default=None)
+    sp.add_argument("who"); sp.add_argument("--month", default=None)
     sp.set_defaults(func=cmd_inbox_archive)
 
     sp = sub.add_parser("archive", help="终结任务转档 archive/tasks-YYYY-MM.jsonl")
