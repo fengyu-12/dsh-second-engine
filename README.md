@@ -20,25 +20,28 @@
 - **能互相交活**：一个 agent 把产出交给另一个做多轮批判性复核；卡住的一方主动提交卡点求助；长任务在文件看板上交接、留痕、要人签字。
 - **可打断可追溯**：appserver 模式下真打断（65ms 级）+ 流式进度；工单有队列、历史、output 留存。
 
-在同一台 Android 设备的 DSHA 容器（Ubuntu / proroot）里，双引擎并存：DSH 侧 agent 负责编排与审核，Codex 独立复核、并行下探、提供异构第二意见——三者各司其职：**Codex 生产 · DSH 侧 agent 编排审核 · 用户裁决**。
+在同一台 Android 设备的 DSHA 容器（Ubuntu / proot）里，双引擎并存：DSH 侧 agent 负责编排与审核，Codex 独立复核、并行下探、提供异构第二意见——三者各司其职：**Codex 生产 · DSH 侧 agent 编排审核 · 用户裁决**。
 
-**占用账单（安卓实测）**：Codex 本体 223MB + 数据 33MB + 插件依赖 0.3MB ≈ **256MB**，换一个独立执行、互审、救场的第二 Agent。
+**占用账单（安卓实测，2026-10-31）**：Codex CLI 本体 **265MB** + `code-mode-host` **68MB** + 会话数据 **127MB** + 插件 **4MB** ≈ **464MB**，换一个独立执行、互审、救场的第二 Agent。再加 Pi（本体 21MB + 数据 1MB）约 **486MB**——Pi 只有 Codex 的十三分之一，但功能也少（无复核链路、无内置联网）。
 
 ## 为什么安卓上"多一个 agent"这么难，怎么绕过的
 
 Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各部署一遍，agent 想要的那把 shell 工具链在沙箱里根本不存在。
 
 - **沙箱为什么挡路**：proot 环境无 Landlock / bubblewrap，Codex 需要的沙箱原语拿不到；App 各自一套环境，也意味着没有一处能让两个 agent 共用同一份工作目录与同一批工具。
-- **proot 容器怎么替代**：DSHA 容器（Ubuntu / proroot）给出一把完整 shell，Codex 用 **musl 静态二进制**直接跑（免 ROOT 免 Termux）；沙箱改为 `danger-full-access` 运行，**安全防线移到流程层**——工作副本隔离 + diff 审查 + git 仲裁（详见「有哪些坑要提前知道」）。
+- **proot 容器怎么替代**：DSHA 容器（Ubuntu / proot）给出一把完整 shell，Codex 用 **musl 静态二进制**直接跑（免 ROOT 免 Termux）；沙箱改为 `danger-full-access` 运行，**安全防线移到流程层**——工作副本隔离 + diff 审查 + git 仲裁（详见「有哪些坑要提前知道」）。
 - **顺带得到的好处**：Codex 不自带依赖，任务里跑的每条命令直接使用容器现成的 Python / Node / 工具链 / 词库（55 个沉淀脚本即取即用），插件本体仅 0.3MB；两颗大脑互为备份——DSH 侧 agent 装插件/写配置出问题时，Codex 有完整 shell 可以接手排查修复；反过来 Codex 卡住走求助协议喊救命，DSH 侧 agent 带建议回来。谁都能救谁。
 
 ## 多个 agent 怎么分工
 
 | 角色 | 职责 |
 |---|---|
-| Codex（第二引擎） | 生产：小粒度任务交付、独立复核、并行下探 |
+| Codex（默认第二引擎） | 生产：小粒度任务交付、独立复核、并行下探、内置联网搜索 |
+| Pi（可替换的第二引擎） | 同上，优势是**多 provider 并存**、体积仅 21MB；代价是无复核链路、无内置联网（要联网得自己配 MCP） |
 | DSH 侧 agent | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
+
+两个引擎**面板是同一套**，切换只改 `~/.dsh/second-engine-engine.txt`；但**会话不迁移**——已开的工单留在原引擎。
 
 ## 什么时候该把活交给另一个引擎（多引擎协作策略）
 
@@ -86,7 +89,14 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 
 ### 浏览器聊天桥
 
-手机浏览器里直接和 Codex 对话，与终端共享同一批会话（`127.0.0.1:3095`，自带 token 鉴权，等于密码别外传）。
+手机浏览器里直接和 agent 对话，与终端 TUI **共享同一批会话**（不是另一套历史）。两个引擎各有自己的桥：
+
+| 引擎 | 端口 | 起法 |
+|---|---|---|
+| Codex | `127.0.0.1:3095`（`bridge/web/ctl.sh`，`BRIDGE_PORT` 可改） | `codex-env -u` 直接取网址 |
+| Pi | `127.0.0.1:8788`（`bridge/pi/server.mjs`，`PI_BRIDGE_PORT` 可改） | 面板的桥卡或 `node bridge/pi/server.mjs` |
+
+两个桥都**自带 token 鉴权**——等于密码，别外传。页面路由是 NDJSON 流，接自研前端时别按一次性 JSON 解析，否则界面静默无反应。
 
 ## 唤醒层：把消息递进指定会话（实验端点）
 
@@ -340,7 +350,7 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.0 · 未发布）
+## 支持能力一览（v3.8.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
