@@ -22,7 +22,10 @@
     "README.md",
     "tools/wait-task.sh",
     "tools/t-tool.sh",
-    "tools/web-base.sh"
+    "tools/web-base.sh",
+    "tools/policy-watch.py",
+    "tools/README.md",
+    "tools/post-change.sh"
   ],
   "engines": {
     "node": ">=22",
