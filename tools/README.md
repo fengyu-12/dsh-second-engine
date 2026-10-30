@@ -25,3 +25,13 @@ wait-task.sh <工单id> [轮询间隔秒=5] [总超时秒=600]
 ```
 
 退出码语义：0=done 2=失败终态 3=任务不存在 4=接口不可用 124=超时。配后台 job 使用：工单完成时 harness 的完成通知会自动唤醒等待者，本脚本同时是超时与故障的兜底。
+
+## policy-watch.py — 算「该派单了」的机械信号
+
+```bash
+policy-watch.py [--session <id>] [--root <会话根>] [--json] [--steps N]
+```
+
+读 DSH 会话事件流 `~/.dsh/sessions/<cwd编码>/<session>/session.v4.jsonl.zstd`，算三条判据：
+同一命令 + 同一错误类连续失败 ≥2 · 同一文件编辑振荡 A→B→A · 连续 N 步无状态推进（默认 4，自动跳过 `job_output` 等等待类）。
+退出码 0 = 未命中，10 = 命中。配套 skill `second-engine` 的「编排的定义与触发 · 兜底」节。
