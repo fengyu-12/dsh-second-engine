@@ -2,10 +2,10 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.164.0`（2026-10-25 升级；回滚物 `/root/codex/*.bak-0.163.0`。⚠️ 0.164.0 只跑了工具面 + DSH 依赖点，**执行链未复验**）
-> **二进制**：`/root/codex/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
-> **升级方式（2026-10-17 实测修订）**：**GitHub release 直连这次是通的** —— 主二进制 `codex-aarch64-unknown-linux-musl.tar.gz`(~100 MB) + sidecar `codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz`(~26 MB)，`aria2c -x8` 单线程 128 KiB/s → **757 KiB/s**，两分钟下完。**镜像现状变了**：`ghfast.top` **已挂（HTTP 000）**、`ghproxy.net` 200 可用。**⚠️ 网络状态会变，"直连不通"的旧结论不能当现在的判据**（10-10 那条就是这么过期的）。
-> **sidecar 必须改名**：解压得到 `codex-code-mode-host-aarch64-unknown-linux-musl`，装进 `/root/codex/` 要改成 **`codex-code-mode-host`**（codex 找的是**无后缀** sibling）；**主 tar 里不含 sidecar**，两份资产要分别下。备选通道仍是 npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`。
+> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `~/codex/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `src/index.js:3460` 本就当合法终态）。
+> **二进制**：`~/codex/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
+> **升级方式（2026-10-31 实测修订 —— 正选换成 npm 平台包）**：`curl -fL -o pkg.tgz https://registry.npmmirror.com/@openai/codex/-/codex-<版本>-linux-arm64.tgz`，**单文件整包**（0.166.0 = 164,402,913 B，约 3 分钟，字节数校验相符），不走 GitHub release。**release 直连 2026-10-31 实测 75 秒零字节、`ghproxy.net` 同样卡、`ghfast.top` 更早已挂** ⇒ 本机现状是 release 资产走不动，10-17 那条"直连通"已过期（网络会变，但"能通"也要先探再信）。
+> **包内结构与取用**：`vendor/aarch64-unknown-linux-musl/` 内含 `bin/codex`(~277 MB) + `bin/codex-code-mode-host`(~70 MB) + `codex-resources/`(voice host、bwrap、gstreamer 库) + `codex-path/rg`。**只取两个二进制**装进 `~/codex/`，sidecar 必须叫**无后缀** `codex-code-mode-host`；`codex-resources/` 本机当前**未装**（exec / app-server / 代码模式用不到，要 voice 或沙箱资源再补）。替换姿势：`cp -a` 备份 → `cp` 到临时名 → `mv -f` 原子落位 → `codex --version` 复核。
 
 ---
 
@@ -79,29 +79,32 @@ codex remote-control | exec-server | cloud | sandbox | debug   # 0.163 面里已
 
 ---
 
-## 3. Codex 现版本功能（`0.163.0` · 2026-10-17 拉取 · **0.164.0 已升级但本节未重新拉取，当历史看**）
+## 3. Codex 现版本功能（`0.166.0` · 2026-10-31 本机实测拉取）
 
 > **维护方式：主 AI 自己拉 · 不留存历史版本** —— 不逐版累积（没完没了、永远追着上游跑）。每次升级后重新拉一遍**整节覆盖**，只留**当下版本的具体变更与修复**。
+>
+> ⚠️ **本版变更日志无可用来源**（2026-10-31 实测三个源）：`mintlify.com/openai/codex/llms.txt` → **Page gone**；GitHub release 直连 → 不通（已多次复现）；`registry.npmmirror.com` 包 metadata → **无 changelog 字段**。⇒ **本节不含 0.164–0.166 的新增/修复明细**，只有本机实测的命令面与约束。**不要凭记忆补写变更项。**
 
-**本版变更（0.163.0）**
-
-- **新增**：`/config` 搜索式设置（跨类别搜偏好，部分即时生效并标注哪些需重启）· 响应中可发 follow-up **立即转向**（中断会一并停掉活动的 Code Mode cells 及其嵌套工具调用）· `/keymap` 配 leader key（默认 `Ctrl+X`，语音静音移到 `F9`）· `/daemon` 重启托管后台服务（先警告可能被打断的工作，随后自动重连）· **只读工具可并行执行**（含 skill / memory / 会话历史查询）· `Daybreak` 对符合条件账号默认启用
-- **修复**：恢复 thread 时**恢复其权限与网络审批**（尊重显式覆盖与当前 managed policy）· 网络代理**改在 DNS 查询前检权限**、拒绝重复 `Host` 头、防凭据别名绕过检查钩子 · `/side` 切换线程后回到已有侧会话 · **`codex exec` 不再在无关命令后重复打印同一文件 diff** · 本地命令在子进程持有输出管道时及时结束，远程命令保留迟到输出
-- **app-server**：新增 prompt prefix 兼容测试 · **全局 config 与启动目录解耦**
-- **本机仍未验证**：exec 的 diff 改动在"多文件 / 多轮"下的表现；`Daybreak` 默认启用对本机（走第三方 provider）有无影响
-
-**当前命令面（`codex --help` 实测，供速查）**
+**命令面（`codex --help` 实测，供速查）**
 
 ```bash
-codex exec | resume | fork | queue "<消息>"    # 单发 / 续会话 / 分叉 / 排队
+codex exec | resume | fork | queue "<消息>"   # 单发 / 续会话 / 分叉 / 排队
+codex review                                  # 非交互式代码审查    ← 较 0.163 新增
 codex agents                                  # 浏览本地 app-server 守护上的全部会话
 codex archive | unarchive | delete <id|name>  # 会话归档 / 恢复 / 永久删除
 codex migrate-rollouts                        # 旧会话迁移到分页线程历史
-codex app-server | exec-server | remote-control | cloud    # 实验
+codex migrate-nfs-db                          # [experimental] SQLite 迁 DELETE 模式  ← 新增
+codex mcp                                     # 管理外部 MCP 服务器                  ← 新增
+codex plugin                                  # 管理 Codex 插件                      ← 新增
+codex update                                  # 自更新                              ← 新增
+codex login | logout                          # 登录态管理                          ← 新增
+codex app-server | exec-server | remote-control | cloud   # 实验
 codex doctor                                  # 一站式环境体检
 codex features list | enable <名> | disable <名>   # ⚠️ 一次只能给一个名字
 codex sandbox | debug | apply | completion
 ```
+
+> 「← 新增」= 较 0.163.0 那份命令面多出来的（**来源是本机两份列表的差集，不是官方 changelog**）。
 
 **⚠️ 本机实测约束（2026-10-17，别照抄通用文档）**
 
@@ -113,8 +116,6 @@ codex sandbox | debug | apply | completion
 
 **模型元数据（第三方 provider 必看）**：codex 内置模型表只含自家模型，第三方模型会退回**兜底窗口**（实测 `glm-5.3-flash` 的 `model_context_window` = `258400`，而真值 1M）。用 `config.toml` 顶层的 `model_context_window` / `model_max_output_tokens` 覆盖。
 
-- 主 AI 自己拉
-
 ## 4. 升级后检查清单
 
 ```bash
@@ -124,14 +125,14 @@ codex features list | grep -E 'removed'            # 3. 有哪些被移除（老
 codex doctor                                       # 4. 环境体检（连通性/auth/sandbox/记忆库）
 grep -nE '^\[' ~/.codex/config.toml                # 5. ★配置段是否完整
 curl -s "$DSH_WEB_URL/second-engine/api/version"   # 6. 插件侧版本核对
-ls -l /root/codex/codex-code-mode-host             # 7. ★sidecar 是否在位（换源重装/升级后必查，见 §6）
+ls -l ~/codex/codex-code-mode-host             # 7. ★sidecar 是否在位（换源重装/升级后必查，见 §6）
 grep -n 'model_context_window\|model_max_output_tokens' ~/.codex/config.toml  # 8. 模型元数据是否写入（见 §7）
-ls -l /root/codex/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下）
+ls -l ~/codex/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下）
 ```
 
 ### ★ 第 5 条是 2026-10-02 事故换来的
 
-第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`/root/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
+第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`~/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
 
 修复：`src/index.js` 新增 `extractPreservedSections()`，用的是**黑名单**——只排除模板自有的
 `[model_providers.*]` 与 `[memories]`，**其余段一律原样保留**（2026-10-02；最初写成白名单，当天改成黑名单）。
@@ -189,8 +190,8 @@ aria2c -c -x 8 -s 8 -k 1M -d /tmp -o cmh.tar.gz \
   "https://ghproxy.net/https://github.com/openai/codex/releases/download/rust-v<版本>/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz"
 tar -xzf /tmp/cmh.tar.gz -C /tmp
 # 2) ★与 codex 主二进制同目录，且必须命名为 codex-code-mode-host
-cp /tmp/codex-code-mode-host-aarch64-unknown-linux-musl /root/codex/codex-code-mode-host
-chmod +x /root/codex/codex-code-mode-host
+cp /tmp/codex-code-mode-host-aarch64-unknown-linux-musl ~/codex/codex-code-mode-host
+chmod +x ~/codex/codex-code-mode-host
 ```
 
 - 备选通道：npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`（`vendor/<arch>/bin/` 内含它）——本机 codex 本来就是那条渠道装的，下次升级顺手把它一起取出来更省事。
@@ -231,7 +232,7 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 | 配置 | `config.toml` | 1.2 K | `model_provider` / `model` / `sandbox_mode` / `web_search` / `[mcp_servers.*]`。**不手改** —— 插件切 active 时重写它 |
 | | `config.toml.bak-*` ×7 | 各 ~450 B | 历史备份（`-20261001` `-pre-memories` `-pre-switch` `-ma2` `-recplug` `-before-ma2-recplug` `-se`） |
 | | `keyring.json` | 1.4 K | 多提供方与 key。**不手改** |
-| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `/root/proj/AGENTS.md` 同源的那份） |
+| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `~/proj/AGENTS.md` 同源的那份） |
 | 状态库 | **`logs_2.sqlite`** | **41 M** | 运行日志 —— **整个目录最大的一块**（能否清**未验证**） |
 | | `thread_history_1.sqlite` (+`-wal` 248 K) | 15 M | 线程历史 |
 | | `state_5.sqlite` (+`-shm`) | 573 K | 主状态；`state_5.sqlite.bak-20261003-pre-hue` ×3 ≈ 800 K 是升级前备份 |
@@ -344,23 +345,23 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 ```
 -c model_provider=relay -c model="<模型名>" \
 -c 'model_providers.relay.name="relay"' \
--c 'model_providers.relay.base_url="<你的中转站 base_url>"' \
+-c 'model_providers.relay.base_url="https://laneai.dev/v1"' \
 -c 'model_providers.relay.wire_api="responses"' \
 -c 'model_providers.relay.env_key="RELAY_API_KEY"'
 ```
 
 ## 附D. 2026-09-25 新增能力（第二引擎侧，已实测）
 
-> **2026-10-26 复核**：① **relay-forge 管线已退役**——`/root/proj/relay-forge/` 不存在，原件在 `/root/.dsh/refs/retired-proj-20261015/relay-forge`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `/root/proj/共同工作区/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
+> **2026-10-26 复核**：① **relay-forge 管线已退役**——`~/proj/relay-forge/` 不存在，原件在 `~/.dsh/refs/retired-proj-20261015/relay-forge`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `~/proj/共同工作区/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
 
 ### 中转站算力：探测与并发咨询
 
-- **技能 `relay-probe`**（Codex 侧 `~/.codex/skills/relay-probe/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`/root/.dsh/skills/relay-forensics`），此处不重复。
-- **管线 `/root/proj/relay-forge/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
+- **技能 `relay-probe`**（Codex 侧 `~/.codex/skills/relay-probe/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`~/.dsh/skills/relay-forensics`），此处不重复。
+- **管线 `~/proj/relay-forge/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
   模型发 `tool_calls` → `forge.py` 本地 `fetch_url` → 回灌。铁律：产出只落 `out/<时间戳>/`，
   **绝不自动改目标文件**；要"整文件重写"会得 0 字符，只喂"定位锚点 → 替换为"的补丁。
 
-### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `/root/proj/backup/`）
+### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `~/proj/backup/`）
 
 - 会话列表**搜索框**（`Ctrl+K` 唤起）、**会话 ID 芯片**（点一下复制完整 36 位 ID，显示只给前 8 位）、
   **深浅主题切换**（浅色为默认，选择存 localStorage）、被占用时**显示写锁持有者**
