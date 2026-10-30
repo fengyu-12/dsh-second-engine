@@ -37,6 +37,7 @@ const PORT = Number(process.env.BRIDGE_PORT || 3095);
 const HOST = process.env.BRIDGE_HOST || '127.0.0.1';
 const AS_PORT = Number(process.env.BRIDGE_AS_PORT || 3096);
 const AS_URL = process.env.BRIDGE_AS_URL || `ws://127.0.0.1:${AS_PORT}`;
+const HOST_API_URL = process.env.BRIDGE_HOST_API_URL || '';
 const TOKEN_FILE = path.join(STATE_DIR, '.token');
 const PID_FILE = path.join(STATE_DIR, '.pid');
 const AS_PID_FILE = path.join(STATE_DIR, '.as.pid');   // ctl.sh 写的 app-server pid，用于认"锁是不是自家上游拿着"
@@ -715,7 +716,28 @@ const server = createServer(async (req, res) => {
         if (req.method === 'GET') {
           const read = await as.call('thread/read', { threadId: payload.threadId });
           const thread = read.thread || {};
-          return json(res, 200, { engine: 'codex', model: thread.model || '', effort: thread.reasoningEffort || '', levels: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+          let models = [];
+          if (HOST_API_URL) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 3000);
+            try {
+              const response = await fetch(new URL('/second-engine/api/models', HOST_API_URL), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: '{}',
+                signal: controller.signal,
+              });
+              const result = response.ok ? await response.json() : null;
+              if (result?.ok === true && Array.isArray(result.models)) {
+                models = result.models.filter((id) => typeof id === 'string' && id.length > 0);
+              }
+            } catch {
+              models = [];
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+          return json(res, 200, { engine: 'codex', model: thread.model || '', effort: thread.reasoningEffort || '', levels: ['minimal', 'low', 'medium', 'high', 'xhigh'], models });
         }
         if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
         const keys = Object.keys(payload).filter((k) => k !== 'threadId');

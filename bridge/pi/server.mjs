@@ -13,6 +13,7 @@
 //   GET  /api/health            健康状况（本桥自加）
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -46,6 +47,8 @@ class PiRpc {
     this.listeners = new Set()
     this.stderrTail = ''
     this.buf = ''
+    // 同 app-server-client：跨 chunk 多字节字符用 StringDecoder 累积，避免 U+FFFD。
+    this.dec = new StringDecoder('utf8')
     this.child.stdout.on('data', (c) => this.feed(c))
     this.child.stderr.on('data', (c) => { this.stderrTail = (this.stderrTail + c.toString()).slice(-4000) })
     this.child.on('exit', (code) => { this.exitCode = code; for (const [,p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(`pi rpc 退出 code=${code}`)) } this.pending.clear() })
@@ -54,7 +57,7 @@ class PiRpc {
 
   // rpc.md「Framing」：只按 LF 切；**不用 readline**（它还会按 U+2028/U+2029 切）
   feed(chunk) {
-    this.buf += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+    this.buf += this.dec.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
     let i
     while ((i = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, i).replace(/\r$/, '')
@@ -114,8 +117,13 @@ function readBody(req) {
     req.on('error', reject)
   })
 }
+const LOOPBACK_ADDRS = /^(127\.|::1$|::ffff:127\.)/
 function authed(req) {
-  if (TOKEN === '') return true
+  const remote = String(req.socket?.remoteAddress || '')
+  // 本机（面板 / 浏览器 / curl 127.0.0.1）始终免 token，保持开箱可用
+  if (remote === '' || LOOPBACK_ADDRS.test(remote)) return true
+  // 非 loopback：必须显式配置 PI_BRIDGE_TOKEN 且带对 header，否则一律 401
+  if (TOKEN === '') return false
   return req.headers['x-bridge-token'] === TOKEN
 }
 
@@ -123,6 +131,7 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`)
   try {
     if (url.pathname === '/api/health') {
+      if (!authed(req)) return send(res, 401, { ok: false, error: 'token' })
       return send(res, 200, { ok: true, engine: 'pi', provider: prov.id, model: prov.model, cwd: CWD, pid: rpc.child.pid, exitCode: rpc.exitCode ?? null })
     }
 
@@ -291,5 +300,10 @@ const server = createServer(async (req, res) => {
     return send(res, 500, { ok: false, error: String(e && e.message ? e.message : e) })
   }
 })
-server.listen(PORT, HOST, () => log(`[pi-bridge] 就绪 http://${HOST}:${PORT}`))
+server.listen(PORT, HOST, () => {
+  log(`[pi-bridge] 就绪 http://${HOST}:${PORT}`)
+  if (TOKEN === '' && !/^(127\.0\.0\.1|localhost|::1)$/.test(HOST)) {
+    log('[pi-bridge] 警告：监听非 loopback 且未设置 PI_BRIDGE_TOKEN —— 外部请求将一律 401')
+  }
+})
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { rpc.kill(); server.close(() => process.exit(0)) })

@@ -155,7 +155,7 @@ start_as() {
 start_web() {
   local mode=${1:-start}
   p=
-  (cd "$HERE" && BRIDGE_STATE_DIR="$STATE_DIR" BRIDGE_PORT="$PORT" BRIDGE_AS_URL="$AS_URL" BRIDGE_WORKDIR="$WORKDIR" exec setsid nohup "$NODE_BIN" server.mjs >>"$BRIDGE_LOG" 2>&1 </dev/null) 9>&- &
+  (cd "$HERE" && BRIDGE_STATE_DIR="$STATE_DIR" BRIDGE_PORT="$PORT" BRIDGE_AS_URL="$AS_URL" BRIDGE_WORKDIR="$WORKDIR" BRIDGE_HOST_API_URL="${BRIDGE_HOST_API_URL:-}" exec setsid nohup "$NODE_BIN" server.mjs >>"$BRIDGE_LOG" 2>&1 </dev/null) 9>&- &
   disown 2>/dev/null || true
   for _ in $(seq 1 20); do
     sleep 0.5

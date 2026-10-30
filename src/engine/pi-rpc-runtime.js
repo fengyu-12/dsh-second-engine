@@ -202,7 +202,39 @@ export function createPiRpcRuntime(task, deps = {}) {
   let statsCache = null          // get_session_stats 缓存（tokens / cost / contextUsage）
   // 终局证据缓存（json.md「Agent and turn events」：agent_settled.aborted / agent_end.willRetry）
   let settled = null             // { aborted, at }
-  let agentEnd = null            // { willRetry, at, messageCount }
+  let agentEnd = null            // { willRetry, at, messageCount, stopReason, errorMessage }
+
+  // 2026-10-31（Pi 自证 + 包内源码核实）：一次 prompt **只会 emit 一次** `agent_settled`
+  //（`dist/core/agent-session.js` 的 `_startRun()` 在 finally 里 emit，正常/重试/压缩恢复/抛错
+  // 都只收尾一次）⇒ settle 就是本轮终点，收到即收尾，**不等进程退出**（`pi --mode rpc` 是长驻
+  // 进程，永远不退 —— 2026-10-31 04:0x 实机复现过「跑完仍 running」）。drain 窗口只挡
+  // 「extension 在 settle 期间又起一个新 run」这一种情况（本机无 extensions 目录，实际不触发）。
+  let drainTimer = null
+  const SETTLE_DRAIN_MS = 1500
+
+  // settle 后调度收尾。drain 窗口内若又来了 agent_start，由下方 handleRecord 取消。
+  function scheduleSettle() {
+    if (ended || drainTimer !== null) return
+    drainTimer = setTimeout(() => {
+      drainTimer = null
+      if (ended) return
+      // 成败**不看 settle**：settle 只说明"不再自动继续"，不说明成功。看最后一条 assistant
+      // message 的 stopReason（message-types.md：pending|stop|length|toolUse|error|aborted|deferred）。
+      // 2026-10-31 修（Codex 审核）：原来是**黑名单**（只有 error/length 判失败），于是
+      // pending / deferred / 空值 / 将来新增的枚举都静默记成成功 —— "不知道是否成功"绝不能
+      // 写成成功。改成**正向白名单**：只有明确终态 `stop` 才算成功，其余一律按失败收尾并带原因。
+      const stop = typeof agentEnd?.stopReason === 'string' ? agentEnd.stopReason : ''
+      const aborted = settled?.aborted === true || stop === 'aborted'
+      const ok = !aborted && stop === 'stop'
+      const bad = !aborted && !ok
+      void rt.finalize({
+        exitCode: aborted || bad ? -1 : 0,
+        cancelled: aborted,
+        error: bad ? (agentEnd?.errorMessage || `未识别的终态 stopReason=${stop === '' ? '(空)' : stop}`) : undefined,
+      })
+    }, SETTLE_DRAIN_MS)
+    if (typeof drainTimer.unref === 'function') drainTimer.unref()
+  }
 
   const nextId = (prefix) => `${prefix || 'cmd'}-${String(task.id ?? 't')}-${++idCounter}`
 
@@ -357,9 +389,22 @@ export function createPiRpcRuntime(task, deps = {}) {
       stateCache = { ...stateCache, isStreaming: false, at }
       void captureAssistantText()   // 进程还活着，这是取正文最可靠的时机
     } else if (type === 'agent_end') {
-      agentEnd = { willRetry: rec.willRetry === true, at, messageCount: Array.isArray(rec.messages) ? rec.messages.length : 0 }
+      // 2026-10-31：顺带取最后一条 message 的 stopReason / errorMessage —— 这是**唯一**能判
+      // 本轮成败的依据（RPC 模式没有退出码语义，print 模式的非 0 退出码在这里不适用）。
+      const msgs = Array.isArray(rec.messages) ? rec.messages : []
+      const last = msgs.length > 0 ? msgs[msgs.length - 1] : null
+      agentEnd = {
+        willRetry: rec.willRetry === true, at, messageCount: msgs.length,
+        stopReason: typeof last?.stopReason === 'string' ? last.stopReason : '',
+        errorMessage: typeof last?.errorMessage === 'string' ? last.errorMessage : '',
+      }
     } else if (type === 'agent_start') {
       stateCache = { ...stateCache, isStreaming: true, at }
+      // 2026-10-31 修（Codex 审核）：新 run 开始必须**清掉上一轮的终局证据**。原先只清
+      // drain 计时器，`settled` / `agentEnd` 留着 —— 若新 run 在 drain 内开始、1.5s 后还没
+      // 结束，旧 `agentEnd.stopReason='stop'` 会被当成本轮的成功证据，把未完成记成 done。
+      settled = null
+      agentEnd = null
     } else if (type === 'compaction_start') {
       stateCache = { ...stateCache, isCompacting: true, at }
     } else if (type === 'compaction_end') {
@@ -368,6 +413,14 @@ export function createPiRpcRuntime(task, deps = {}) {
     if (type === 'agent_settled') {
       // Refresh after every settled turn to update session metadata and usage state.
       void refreshState()
+      // 2026-10-31 修：原先这里什么都不做 —— 长驻进程不会 exit，于是任务永远 running
+      //（实机复现：任务跑完、产物有内容、`GET /task` 一直 running）。settle 即终点，调度收尾。
+      scheduleSettle()
+    }
+    // drain 窗口里的新 run（extension 延后启动）⇒ 取消收尾，等下一次 settle。
+    if (type === 'agent_start' && drainTimer !== null) {
+      try { clearTimeout(drainTimer) } catch { /* noop */ }
+      drainTimer = null
     }
     // 用量：json.md 说 message_update.usage 是「该 assistant 响应的最新累计 provider 用量」
     // ⇒ 直接覆盖缓存（跨会话总量另问 get_session_stats，见 fetchStats）。
@@ -501,7 +554,11 @@ export function createPiRpcRuntime(task, deps = {}) {
       // 子进程身份**在 spawn 后立即固定**，不等 startWatchdog（runtime.js 是在 startWatchdog
       // 里顺带做的）：对账 tick 判失联要用 pid+start，而看门狗在 disposition='handled' 那条
       // 路径上根本不会启动 —— 放这里两条路径都有值。
-      if (task.childPid === undefined) {
+      // 2026-10-31 修（Codex 复核发现）：原判据是 `=== undefined`，而 index.js 的
+      // startPiTask 把 childPid 初始化为 **null** ⇒ 这里永远不登记；probeTaskLost 对非整数
+      // 又直接返回 null ⇒ Pi 任务永远判不出失联，reconcile 的收尾分支成了死代码。
+      // 两种"未登记"（undefined / null）都要覆盖，写成显式双判而非 == 以免 lint 争议。
+      if (task.childPid === undefined || task.childPid === null) {
         task.childPid = Number.isInteger(child.pid) ? child.pid : null
         task.childStart = typeof readProcStartTime === 'function' ? readProcStartTime(task.childPid) : null
       }
@@ -528,6 +585,12 @@ export function createPiRpcRuntime(task, deps = {}) {
         // 启动失败（ENOENT / 无权限）**不会触发 exit** —— 这里兜底，语义同 index.js。
         rt.setAppError(`pi rpc spawn 失败：${e?.message ?? e}`)
         rejectAllPending('pi rpc 子进程错误')
+        // 2026-10-31 修：spawn 失败走不到 exit，漏 finalize 会让 donePromise 一直挂着等上层
+        // 超时（子进程根本不存在，wait 永不 resolve）。finalize 有 ended 幂等哨兵，之后即便
+        // 真来了 exit 也不会重复落定，所以这里放心收尾。
+        flushTail()
+        rt.stopWatchdog()
+        void rt.finalize({ exitCode: -1 })
       })
       child.on('exit', (code, signal) => {
         flushTail()
@@ -600,6 +663,14 @@ export function createPiRpcRuntime(task, deps = {}) {
       return {
         status,
         outcome,
+        // 2026-10-31（Pi 评审 + 实机证据）：补齐与 Codex `runtime.snapshot()` 同名的字段 ——
+        // 缺了它们 `taskView()` 取不到，Pi 的终态响应既没有 exitCode、也没有 reconcileLost
+        // （实机：卡住那单 `mode` 与 `exitCode` 都是 None）。
+        exitCode: task.exitCode,
+        mode: 'rpc',
+        lastSignal: task.lastSignal,
+        reconcileLost: task.reconcileLost,
+        appError: typeof task.appError === 'string' && task.appError !== '' ? task.appError : undefined,
         activityAt: Number.isFinite(task.activityAt) ? task.activityAt : 0,
         stuckSuspect: task.stuckSuspect === true,
         // 封闭投影（同 progress 那一刀的规矩）：只发 {kind,text,at}；mapPiEvent 附带的
@@ -682,6 +753,8 @@ export function createPiRpcRuntime(task, deps = {}) {
     async finalize(evidence = {}) {
       if (ended) return false
       ended = true
+      // 收尾即取消待执行的 settle drain —— 清理点唯一放在这里，别指望 stopWatchdog 顺带做。
+      if (drainTimer !== null) { try { clearTimeout(drainTimer) } catch { /* noop */ } drainTimer = null }
       rt.stopWatchdog()
       // P4：收尾前尽力补一次正文（agent_settled 的异步抓取可能没赶上 exit），再落盘。
       if (runOutPath !== null && lastAssistantText === '' && child !== null && child.exitCode === null) {
@@ -690,11 +763,14 @@ export function createPiRpcRuntime(task, deps = {}) {
       flushAssistantToOut()
       if (typeof evidence.lost === 'string' && evidence.lost !== '') rt.setReconcileLost(evidence.lost)
       if (typeof evidence.error === 'string' && evidence.error !== '') task.error = evidence.error
-      if (Number.isInteger(evidence.exitCode)) rt.setExitCode(evidence.exitCode)
       if (evidence.signal) rt.setLastSignal(evidence.signal)
       const cancelled = evidence.cancelled === true || task.cancelled === true || settled?.aborted === true
-      const finalCode = Number.isInteger(evidence.exitCode) ? evidence.exitCode
-        : (cancelled || (typeof task.error === 'string' && task.error !== '') ? -1 : 0)
+      // 2026-10-31 修（Pi 评审指出）：原先是"显式 exitCode 优先"，于是 settle 分支若图省事传
+      // `{ exitCode: 0 }`，**取消态也会被记成 0**（Codex 那边记 -1）。取消必须压倒一切。
+      const finalCode = cancelled ? -1
+        : (Number.isInteger(evidence.exitCode) ? evidence.exitCode
+          : (typeof task.error === 'string' && task.error !== '' ? -1 : 0))
+      rt.setExitCode(finalCode)
       // A 方案：**不写 status / endedAt**。写 endedAt 会让 finalizeJob 的幂等哨兵 return false，
       // 跳过「读 output / 删产物 / 发通知」。终态一律交给调用方（index.js）落定。
       closeStdin()
@@ -756,7 +832,7 @@ export function createPiRpcRuntime(task, deps = {}) {
       if (timer !== null) return
       // 兜底：正常路径下 start() 已在 spawn 后固定过身份；这里只照顾「外部只给了
       // setChild、没走 start」的用法。只在首次记录，重复调用不覆盖。
-      if (task.childPid === undefined && child !== null) {
+      if ((task.childPid === undefined || task.childPid === null) && child !== null) {
         task.childPid = Number.isInteger(child.pid) ? child.pid : null
         task.childStart = typeof readProcStartTime === 'function' ? readProcStartTime(task.childPid) : null
       }

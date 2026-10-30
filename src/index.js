@@ -35,7 +35,7 @@
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, renameSync, openSync, fstatSync, readSync, closeSync, createWriteStream, accessSync, constants } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, renameSync, openSync, fstatSync, readSync, closeSync, createWriteStream, accessSync, constants } from 'node:fs'
 import { spawn, execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
@@ -51,6 +51,9 @@ import { createBridgeServer } from './bridge.js'
 import { startAppServerTurn } from './app-server-client.js'
 import { resolveCollab, collabPreset, writeCollab } from './collab.js'
 import { createHash, randomBytes } from 'node:crypto'
+
+// The bridge is started by ctl.sh; pass the host API address through its inherited environment.
+if (process.env.DSH_WEB_URL) process.env.BRIDGE_HOST_API_URL = process.env.DSH_WEB_URL
 
 export const name = 'second-engine'
 
@@ -150,6 +153,97 @@ function newId() {
 // 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
 const consults = []
 const CONSULT_KEEP_LIMIT = 20
+
+
+// ── 绕圈自动提醒（policy-watch）：检测在 turn/end，投递只追加到当次 pre-step ──
+const POLICY_WATCH_PATH = '/root/dsha-second-engine/tools/policy-watch.py'
+const POLICY_WATCH_STATE_PATH = join(homedir(), '.dsh', 'policy-watch', 'last.json')
+const POLICY_WATCH_TIMEOUT_MS = 5000
+const POLICY_WATCH_DELIVERY_COOLDOWN_MS = 10 * 60 * 1000
+const POLICY_WATCH_KEEP_LIMIT = 50
+const policyWatchPending = new Map()
+const policyWatchDelivered = new Map()
+const policyWatchHitKeys = new Map()
+
+function loadPolicyWatchState() {
+  try {
+    const saved = JSON.parse(readFileSync(POLICY_WATCH_STATE_PATH, 'utf8'))
+    for (const [id, entry] of Object.entries(saved.pending || {})) {
+      if (entry && typeof entry.at === 'number' && typeof entry.summary === 'string') policyWatchPending.set(id, entry)
+    }
+    for (const [id, at] of Object.entries(saved.delivered || {})) if (Number.isFinite(at)) policyWatchDelivered.set(id, at)
+    for (const [id, keys] of Object.entries(saved.hitKeys || {})) if (Array.isArray(keys)) policyWatchHitKeys.set(id, new Set(keys))
+    trimPolicyWatchMaps()
+  } catch { /* absent/corrupt state is a silent cold start */ }
+}
+function trimPolicyWatchMaps() {
+  for (const map of [policyWatchPending, policyWatchDelivered, policyWatchHitKeys]) {
+    while (map.size > POLICY_WATCH_KEEP_LIMIT) map.delete(map.keys().next().value)
+  }
+}
+function persistPolicyWatchState() {
+  try {
+    const dir = dirname(POLICY_WATCH_STATE_PATH)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const payload = {
+      pending: Object.fromEntries(policyWatchPending),
+      delivered: Object.fromEntries(policyWatchDelivered),
+      hitKeys: Object.fromEntries([...policyWatchHitKeys].map(([id, keys]) => [id, [...keys]])),
+    }
+    writeFileSync(POLICY_WATCH_STATE_PATH, JSON.stringify(payload), { mode: 0o600 })
+    chmodSync(POLICY_WATCH_STATE_PATH, 0o600)
+  } catch { /* persistence is best effort and never blocks a conversation */ }
+}
+function policyWatchSummary(json) {
+  const labels = []
+  if (Array.isArray(json.m1) && json.m1.length) labels.push(`M1 同命令同输出重复 ${json.m1.length} 处`)
+  if (Array.isArray(json.m2) && json.m2.length) labels.push(`M2 文件编辑 A→B→A 振荡 ${json.m2.length} 处`)
+  if (Array.isArray(json.m3) && json.m3.length) labels.push(`M3 连续无状态推进 ${json.m3.length} 处`)
+  return labels.join('；')
+}
+function runPolicyWatch(sessionId) {
+  return new Promise((resolveResult) => {
+    let settled = false
+    const finish = (value) => { if (!settled) { settled = true; resolveResult(value) } }
+    let child
+    try {
+      child = execFile('/usr/bin/python3', [POLICY_WATCH_PATH, '--json', '--session', String(sessionId)], { timeout: POLICY_WATCH_TIMEOUT_MS, maxBuffer: 256 * 1024 }, (error, stdout) => {
+        const code = error ? (Number.isInteger(error.code) ? error.code : null) : 0
+        if (code !== 0 && code !== 10) return finish(null)
+        try { finish({ code, json: JSON.parse(stdout) }) } catch { finish(null) }
+      })
+      const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} finish(null) }, POLICY_WATCH_TIMEOUT_MS)
+      timer.unref?.()
+    } catch { finish(null) }
+  })
+}
+function startPolicyWatch(sessionId) {
+  void runPolicyWatch(sessionId).then((result) => {
+    if (!result) return
+    if (result.code === 0) {
+      policyWatchPending.delete(sessionId)
+      persistPolicyWatchState()
+      return
+    }
+    if (result.code !== 10) return
+    const summary = policyWatchSummary(result.json)
+    if (!summary) return
+    const now = Date.now()
+    const key = createHash('sha256').update(JSON.stringify({ m1: result.json.m1 || [], m2: result.json.m2 || [], m3: result.json.m3 || [] })).digest('hex')
+    const keys = policyWatchHitKeys.get(sessionId) || new Set()
+    const previous = policyWatchPending.get(sessionId)
+    if (keys.has(key) || previous?.key === key) return
+    // Identical hit keys stay suppressed for this session; new keys replace the one-shot pending notice.
+    keys.add(key)
+    while (keys.size > POLICY_WATCH_KEEP_LIMIT) keys.delete(keys.values().next().value)
+    policyWatchHitKeys.delete(sessionId)
+    policyWatchHitKeys.set(sessionId, keys)
+    policyWatchPending.delete(sessionId)
+    policyWatchPending.set(sessionId, { summary, key, at: now })
+    trimPolicyWatchMaps()
+    persistPolicyWatchState()
+  }).catch(() => {})
+}
 
 // ── 吞错留痕（D，2026-10-25）──
 // 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
@@ -1069,6 +1163,14 @@ async function reconcileOnce() {
     const why = probeTaskLost(task)
     if (why === null) continue
     rtOf(task).setReconcileLost(why)
+    // 2026-10-31 修：finalizeJob 只写 task 侧（status/endedAt/output），**完全不碰 runtime**。
+    // Pi runtime 有自己的 ended 哨兵与 donePromise（pi-rpc-runtime.js:688），不调它的 finalize
+    // 就会留下「task 已判失联、pi 子进程还活着、donePromise 永不 resolve」。
+    // Codex runtime 没有 finalize 方法，所以按能力判断，不按引擎名分支。
+    const rt = rtOf(task)
+    if (typeof rt.finalize === 'function') {
+      try { await rt.finalize({ exitCode: -1, lost: why }) } catch { /* best effort */ }
+    }
     if (finalizeTask(task, -1, 'error') && !rtOf(task).isCancelled()) void notifyTask(task)
     actions.push(`task:${task.id}:${why}`)
   }
@@ -1263,6 +1365,72 @@ async function handleStatus(_req, res) {
       engine: await engineView(),
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// 实验：唤醒休眠 DSH 会话并投递一条用户消息。
+async function handleExperimentalWake(ctx, req, res) {
+  let body = {}
+  let handle
+  try {
+    body = await readBody(req)
+    const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+    const text = typeof body?.text === 'string' ? body.text : ''
+    if (sessionId === '' || text.trim() === '') {
+      send(res, { ok: false, resumed: null, live: null, error: 'sessionId 和 text 都不能为空' }, 400)
+      return
+    }
+
+    const agents = ctx.get('agents')
+    if (agents === undefined || agents === null) {
+      send(res, { ok: false, resumed: null, live: null, error: 'agents 服务不可用' })
+      return
+    }
+
+    let createUserMessage
+    let SessionId
+    try {
+      const llm = await import('@deepseek-ai/dsh-llm')
+      const session = await import('@deepseek-ai/dsh-session')
+      createUserMessage = llm.createUserMessage
+      SessionId = session.SessionId
+    } catch (e) {
+      send(res, { ok: false, resumed: null, live: null, error: `唤醒依赖不可用: ${errMsg(e)}` })
+      return
+    }
+    if (typeof createUserMessage !== 'function') {
+      send(res, { ok: false, resumed: null, live: null, error: '唤醒依赖不可用: createUserMessage 不可用' })
+      return
+    }
+
+    // SessionId 是 dsh-session 的类型/运行时导出（按包版本可能不存在）；字符串 ID 直接交给 agents。
+    void SessionId
+    // 会话 id 需要 DSH 的 `session-<uuid>` 形态；裸 uuid 会 not found。
+    const resolvedId = sessionId.startsWith('session-') ? sessionId : `session-${sessionId}`
+    const liveAgent = agents.get(resolvedId)
+    // ⚠ agentOptions 必须是 **DSH 侧**的 provider，不能用 Codex keyring 的 provider id
+    // （实测：传 ziluo 会让回合 fail 在 NO_ADAPTER）。默认不传 = 用会话自身日志里的 config。
+    let options
+    if (typeof body?.provider === 'string' && body.provider.trim() !== '' &&
+        typeof body?.model === 'string' && body.model.trim() !== '') {
+      options = { provider: body.provider.trim(), model: body.model.trim() }
+    }
+    if (liveAgent === undefined) {
+      handle = await agents.resume({ resumeSessionId: resolvedId, ...(options ? { agentOptions: options } : {}) })
+    }
+    const agent = liveAgent ?? handle?.agent
+    if (agent === undefined || agent === null) throw new Error('agents 未返回可用 agent')
+    const idle = agent.whenIdle()
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    }))
+    await idle
+    send(res, { ok: true, resumed: liveAgent === undefined ? true : null, live: liveAgent !== undefined ? true : null, error: null })
+  } catch (e) {
+    send(res, { ok: false, resumed: null, live: null, error: errMsg(e) })
+  } finally {
+    try { await handle?.dispose() } catch (e) { noteErr('exp-wake-dispose', e) }
+  }
 }
 
 // ── Pi 面板数据（P4.6）：Pi 引擎专用，字段与 lib/pi-cards.js 契约一一对应 ──
@@ -2563,6 +2731,7 @@ function cleanupLiveFiles(cutoff, stats) {
     // （原来只清 *.live —— finalize 没跑成（崩溃/被 kill）时 task-*.out / review-*.out 会永久残留。）
     let id = ''
     if (name.startsWith('task-') && name.endsWith('.out.live')) id = name.slice('task-'.length, -'.out.live'.length)
+    else if (name.startsWith('task-') && name.endsWith('.out.live.1')) id = name.slice('task-'.length, -'.out.live.1'.length)
     else if (name.startsWith('task-') && name.endsWith('.out')) id = name.slice('task-'.length, -'.out'.length)
     else {
       const m = /^review-(.+)-r\d+\.out$/.exec(name)
@@ -2735,12 +2904,21 @@ function taskView(task) {
   const view = {
     id: task.id,
     kind: task.kind === 'review' ? 'review' : 'task',
-    status: snap.status,
+    // 2026-10-31 修：原来直接透传 snap.status，把 Pi runtime 的**内部三态词表**
+    // （running / cancelling / finished）原样发给前端，而 lib/client.js 只认 Codex 的
+    // （running / cancelled / done / error）—— Pi 点取消后面板认不出「已取消」。
+    // 终态唯一写入口是 finalizeJob（见上方 :2793 注释），所以出口统一走 viewStatus 折算。
+    status: viewStatus(task),
     exitCode: snap.exitCode,
     startedAt: task.startedAt,
     endedAt: task.endedAt,
     workdir: task.workdir,
     output: typeof task.output === 'string' ? task.output : '',
+    // 2026-10-31：暴露引擎归属 —— 前端原先分不出某条单是 Codex 还是 Pi 的（Pi 的单会混进
+    // Codex 侧视图）。判据就是创建时写下的 `task.engine`（Pi 分支 :3600 已写 'pi'）。
+    // ⚠️ 别用 `piProvider` 判：调用方不传 provider 时它是 undefined，会把 Pi 单误判成 codex
+    // （2026-10-31 实机踩过：Pi 的单返回 engine:'codex'）。
+    engine: task.engine === 'pi' ? 'pi' : 'codex',
   }
   // 实时进度可见性：exec 模式看 liveBytes（过程流字节数，在涨=在动），
   // appserver 模式另加 progress（归一化事件）。
@@ -2751,8 +2929,13 @@ function taskView(task) {
     // 引擎专有形状（tool / usage / done / meta.eventType / itemId / contentIndex /
     // summaryIndex / willRetry）一律不外发 —— 那是 Codex app-server 的词表，第二个引擎
     // 一进 progress，消费端就得按引擎分支。排障用的原文见 task.engineEvents（不进本视图）。
+    if (task.appServerParseFailures) view.appServerParseFailures = { ...task.appServerParseFailures }
     view.mode = 'appserver'
     view.progress = projectProgress(snap.progress)
+  } else if (typeof snap.mode === 'string' && snap.mode !== '') {
+    // 2026-10-31：其他引擎的 mode 也要透传（Pi 的 snapshot 已返回 'rpc'）。原先只在
+    // appserver 分支里赋值，Pi 的 mode 就永远显示 None —— 实机见 `mode: None`。
+    view.mode = snap.mode
   }
   // P1.1：活性时间 —— 与看门狗判据用同一个值（task.activityAt：事件心跳 ∨ 产物 mtime）。
   // stuckSuspect 是看门狗「上次采样」的结论，二者可能短暂不一致（例如产物被清理后归 0）。
@@ -2844,6 +3027,9 @@ function startWatchdog(task) { rtOf(task).startWatchdog() }
 // 超长 -o 输出只留头尾（各半）：output 会整段进内存并随 GET /task 全量外发，
 // 不设限时长任务的输出可达数百 MB（OOM + 响应体爆炸）。
 const TASK_OUTPUT_CLIP = 2 * 1024 * 1024
+const CANCEL_RETRY_MS = 1000
+const CANCEL_FORCE_FINALIZE_MS = 5000
+const CANCEL_FORCE_FINALIZE_MESSAGE = 'agent 未响应取消，已强制收尾（5 秒超时）'
 function readHeadTail(path, maxBytes) {
   const fd = openSync(path, 'r')
   try {
@@ -2901,6 +3087,7 @@ const FINALIZE_EXTRA_ALLOWED = new Set(['verdict', 'error'])
 
 function finalizeJob(task, exitCode, status, extra) {
   if (task.endedAt !== null && task.endedAt !== undefined) return false
+  clearCancelTimers(task)
   stopWatchdog(task)
   // exitCode 省略 = 保留调用方已记的值：复核每轮在 runReview 里自记 exitCode，不能覆盖。
   if (exitCode !== undefined) rtOf(task).setExitCode(exitCode)
@@ -2920,6 +3107,7 @@ function finalizeJob(task, exitCode, status, extra) {
   // 复核被熔断时本轮 -o 文件还在（readReviewOut 没跑到），这里一并回收，不再单靠 keepDays。
   try { unlinkSync(jobOutPath) } catch { /* 文件可能本就没生成/已被逐轮清理，忽略 */ }
   try { unlinkSync(`${jobOutPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
+  try { unlinkSync(`${jobOutPath}.live.1`) } catch { /* 轮转备份同一收尾时机删除 */ }
   // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
   // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
   try { appendConsultBlock(task) } catch (e) { noteErr('consult', e) }
@@ -2930,6 +3118,15 @@ function finalizeJob(task, exitCode, status, extra) {
 // 工单收尾：统一走 finalizeJob。
 function finalizeTask(task, exitCode, status) {
   return finalizeJob(task, exitCode, status)
+}
+
+function clearCancelTimers(task) {
+  const timers = task.cancelTimers
+  if (!timers) return
+  for (const timer of Object.values(timers)) {
+    if (timer !== null) clearTimeout(timer)
+  }
+  task.cancelTimers = null
 }
 
 // 完成/停滞通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
@@ -3267,6 +3464,13 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     outPath,
     codexBinary: resolveCodexBinary(),
     onEvent: (evt) => {
+      if (evt.kind === 'appserverParseFailure') {
+        // 独立累计快照：不会被 engineEvents 环形挤掉，也不算有效协议活动。
+        task.appServerParseFailures = {
+          count: evt.count, firstSample: evt.firstSample, lastSample: evt.lastSample,
+        }
+        return
+      }
       // progress 封闭投影（2026-10-28）：不再 `{...evt}` 展开 —— 原先除 meta.raw 之外的
       // 引擎专有字段（tool/usage/done/meta.eventType/itemId/…）会整条漏进对外响应。
       rtOf(task).pushProgress(progressEntry(evt, Date.now()), PROGRESS_LIMIT)
@@ -3350,6 +3554,23 @@ async function handleTaskCreate(req, res) {
       if (piProvider === null) {
         return send(res, { ok: false, error: '没有可用的 Pi provider/API Key；请先在第二引擎设置中配置 provider' }, 400)
       }
+      // 请求里的 model 原来只判类型就原样下发 —— 名字写错时 Pi 自行失败或回退，
+      // 用户看到「跑完了但不是我选的模型」。下发前用探测到的可用集合校验一次；
+      // 探测拿不到（null / 空数组：没装 pi 或没配 key）时放行，不能因为探不到就拦住正常使用。
+      const requestedPiModel = typeof body.model === 'string' ? body.model.trim() : ''
+      if (requestedPiModel !== '') {
+        const avail = await piAvailableModels().catch(() => null)
+        if (Array.isArray(avail) && avail.length > 0) {
+          const names = avail.map((m) => (typeof m === 'string' ? m : String(m?.id ?? m?.model ?? '')))
+          if (!names.includes(requestedPiModel)) {
+            const head = names.slice(0, 8).join(', ')
+            return send(res, {
+              ok: false,
+              error: `Pi 没有模型 "${requestedPiModel}"；当前可用：${head}${names.length > 8 ? ` 等 ${names.length} 个` : ''}`,
+            }, 400)
+          }
+        }
+      }
       const piId = newId()
       return startPiTask({
         res,
@@ -3420,11 +3641,23 @@ async function handleTaskCreate(req, res) {
     let liveStream = openLiveStream('a')
     const writeLive = (buf) => {
       live.bytes += buf.length
-      // 轮转：live 只作近期诊断，超限重开（'w' 从头写），不让长任务把它膨胀到 GB 级。
-      if (live.bytes - live.rotatedAt > LIVE_ROTATE_BYTES) {
-        live.rotatedAt = live.bytes
-        try { liveStream.end() } catch { /* best effort */ }
-        liveStream = openLiveStream('w')
+      // 保留最近两段；旧流排队中的写入继续落在 rename 后的 inode，绝不截断它。
+      // 首次异步 open 完成后才能 rename；新 fd 同步打开，避免紧接着 finalize 又创建 .live。
+      if (live.bytes - live.rotatedAt > LIVE_ROTATE_BYTES && !liveStream.pending && !liveStream.destroyed) {
+        let renamed = false
+        try {
+          renameSync(livePath, `${livePath}.1`)
+          renamed = true
+          const next = createWriteStream(livePath, { fd: openSync(livePath, 'a') })
+          next.on('error', () => { /* 诊断日志失败不影响任务 */ })
+          const previous = liveStream
+          liveStream = next
+          live.rotatedAt = live.bytes
+          previous.end()
+        } catch {
+          // 切换失败仍沿用旧流；新文件打开失败时恢复路径，下个 chunk 可再次尝试。
+          if (renamed) { try { renameSync(`${livePath}.1`, livePath) } catch { /* best effort */ } }
+        }
       }
       liveStream.write(buf)
     }
@@ -3449,6 +3682,12 @@ async function handleTaskCreate(req, res) {
     // P3.3 修正（2026-10-28）：exec 工单的 child 原先只在对象字面量里，没交给 runtime ——
     // 导致 handleTaskCancel 的 rtOf(task).kill() 拿到 null，进程杀不死、终态永不落定。
     rtOf(task).setChild(child)
+    // 2026-10-31 修（对照 task-reaper 时发现）：exec 工单原先**只 setChild、没记 childPid**。
+    // 而 `probeTaskLost()` 靠 `rt.getChildPid()` 判断，pid 非整数就直接 return null ——
+    // 于是 reconcile 的失联检测**对 exec 工单完全失效**（与 Pi runtime 那个 PID 登记坑同源，
+    // 只是这处一直没被触发路径暴露）。照复核分支的写法在 spawn 后立即固定身份。
+    rtOf(task).setChildPid(Number.isInteger(child.pid) ? child.pid : null)
+    rtOf(task).setChildStart(rtOf(task).getChildPid() === null ? null : readProcStartTime(rtOf(task).getChildPid()))
     startWatchdog(task)
 
     child.on('exit', (code, signal) => {
@@ -3572,17 +3811,37 @@ async function handleTaskCancel(req, res) {
     // T5：app-server 模式先发 turn/interrupt（优雅结束当前 turn），kill 作为兜底。
     rtOf(task).interrupt()
     rtOf(task).kill('SIGTERM')
-    // 兜底（2026-09-27 实测：codex 子进程偶有 SIGTERM 后残留）：3s 后仍未退出则 SIGKILL。
     const child = rtOf(task).child()
-    const killTimer = setTimeout(() => {
+    const timers = { retry: null, kill: null, forceFinalize: null }
+    task.cancelTimers = timers
+    const forceKillAndScheduleFinalize = () => {
+      if (task.endedAt !== null && task.endedAt !== undefined) return
       try {
         if (child !== null && child !== undefined && child.exitCode === null && child.signalCode === null) {
           child.kill('SIGKILL')
           rtOf(task).setForcedKill()
         }
       } catch { /* best effort */ }
-    }, 3000)
-    if (typeof killTimer.unref === 'function') killTimer.unref()
+      timers.forceFinalize = setTimeout(() => {
+        if (task.endedAt !== null && task.endedAt !== undefined) return
+        if (finalizeTask(task, -1, 'error')) {
+          task.output = `${task.output === '' ? '' : `${task.output}\n`}${CANCEL_FORCE_FINALIZE_MESSAGE}`
+          void notifyTask(task)
+        }
+      }, CANCEL_FORCE_FINALIZE_MS)
+      if (typeof timers.forceFinalize.unref === 'function') timers.forceFinalize.unref()
+    }
+    // T1 内仍未终态时只重发一次对应传输的取消请求。
+    timers.retry = setTimeout(() => {
+      if (task.endedAt !== null && task.endedAt !== undefined) return
+      if (task.status !== 'running' || !rtOf(task).isCancelled()) return
+      if (task.mode === 'appserver') rtOf(task).interrupt()
+      else rtOf(task).kill('SIGTERM')
+    }, CANCEL_RETRY_MS)
+    // SIGKILL 保持原有 3 秒兜底；其后 T2 内仍未收到退出事件则统一强制 finalize。
+    timers.kill = setTimeout(forceKillAndScheduleFinalize, 3000)
+    if (typeof timers.retry.unref === 'function') timers.retry.unref()
+    if (typeof timers.kill.unref === 'function') timers.kill.unref()
     send(res, { ok: true, id, status: viewStatus(task), exitCode: -1 })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
@@ -4260,6 +4519,12 @@ async function runReview(task, active) {
           try { child.kill('SIGKILL') } catch { /* best effort */ }
         }, roundWallMs)
         if (typeof wallTimer.unref === 'function') wallTimer.unref()
+      } else {
+        // 2026-10-31 修：预算在本轮开始前就已耗尽（轮间把 30 分钟吃满）时，原先"不装 timer
+        // 直接 await wait"等于零兜底 —— 子进程一挂死，硬预算就彻底失效。这里立即按墙钟到点
+        // 处理；下面 task.wallHit === true 的分支会正常收尾（stopReason='wallclock'）。
+        task.wallHit = true
+        try { child.kill('SIGKILL') } catch { /* best effort */ }
       }
       const code = await wait
       if (wallTimer !== null) clearTimeout(wallTimer)
@@ -5171,6 +5436,41 @@ async function handlePluginVersion(_req, res) {
 }
 
 export function apply(ctx) {
+  loadPolicyWatchState()
+  ctx.on('session/event', async (session, event) => {
+    if (event?.type !== 'turn/end') return
+    const sessionId = session?.id
+    if (typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
+  }, { global: true })
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    // 检测挂这里而不是 session/event：后者在 dsh-session/lib/index.js:1585 有
+    // `callbacks !== void 0 && entry !== void 0` 的派发前置条件，插件拿不到 entry
+    // 就永远收不到。agent/pre-step 是每次请求必经，且广播到**所有会话**（2026-10-31
+    // 实测 2 个会话均触发）。agent.id 就是 session id（同次探针实测，两者同值）。
+    if (typeof agent?.id === 'string' && agent.id) startPolicyWatch(agent.id)
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    const sessionId = agent?.id
+    const pending = typeof sessionId === 'string' ? policyWatchPending.get(sessionId) : null
+    if (!pending) return decision
+    const now = Date.now()
+    const lastDelivered = policyWatchDelivered.get(sessionId) || 0
+    policyWatchPending.delete(sessionId)
+    if (now - lastDelivered < POLICY_WATCH_DELIVERY_COOLDOWN_MS) {
+      persistPolicyWatchState()
+      return decision
+    }
+    policyWatchDelivered.delete(sessionId)
+    policyWatchDelivered.set(sessionId, now)
+    persistPolicyWatchState()
+    const message = {
+      id: `policy-watch-${randomBytes(8).toString('hex')}`,
+      role: 'system',
+      source: { kind: 'system-prompt' },
+      content: [{ type: 'text', text: `[POLICY_WATCH] 检测到${pending.summary}；考虑把当前卡点派单给第二引擎。` }],
+    }
+    return { ...decision, messages: [...decision.messages, message] }
+  })
   // 桥清理：插件卸载/热重载时关掉本地桥，避免 server 句柄与端口残留。
   // 宿主用 cordis fiber：ctx.effect 回调返回的函数即卸载时的 disposer（同 guard 写法）；
   // 宿主若没有 effect（老版本），退回 process.on('exit')。
@@ -5242,6 +5542,7 @@ export function apply(ctx) {
       { kind: 'exact', method: 'GET', path: '/second-engine/api/consults', desc: '求助列表（不脱敏，给主 AI 收卷）', handler: handleConsultsList },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/version', desc: '本机 codex 版本 vs GitHub 最新 release（updateAvailable）', handler: handleVersion },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/plugin-version', desc: '插件自身版本 vs GitHub 最新 release（失败静默，无更新不提示）', handler: handlePluginVersion },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/_exp/wake', desc: '实验：唤醒休眠 DSH 会话并投递用户消息 { sessionId, text }（暂不传 setup）', handler: (req, res) => handleExperimentalWake(wctx, req, res) },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/websearch', desc: '读/写 config.toml 顶层 web_search { value: disabled|cached|indexed|live }', handler: handleWebSearchRoot },
       // prefix：'prefix' 同时命中 /mcp 与 /mcp/<name>，DELETE 的名字从 URL 尾巴取。
       { kind: 'prefix', method: 'GET|POST|DELETE', path: '/second-engine/api/mcp', desc: 'GET 全部 [mcp_servers.*] 段；POST 新增 { name, url }（重名 409）或 /<name> 启用禁用 { enabled }；DELETE /<name> 删段（404）', handler: handleMcpRoot },

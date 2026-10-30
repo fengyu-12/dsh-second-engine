@@ -13,6 +13,7 @@
  */
 import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
+import { StringDecoder } from 'node:string_decoder'
 
 const REQUEST_TIMEOUT_MS = 60_000
 // 首 token 看门狗：turn/start 已应答但 app-server 长时间无任何通知（典型 401/403/额度耗尽）
@@ -117,6 +118,9 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
   // 接不住；不挂监听器就是 uncaughtException（write() 外层的 try/catch 防不了这个）。
   child.stdin.on('error', () => { /* 已退出：exit/error 回调负责收尾 */ })
   let buffer = ''
+  // 跨 chunk 的多字节字符必须用 StringDecoder 累积半个字符：
+  // chunk.toString() 逐块解码会在 UTF-8 序列中间切开，产生 U+FFFD 并永久损坏中文正文。
+  const stdoutDec = new StringDecoder('utf8')
   let nextId = 1
   let threadId = null
   let turnId = null
@@ -190,11 +194,20 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
     eventType: msg.method,
     raw: p,
   })
+  const parseFailures = { count: 0, firstSample: null, lastSample: null }
   function handleLine(line) {
     const text = line.trim()
     if (!text) return
     let msg
-    try { msg = JSON.parse(text) } catch { return }
+    try { msg = JSON.parse(text) } catch {
+      const sample = text.slice(0, 300)
+      parseFailures.count += 1
+      if (parseFailures.count === 1) parseFailures.firstSample = sample
+      parseFailures.lastSample = sample
+      // 内部诊断事件：上层必须在 progress/heartbeat 之前截获；坏帧仍直接丢弃。
+      emit({ kind: 'appserverParseFailure', ...parseFailures })
+      return
+    }
     // 服务端发起的 JSON-RPC 请求（权限审批 / request_user_input / 动态工具）：带 method 又带 id。
     // 不能让它落到 pending 分支，否则 provider 永久等待，turn 挂到超时（A: json-rpc-process.ts:243-258）
     if (msg.method && msg.id !== undefined && msg.id !== null) {
@@ -399,7 +412,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
   }
 
   child.stdout.on('data', (chunk) => {
-    buffer += chunk.toString()
+    buffer += stdoutDec.write(chunk)
     let idx
     while ((idx = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, idx)
