@@ -9,12 +9,12 @@ description: 唤起与操作第二引擎（Codex 或 Pi，可在设置页切换�
 
 **读取闸门（任务出现 → 必须先读 → 读完带走什么）**
 
-| 任务出现时 | 必须先读（相对本 skill 根目录） | 带走什么结论 |
+| 任务出现时 | 必须先读（绝对路径） | 带走什么结论 |
 |---|---|---|
-| 要操作 Pi：路径 / 事件格式 / 桥 / 能力契约 / 清理 / 版本 | `references/ref-pi-runtime.md` | Pi 会话落在 `<cwd>` 分区、桥端口 8788、`agent_settled` 才是终点、成败只认 `stopReason=stop` |
-| 要查 Codex 现场：keyring / wireApi / CODEX_HOME / CLI / 凭证 / 中转站 | `references/ref-codex-facts.md` | config.toml 由 keyring 生成（别手改）、wireApi 判据、key 不进 argv |
-| 要升级 Codex，或升级后判断插件要不要动 | `references/ref-codex-upgrade.md` | npm 平台包是正选、三条检验的通过判据、只有执行链判不过才动插件 |
-| 要写看板 / 派长任务链 / 查 board 子命令 | `references/ref-dual-board.md` | `board.sh` 是唯一写入口、出板必须 `--reviewed-by human`、`--workdir` 必须绝对路径 |
+| 要操作 Pi：路径 / 事件格式 / 桥 / 能力契约 / 清理 / 版本 | `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md` | Pi 会话落在 `<cwd>` 分区、桥端口 8788、`agent_settled` 才是终点、成败只认 `stopReason=stop` |
+| 要查 Codex 现场：keyring / wireApi / CODEX_HOME / CLI / 凭证 / 中转站 | `<DSH 技能目录>/second-engine/references/ref-codex-facts.md` | config.toml 由 keyring 生成（别手改）、wireApi 判据、key 不进 argv |
+| 要升级 Codex，或升级后判断插件要不要动 | `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md` | npm 平台包是正选、三条检验的通过判据、只有执行链判不过才动插件 |
+| 要写看板 / 派长任务链 / 查 board 子命令 | `<DSH 技能目录>/second-engine/references/ref-dual-board.md` | `board.sh` 是唯一写入口、出板必须 `--reviewed-by human`、`--workdir` 必须绝对路径 |
 
 ---
 
@@ -126,7 +126,7 @@ description: 唤起与操作第二引擎（Codex 或 Pi，可在设置页切换�
 
 ⚠️ **别把"能换模型"当成 Pi 的卖点** —— **Codex 同样能换**（改 `config.toml` 的 `model_provider` + `model`，本机现为 zhipu/glm-5.3-flash）。真实差别是：Codex 一次一个 active provider，Pi 可并存多个。
 
-> 判据：**引擎能力看 CLI/配置文件，不看 Web 控件列几个**。别再按「下拉只显示当前值」的旧现象推断引擎能力（该 UI 缺陷 2026-10-30 已修，细节见 `references/ref-pi-runtime.md`）。
+> 判据：**引擎能力看 CLI/配置文件，不看 Web 控件列几个**。别再按「下拉只显示当前值」的旧现象推断引擎能力（该 UI 缺陷 2026-10-30 已修，细节见 `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md`）。
 
 两条容易踩的：
 - 切换即时生效（`~/.dsh/second-engine-engine.txt`），但**会话不迁移** —— 已开的工单留在原引擎，切完看不到旧单。
@@ -184,7 +184,7 @@ DSH 侧**两条路都能叫到 Codex**，别混：
 
 **共同点**：两条都是「**一 run 一进程一 thread，无 resume**」（官方原话，本机两条都已实测）⇒ **要连续性只能靠 dual-board 文本看板**，别指望引擎。
 
-⚠️ **`subagent_codex` 的工具描述里完全没提 Codex**（与通用 `subagent` 的描述前半段逐字相同），新会话的 AI 不会自动知道该用它干 Codex 的活，也读不出它没有连续性、`permissionMode` 默认 `never`。**这条判据正是本 skill 存在的意义之一。**（它的凭据喂法见 `references/ref-codex-facts.md`）
+⚠️ **`subagent_codex` 的工具描述里完全没提 Codex**（与通用 `subagent` 的描述前半段逐字相同），新会话的 AI 不会自动知道该用它干 Codex 的活，也读不出它没有连续性、`permissionMode` 默认 `never`。**这条判据正是本 skill 存在的意义之一。**（它的凭据喂法见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`）
 
 ## 派单前：查档位与发法（2026-10-25 定 · 责任在主 AI 不在 Codex）
 
@@ -302,7 +302,7 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 echo appserver > ~/.dsh/second-engine-mode.txt   # 切 app-server（2026-10-26 查：当前值为 exec）
 echo exec      > ~/.dsh/second-engine-mode.txt   # 切回
 ```
-优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。appserver 协议映射见 `references/ref-codex-facts.md`。
+优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。appserver 协议映射见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`。
 
 ## API 优先：本插件服务层（入口 = `$DSH_WEB_URL`，随端口变、别写死）
 
@@ -321,7 +321,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 ```bash
 codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI（Ctrl+D 或 /quit 退出）
 # 手动（⚠️ 别写成 VAR=key cmd，会进 argv 被 ps 看到）：
-KEY=$(head -1 "~/.dsh/中转站/当前生效API.txt"); cd ~/proj && env PROVIDER_API_KEY="$KEY" codex exec --skip-git-repo-check -o /tmp/out.txt "工单"
+KEY=$(head -1 "<你的 API key 文件>"); cd ~/proj && env PROVIDER_API_KEY="$KEY" codex exec --skip-git-repo-check -o /tmp/out.txt "工单"
 ```
 - 长线程需 resume 时不加 `--ephemeral`（完整 36 位 UUID）；结构化收结果用 `-o <文件>` 或 `--json`。
 
@@ -347,13 +347,13 @@ KEY=$(head -1 "~/.dsh/中转站/当前生效API.txt"); cd ~/proj && env PROVIDER
 |---|---|
 | 派单后长时间零输出（>10 分钟） | **先分清「错」「慢」「并发」**：有 `Reconnecting/stream disconnected` = 流断，切 provider；只有沉默无错误 = 可能在生成（relay 桥是"非流式请求上游、整段生成完再流式回放"，长任务首包延迟≈整段生成时间，此时**不要熔断，先等**）；**失败多为多个 codex 进程并发叠加**（实测智谱单发长输出 25.3 万字节/21s 完全正常）——先 `ps` 确认没叠跑再重试，仍不通切 active 提供方。**别并发派单** |
 | 任务**秒退**且过程流尾部 `exceeded retry limit, last status: 429` | **先分清「本地限速」还是「上游侧拒绝」——两者都报 429**。⚠️ 别用小请求探活当判据（几个 token 的探针 200，而 40K+ 上下文被直接拒；10-03 误判多灌 55 个请求）；**判据 = 看面板**；确属限速才冷却重派，否则换 provider |
-| 工单 exit 0 但工作目录没有新文件 | **假完成**，第一件事查它是不是走了翻译桥（wireApi 判据见 `references/ref-codex-facts.md`） |
+| 工单 exit 0 但工作目录没有新文件 | **假完成**，第一件事查它是不是走了翻译桥（wireApi 判据见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`） |
 | `wire_api` 报错 / bwrap、sandbox 报错 | config 被手改（应 responses / danger-full-access）→ 面板重新「启用」即由生成器重写 |
 | 工具全灭 approval never | 同上（config 被改坏，切 active 重写） |
 | `Missing <X>_API_KEY` | 激活提供方换了但 env 没跟上：用 `codex-env` 或手动 export 对应变量 |
 | 任务「运行中」长期无输出 | 看门狗会标 `stuckSuspect`（曾因 stdin EOF 假死，已修复）；直接取消重发 |
 | 取消后仍有 codex 进程残留 | 已加 3s 兜底 SIGKILL（`task.forcedKill` 可查）；手工清理只用**精确 PID**（`kill <pid>`），绝不用模式匹配 |
-| 智谱模型的疑问 | 端点与密钥事实见 `references/ref-codex-facts.md` |
+| 智谱模型的疑问 | 端点与密钥事实见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md` |
 
 ## 降级路径（环境不全时怎么办）
 
@@ -374,7 +374,7 @@ KEY=$(head -1 "~/.dsh/中转站/当前生效API.txt"); cd ~/proj && env PROVIDER
 - **自检一条命令**：`bash <插件目录>/tools/smoke.sh` 第 8 段比对 **17 个文件**的三处指纹；文档类（README / CHANGELOG / PROTOCOL / env.example）发布树是剔私版，只比存在不比内容。
 - **三个坑（实测踩的）**：① 改完真身没同步加载层 → 重启后验证白跑；② `board_tool.py` 的 `CHANNEL` 曾错挂 `dirname(__file__)`（已改为跟 `BOARD_DIR`）；③ 面板卡片状态白名单曾漏 `cancelled`，导致「已取消 + 运行中」并存。
 
-## 长任务链走看板：dual-board（细则见 `references/ref-dual-board.md`）
+## 长任务链走看板：dual-board（细则见 `<DSH 技能目录>/second-engine/references/ref-dual-board.md`）
 
 **什么时候走**：派单涉及多环节长任务，或需要 Codex 持续记忆。**写板唯一入口是 `board.sh`，手改 `board.json` = 破坏协议。**
 
@@ -390,9 +390,9 @@ bash <插件目录>/tools/dual-board/dispatch.sh --help # 派单前注入未读�
 
 ## 引擎与本机现场（要细节就读 references）
 
-- **Pi**：路径对照、装法与工作区、事件格式（`agent_settled` / `stopReason` 白名单）、桥端口 8788 与 pid 读法、前端 NDJSON 契约、`capabilities` 单点定义与四个判据坑、AGENTS.md 双写、版本检查、模型真源优先序 → **要 Pi 的路径 / 事件格式 / 桥 / 能力契约 / 清理目标 / 版本检查时，读 `references/ref-pi-runtime.md`**
-- **Codex**：二进制与沙箱、keyring 与 config.toml 生成、🔴 wireApi 选法、`~/.codex` 现场查（工单 `.out.live` / rollout）、CLI 面与探针、凭证安全、中转站参数、智谱端点、`~/.codex` 目录维护 → **要 Codex 的路径 / keyring / wireApi / CODEX_HOME / CLI 现场 / 凭证 / 中转站时，读 `references/ref-codex-facts.md`**
-- **升级**：npm 平台包正选姿势、原子替换与回滚、升级后三条检验（只有执行链判不过才动插件）、🔴 升级后维护旧结论 → **要升级或升级后判断插件要不要改时，读 `references/ref-codex-upgrade.md`**
+- **Pi**：路径对照、装法与工作区、事件格式（`agent_settled` / `stopReason` 白名单）、桥端口 8788 与 pid 读法、前端 NDJSON 契约、`capabilities` 单点定义与四个判据坑、AGENTS.md 双写、版本检查、模型真源优先序 → **要 Pi 的路径 / 事件格式 / 桥 / 能力契约 / 清理目标 / 版本检查时，读 `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md`**
+- **Codex**：二进制与沙箱、keyring 与 config.toml 生成、🔴 wireApi 选法、`~/.codex` 现场查（工单 `.out.live` / rollout）、CLI 面与探针、凭证安全、中转站参数、智谱端点、`~/.codex` 目录维护 → **要 Codex 的路径 / keyring / wireApi / CODEX_HOME / CLI 现场 / 凭证 / 中转站时，读 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`**
+- **升级**：npm 平台包正选姿势、原子替换与回滚、升级后三条检验（只有执行链判不过才动插件）、🔴 升级后维护旧结论 → **要升级或升级后判断插件要不要改时，读 `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md`**
 - **版本敏感结论**：版本号、feature 开关、CLI 面、逐版实测一律查 `<本机功能核对表>`，本文件与 references 都不记现状。
 
 ## 附录 · 一次性台账去处（正文不留）
