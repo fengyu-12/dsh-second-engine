@@ -1,0 +1,8 @@
+# 备份与测试产物：.gitignore 管不住 npm 打包，files 里的目录会整目录收
+*.bak
+*.bak-*
+*.orig
+*.rej
+__pycache__/
+*.pyc
+.ruff_cache/
