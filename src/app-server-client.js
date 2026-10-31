@@ -1,7 +1,7 @@
 /**
  * app-server 客户端（stdio JSON-RPC，零依赖）—— second-engine 的 app-server 执行模式。
  *
- * 协议事实来源：/root/proj/appserver-spike/FINDINGS.md + run1.log（Codex T4 实测，2026-09-27）
+ * 协议事实来源：Codex app-server 实测记录（T4，2026-09-27；作者机留档于 appserver-spike/FINDINGS.md + run1.log）
  *   initialize → initialized → thread/start → turn/start → 事件流 → turn/completed
  *   interrupt: turn/interrupt {threadId, turnId}
  *

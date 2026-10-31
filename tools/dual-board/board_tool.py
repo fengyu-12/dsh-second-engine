@@ -423,6 +423,8 @@ def cmd_set(a) -> None:
             if k == "status":
                 if v not in VALID_STATUS:
                     die(5, f"非法状态：{v}")
+                if v in TERMINAL:
+                    die(5, f"不可通过 set 直接写入终态：{v}——请使用 complete / abandon")
                 if t.get("status") in TERMINAL:
                     die(5, f"{a.id} 已终结（{t['status']}），终态不可再改（含改回 pending）"
                            f"——要重做请开新任务并引用它")

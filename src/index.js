@@ -271,9 +271,6 @@ function startPolicyWatch(sessionId) {
   policyWatchFlights.set(sessionId, flight)
   void flight.then((result) => {
     if (result?.error) { policyWatchErr('policy-watch-scan', result.error); return }
-    let current
-    try { const s = statSync(result.snapshot.path); current = { mtimeMs: s.mtimeMs, size: s.size } } catch { return }
-    if (current.mtimeMs !== result.snapshot.mtimeMs || current.size !== result.snapshot.size) return
     if (result.code === 0) {
       policyWatchPending.delete(sessionId)
       persistPolicyWatchState()
@@ -5012,6 +5009,18 @@ async function handleConfigSet(req, res) {
       if (ENGINES[body.engine] === undefined) {
         return send(res, { ok: false, error: `未知引擎：${body.engine}（可选 ${Object.keys(ENGINES).join(' / ')}）` }, 400)
       }
+      // 有工单在跑时切换 = 「面板按新引擎展示、工单仍在旧引擎执行」（activeEngineId 当场翻边，
+      // providers/key/active/delete 四条接口会转头去读另一个引擎的配置）。要显式 force:true 才放行。
+      const runningTasks = [...tasks.values()].filter((t) => t && typeof t === 'object' && t.status === 'running' && typeof t.id === 'string')
+      const engineNow = activeEngineId()
+      if (runningTasks.length && body.engine !== engineNow && body.force !== true) {
+        return send(res, {
+          ok: false,
+          error: `有 ${runningTasks.length} 个工单正在跑（${runningTasks.map((t) => t.id).join(', ')}），切换后面板会按新引擎展示而工单仍在旧引擎执行；确认切换请带 force:true`,
+          runningTasks: runningTasks.map((t) => ({ id: t.id, engine: t.engine || '' })),
+          activeEngine: engineNow,
+        }, 409)
+      }
       engineSwitched = setActiveEngineId(body.engine)
     }
     send(res, {
@@ -5501,11 +5510,11 @@ export function apply(ctx) {
     // `callbacks !== void 0 && entry !== void 0` 的派发前置条件，插件拿不到 entry
     // 就永远收不到。agent/pre-step 是每次请求必经，且广播到**所有会话**（2026-10-31
     // 实测 2 个会话均触发）。agent.id 就是 session id（同次探针实测，两者同值）。
-    if (typeof agent?.id === 'string' && agent.id) startPolicyWatch(agent.id)
-    const decision = await next()
-    if (decision.kind === 'reject') return decision
     const sessionId = agent?.id
     const pending = typeof sessionId === 'string' ? policyWatchPending.get(sessionId) : null
+    if (typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
     if (!pending) return decision
     const now = Date.now()
     const lastDelivered = policyWatchDelivered.get(sessionId) || 0
@@ -5521,7 +5530,7 @@ export function apply(ctx) {
       id: `policy-watch-${randomBytes(8).toString('hex')}`,
       role: 'user',
       source: { kind: 'policy-watch' },
-      content: [{ type: 'text', text: `[POLICY_WATCH] 检测到${pending.summary}；考虑把当前卡点派单给第二引擎。` }],
+      content: [{ type: 'text', text: `[POLICY_WATCH] 四条机械量命中：${pending.summary}。这可能是在验证、也可能是原地打转 —— 真正决定「派不派」的是 skill 的「用户否了我时」二分自答 +「什么时候该派它」A/B 两分法；本提醒只是机械量，不下结论。` }],
     }
     return { ...decision, messages: [...decision.messages, message] }
   })

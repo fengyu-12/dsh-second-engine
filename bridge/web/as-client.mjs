@@ -36,7 +36,7 @@ export class AppServerClient extends EventEmitter {
 
     ws.addEventListener('open', () => {
       this.attempts = 0;
-      this.call('initialize', { clientInfo: this.clientInfo })
+      this.call('initialize', { clientInfo: this.clientInfo, capabilities: { experimentalApi: true } })
         .then((r) => {
           this.ready = true;
           this.log(`app-server 已连接：${r.userAgent || ''}`);

@@ -153,8 +153,10 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 
 <p align="center">
   <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/settings-model.jpg" width="46%" alt="界面风格与模型思考">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/pi-chat.jpg" width="46%" alt="Pi 引擎对话">
   <br>
-  <sub><b>界面风格</b>（Codex 蓝 / Claude 陶土色）· 字号 · 模型与思考等级</sub>
+  <sub>左：<b>界面风格</b>（Codex 蓝 / Claude 陶土色）· 字号 · 模型与思考等级。
+  <br>右：<b>Pi 引擎</b> —— 同一个聊天桥换个引擎，模型与思考档位同样可切。</sub>
 </p>
 
 ## 装之前要准备什么
@@ -350,10 +352,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.1）
+## 支持能力一览（v3.8.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **3.8.2 修复批** | ✅ 3.8.2 | 看板 `set` 不能再直接写终态（补完人审门禁的另一半，此前可从 pending 直达 completed 且不写审计）；`policy-watch` 把 `norm_err()` 接进 M1 判据、清掉死参数/死变量、zstd 缺失走干净退出而非抛 traceback；Web 桥接通宿主模型清单（`BRIDGE_HOST_API_URL` 未注入时 models 恒为空，此前下拉只有一个）并恢复会话内切模型/切思考（`initialize` 补 `experimentalApi` 能力，此前被 app-server 拒绝）；绕圈提醒两处（pending 读取顺序 + 去掉「文件一长就丢弃结果」的快照校验，此前提醒 8 小时发不出一次），现已实测能注入且同命中不重复；切引擎前检查运行中工单（409 + `force:true`） |
 | **协作信号检测的运行时加固** | ✅ 3.8.1 | 三条修正一并落地：① 脚本路径改为按模块自身位置定位，不再写死安装目录（换路径安装即失效的老问题）；② 启动前探测解释器可用性，缺 Python 只关掉检测、不影响正常对话，且错误留痕而非静默；③ 每会话 30s 最小间隔 + 会话文件 mtime/size 快照去重（同一状态不重复扫），状态落盘改原子写。注入的消息 role 固定为 `user`、来源标 `policy-watch` |
 | **桥配置写入加固** | ✅ 3.8.1 | 原实现有两个坑：并发写互相踩、失败分支还会把半截临时文件 `rename` 成正式配置。现改为按配置路径串行化 + TOML 写前写后双校验（python `tomllib`，fail-closed）+ 临时文件 `pid.时间戳.随机串` + 失败只删临时文件。已验故障注入下正式文件 MD5 逐字节不变、10 并发最终文件完整可解析 |
 | **看板正确性修复** | ✅ 3.8.1 | 两条状态机漏洞：① 依赖项完成后被 `--keep`/人审移出板，下游仍被判 `blocked`（现从 `audit/completed-<月>.jsonl` 补齐已终结集合）；② 只有 `complete` 有终态检查，`set`/`abandon` 能把 `completed` 改回 `pending`（现终态一律不可离开） |
@@ -394,7 +397,7 @@ Codex 升到 **0.166.0**，命令面新增 `review` / `mcp` / `plugin` / `update
 
 ## 版本记录（择要）
 
-最新版本 **3.8.1** —— 发布前加固版：协作信号检测的运行时加固（路径定位 / 解释器探测 / 限流去重 / 原子落盘）、桥配置写入加固（串行锁 + 双校验 + 唯一临时名）、看板状态机两条漏洞修复。无新功能，全部是 3.8.0 上线后暴露的可靠性问题。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+最新版本 **3.8.2** —— 修复版，无新功能：看板人审门禁补完之后被绕过的另一半、`policy-watch` 三处（归一化/死码/退出码）、Web 桥两处（模型清单通道、会话内切模型与切思考的能力声明）、绕圈提醒的读取顺序、切引擎前的运行中工单检查。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## 有哪些坑要提前知道（已知限制）
 

@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 
 SESSIONS_ROOT = os.path.expanduser("~/.dsh/sessions")
 SESSION_FILE = "session.v4.jsonl.zstd"
@@ -95,7 +96,10 @@ def pick_session(spec, root=SESSIONS_ROOT):
 
 def read_events(path):
     f = os.path.join(path, SESSION_FILE)
-    proc = subprocess.Popen(["zstd", "-dc", f], stdout=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(["zstd", "-dc", f], stdout=subprocess.PIPE)
+    except FileNotFoundError:
+        raise RuntimeError("zstd binary not found")
     for line in proc.stdout:
         line = line.strip()
         if not line:
@@ -107,15 +111,41 @@ def read_events(path):
     proc.wait()
 
 
-def analyze(events, steps_threshold, window_s):
+def _event_time(ev):
+    """Return event time in seconds, accepting epoch seconds/ms or ISO strings."""
+    for key in ("ts", "timestamp", "time", "createdAt"):
+        value = ev.get(key)
+        if value is None:
+            value = (ev.get("data") or {}).get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return float(value) / 1000 if value > 10_000_000_000 else float(value)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                try:
+                    n = float(value)
+                    return n / 1000 if n > 10_000_000_000 else n
+                except ValueError:
+                    pass
+    return None
+
+
+def analyze(events, steps_threshold, window_s=600):
+    events = list(events)
+    times = [_event_time(ev) for ev in events]
+    known = [t for t in times if t is not None]
+    m1_cutoff = max(known) - window_s if known else None
     calls = {}          # callId -> {name, args, seq, turn, step}
-    m1_streak = {}      # cmd_key -> [(err_key, seq)]
+    m1_streak = {}      # current command -> [err_key, count]
+    last_m1_cmd = None
     m1_hits = []
     edits = {}          # file_path -> [(old_h, new_h, seq, turn)]
     m2_hits = []
     step_sig = {}       # (turn, step) -> [result_texts]
     step_wait = set()   # (turn, step) 只含等待类调用
-    t_start = t_end = None
     n_ev = 0
 
     for ev in events:
@@ -149,6 +179,9 @@ def analyze(events, steps_threshold, window_s):
 
             name = call["name"]
             if name == "bash":
+                event_time = _event_time(ev)
+                if m1_cutoff is not None and event_time is not None and event_time < m1_cutoff:
+                    continue
                 try:
                     args = json.loads(call["args"] or "{}")
                 except ValueError:
@@ -160,7 +193,11 @@ def analyze(events, steps_threshold, window_s):
                 # `[exit code: N]`；而末条是 echo 之类的命令会把整体退出码变成 0（于是不标记），
                 # 单靠退出码会漏掉「成功但输出一字未变」的重复。输出本身会变的命令
                 # （date / ps / ls 变化目录）自然不命中。
-                out_sig = h(str(text)[:2000])
+                out_sig = h(norm_err(str(text))[:2000])
+                # M1 is continuous: any different command breaks the streak.
+                if last_m1_cmd != ck:
+                    m1_streak.clear()
+                last_m1_cmd = ck
                 prev = m1_streak.get(ck)
                 if prev and prev[0] == out_sig:
                     prev[1] += 1
@@ -226,6 +263,7 @@ def main():
     ap.add_argument("--session", help="会话 id 或路径（默认当前目录最新）")
     ap.add_argument("--root", default=SESSIONS_ROOT, help="会话根目录")
     ap.add_argument("--steps", type=int, default=4, help="M3 连续无推进步数阈值（默认 4）")
+    ap.add_argument("--window", type=float, default=600, help="M1 时间窗口秒数（默认 600）")
     ap.add_argument("--json", action="store_true", help="机器可读输出")
     a = ap.parse_args()
 
@@ -234,7 +272,7 @@ def main():
         print("[policy-watch] 找不到会话文件", file=sys.stderr)
         return 3
 
-    res = analyze(read_events(path), a.steps, 600)
+    res = analyze(read_events(path), a.steps, a.window)
     total = len(res["m1"]) + len(res["m2"]) + len(res["m3"])
 
     if a.json:
