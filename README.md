@@ -350,10 +350,13 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.0）
+## 支持能力一览（v3.8.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **协作信号检测的运行时加固** | ✅ 3.8.1 | 三条修正一并落地：① 脚本路径改为按模块自身位置定位，不再写死安装目录（换路径安装即失效的老问题）；② 启动前探测解释器可用性，缺 Python 只关掉检测、不影响正常对话，且错误留痕而非静默；③ 每会话 30s 最小间隔 + 会话文件 mtime/size 快照去重（同一状态不重复扫），状态落盘改原子写。注入的消息 role 固定为 `user`、来源标 `policy-watch` |
+| **桥配置写入加固** | ✅ 3.8.1 | 原实现有两个坑：并发写互相踩、失败分支还会把半截临时文件 `rename` 成正式配置。现改为按配置路径串行化 + TOML 写前写后双校验（python `tomllib`，fail-closed）+ 临时文件 `pid.时间戳.随机串` + 失败只删临时文件。已验故障注入下正式文件 MD5 逐字节不变、10 并发最终文件完整可解析 |
+| **看板正确性修复** | ✅ 3.8.1 | 两条状态机漏洞：① 依赖项完成后被 `--keep`/人审移出板，下游仍被判 `blocked`（现从 `audit/completed-<月>.jsonl` 补齐已终结集合）；② 只有 `complete` 有终态检查，`set`/`abandon` 能把 `completed` 改回 `pending`（现终态一律不可离开） |
 | **多引擎协作策略 + 无效重试信号检测** | ✅ 3.8.0 | `tools/policy-watch.py` 从会话事件流算三条信号（同一命令+同一错误类连续失败 ≥2 / 同一文件编辑振荡 A→B→A / 连续 4 步无状态推进，跳过等待类调用），退出码 **10 = 命中**；已验正向 3/3 命中、负向 4 类反例不报。配「二分自答」判据决定要不要把活外置给第二引擎 |
 | **skill 分层（正文 400 行 + `references/` 4 个按需文件 + 读取闸门表）** | ✅ 3.8.0 | 手册正文只留判据与入口，细节按需要时才读，避免手册本身吃掉上下文 |
 | **出板人审门禁 + 审计留痕** | ✅ 3.8.0 | `complete` 须 `--reviewed-by human`（Agent 自报不算），自动化用 `--keep` 免审留在板且**不伪造** human 标记；出板记录落 `audit/completed-<月>.jsonl` |
@@ -391,7 +394,7 @@ Codex 升到 **0.166.0**，命令面新增 `review` / `mcp` / `plugin` / `update
 
 ## 版本记录（择要）
 
-最新版本 **3.7.0** —— 双引擎能力契约 + Pi 运行时接入。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+最新版本 **3.8.1** —— 发布前加固版：协作信号检测的运行时加固（路径定位 / 解释器探测 / 限流去重 / 原子落盘）、桥配置写入加固（串行锁 + 双校验 + 唯一临时名）、看板状态机两条漏洞修复。无新功能，全部是 3.8.0 上线后暴露的可靠性问题。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## 有哪些坑要提前知道（已知限制）
 

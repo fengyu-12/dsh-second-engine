@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 BOARD_DIR = os.environ.get("DUAL_BOARD_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,28 @@ LOCK_TRIES = 50          # 50 × 0.1s = 5s
 LOCK_SLEEP = 0.1
 DEFAULT_ROLES = {"lead": {"inbox": "inbox-lead.md", "engine": "dsh"},
                  "codex": {"inbox": "inbox-codex.md", "engine": "codex"}}
+
+_INBOX_LOCKS = {}
+_INBOX_LOCKS_GUARD = threading.Lock()
+
+def _inbox_lock(path):
+    key = os.path.abspath(path)
+    with _INBOX_LOCKS_GUARD:
+        return _INBOX_LOCKS.setdefault(key, threading.RLock())
+
+def _atomic_text(path, text):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 VALID_STATUS = ("pending", "in_progress", "blocked", "completed", "abandoned")
 TERMINAL = ("completed", "abandoned")
 TASK_TEMPLATE_KEYS = ("frame", "session", "write_scopes", "blocked_by", "acceptance", "result", "steps")
@@ -180,8 +203,36 @@ def check_cas(data: dict, expect: int | None) -> None:
         die(3, f"CAS 冲突：期望 revision={expect}，实际 {data['revision']}（请重读看板后重试）")
 
 
+def completed_ids(data: dict) -> set:
+    """已完成任务的 id 集合 = 板上 completed + 审计里已出板的 completed。
+
+    为什么必须读审计：`complete` 会把任务从板上删掉（v1.3 §12.1 完成即出板），
+    只看 data["tasks"] 的话，依赖一个已正常出板的任务会永远显示"未完成"。
+    """
+    ids = {t["id"] for t in data["tasks"] if t.get("status") == "completed"}
+    try:
+        for fn in os.listdir(AUDIT_DIR):
+            if not (fn.startswith("completed-") and fn.endswith(".jsonl")):
+                continue
+            with open(os.path.join(AUDIT_DIR, fn), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue  # 半截行不致命，容错继续
+                    tid = rec.get("id")
+                    if isinstance(tid, str) and tid:
+                        ids.add(tid)
+    except FileNotFoundError:
+        pass
+    return ids
+
+
 def check_deps(data: dict, task: dict) -> None:
-    done = {t["id"] for t in data["tasks"] if t.get("status") == "completed"}
+    done = completed_ids(data)
     missing = [b for b in task.get("blocked_by") or [] if b not in done]
     if missing:
         die(4, f"依赖未完成：{', '.join(missing)}")
@@ -346,6 +397,8 @@ def cmd_abandon(a) -> None:
         data = load_board()
         check_cas(data, a.expect)
         t = find_task(data, a.id)
+        if t.get("status") in TERMINAL:
+            die(5, f"{a.id} 已终结（{t['status']}），终态不可再改——要重做请开新任务并引用它")
         t["status"] = "abandoned"
         t["result"] = (t.get("result") or "") + f"\n[abandoned {now_utc()}] {a.reason}"
         t["updated_at"] = now_utc()
@@ -367,10 +420,12 @@ def cmd_set(a) -> None:
             k, v = pair.split("=", 1)
             if k not in allow:
                 die(2, f"字段不可改：{k}（允许：{', '.join(sorted(allow))}）")
-            if k == "status" and v not in VALID_STATUS:
-                die(5, f"非法状态：{v}")
-            if k == "status" and v == "completed" and t.get("status") in TERMINAL:
-                die(5, "completed 不可复改")
+            if k == "status":
+                if v not in VALID_STATUS:
+                    die(5, f"非法状态：{v}")
+                if t.get("status") in TERMINAL:
+                    die(5, f"{a.id} 已终结（{t['status']}），终态不可再改（含改回 pending）"
+                           f"——要重做请开新任务并引用它")
             if k == "owner" and v and not role_exists(roles, v):
                 die(5, f"角色不存在：{v}")
             if k == "engine" and v not in ("dsh", "codex", "pi"):
@@ -393,7 +448,7 @@ def cmd_ready(a) -> None:
     依赖判定复用既有 done/missing 语义（与 check_deps 一致）。
     """
     data = load_board()
-    done = {t["id"] for t in data["tasks"] if t.get("status") == "completed"}
+    done = completed_ids(data)
     ready, blocked = [], []
     for t in data["tasks"]:
         if t.get("status") not in ("pending", "blocked"):
@@ -449,8 +504,9 @@ def cmd_inbox_append(a) -> None:
         die(2, f"sender 不是已知角色：{a.sender}")
     head = f"\n## [{now_bj()}] 来自 {a.sender}\n"
     body = a.text if a.text is not None else sys.stdin.read()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(head + body.rstrip("\n") + "\n")
+    with _inbox_lock(path):
+        current = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+        _atomic_text(path, current + head + body.rstrip("\n") + "\n")
     print(f"ok: 追加到 {roles[a.who]['inbox']}（{a.sender}）")
 
 
@@ -462,7 +518,8 @@ def read_sections(who: str):
     path = inbox_path(_roles_for_command(), who)
     if not os.path.exists(path):
         return []
-    text = open(path, encoding="utf-8").read()
+    with _inbox_lock(path):
+        text = open(path, encoding="utf-8").read()
     starts = [m.start() for m in _SECTION_RE.finditer(text)]
     out = []
     for i, s in enumerate(starts):
@@ -486,21 +543,19 @@ def cmd_inbox_read(a) -> None:
     roles = _roles_for_command(); path = inbox_path(roles, a.who)
     if not os.path.exists(path):
         die(1, f"收件箱不存在：{path}")
-    lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
-    marked = 0
-    for i, ln in enumerate(lines):
-        if ln.startswith("## [") and "[已读]" not in ln:
-            if a.match and a.match not in ln:
-                continue
-            lines[i] = ln.rstrip("\n") + " [已读]\n"
-            marked += 1
-            if a.match:
-                break
-    if not marked:
-        print("（无未读需标注）", file=sys.stderr)
-        return
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    with _inbox_lock(path):
+        lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+        marked = 0
+        for i, ln in enumerate(lines):
+            if ln.startswith("## [") and "[已读]" not in ln:
+                if a.match and a.match not in ln: continue
+                lines[i] = ln.rstrip("\n") + " [已读]\n"
+                marked += 1
+                if a.match: break
+        if not marked:
+            print("（无未读需标注）", file=sys.stderr)
+            return
+        _atomic_text(path, "".join(lines))
     print(f"ok: 标注 {marked} 条已读 → {roles[a.who]['inbox']}")
 
 
@@ -607,24 +662,22 @@ def cmd_inbox_archive(a) -> None:
     path = inbox_path(_roles_for_command(), a.who)
     if not os.path.exists(path):
         die(1, f"收件箱不存在：{path}")
-    text = open(path, encoding="utf-8").read()
-    starts = [m.start() for m in _SECTION_RE.finditer(text)]
-    if not starts:
-        print("（收件箱无消息段）", file=sys.stderr)
-        return
-    head = text[:starts[0]]
-    keep_segs, moved_segs = [], []
-    for i, s in enumerate(starts):
-        e = starts[i + 1] if i + 1 < len(starts) else len(text)
-        seg = text[s:e]
-        (moved_segs if "[已读]" in seg.splitlines()[0] else keep_segs).append(seg)
-    if not moved_segs:
-        print("（无已读段可归档）", file=sys.stderr)
-        return
-    _append_jsonl(os.path.join(ARCHIVE_DIR, f"inbox-{a.who}-{month}.jsonl"),
-                  [{"archived_at": now_utc(), "content": seg.strip()} for seg in moved_segs])
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(head.rstrip("\n") + ("\n\n" if head.strip() else "") + "\n".join(
+    with _inbox_lock(path):
+        text = open(path, encoding="utf-8").read()
+        starts = [m.start() for m in _SECTION_RE.finditer(text)]
+        if not starts:
+            print("（收件箱无消息段）", file=sys.stderr); return
+        head = text[:starts[0]]
+        keep_segs, moved_segs = [], []
+        for i, s in enumerate(starts):
+            e = starts[i + 1] if i + 1 < len(starts) else len(text)
+            seg = text[s:e]
+            (moved_segs if "[已读]" in seg.splitlines()[0] else keep_segs).append(seg)
+        if not moved_segs:
+            print("（无已读段可归档）", file=sys.stderr); return
+        _append_jsonl(os.path.join(ARCHIVE_DIR, f"inbox-{a.who}-{month}.jsonl"),
+                      [{"archived_at": now_utc(), "content": seg.strip()} for seg in moved_segs])
+        _atomic_text(path, head.rstrip("\n") + ("\n\n" if head.strip() else "") + "\n".join(
             s.strip() for s in keep_segs) + ("\n" if keep_segs else ""))
     print(f"ok: {len(moved_segs)} 段已读转档 archive/inbox-{a.who}-{month}.jsonl")
 

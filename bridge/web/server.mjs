@@ -20,7 +20,8 @@
 
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile, readdir, readlink } from 'node:fs/promises';
-import { copyFileSync, writeFileSync, renameSync } from 'node:fs';
+import { copyFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -432,6 +433,20 @@ function requireReady(res) {
 // ── /api/config：读写 codex 的 config.toml（模型 / 思考等级等） ───────────────
 // 只碰顶层平键；注释、空行、所有 [section] 原样保留。写前备份 + 临时文件原子替换。
 const CODEX_CONFIG = process.env.BRIDGE_CODEX_CONFIG || path.join(os.homedir(), '.codex', 'config.toml');
+const configWriteLocks = new Map();
+
+function validateToml(text) {
+  execFileSync('python3', ['-c', 'import sys,tomllib; tomllib.loads(sys.stdin.read())'], { input: text, stdio: ['pipe', 'ignore', 'pipe'] });
+}
+
+function withConfigWriteLock(fn) {
+  const prior = configWriteLocks.get(CODEX_CONFIG) || Promise.resolve();
+  const run = prior.then(fn, fn);
+  configWriteLocks.set(CODEX_CONFIG, run.finally(() => {
+    if (configWriteLocks.get(CODEX_CONFIG) === run) configWriteLocks.delete(CODEX_CONFIG);
+  }));
+  return run;
+}
 
 // 枚举键：值域来自 codex-cli 0.163.0（binary grep 核实过 model_reasoning_effort）
 const CONFIG_ENUMS = {
@@ -551,26 +566,30 @@ async function handlePostConfig(req, res) {
   }
   if (!Object.keys(kv).length) return json(res, 400, { error: '没有可写的键' });
 
-  let text;
-  try {
-    text = await readFile(CODEX_CONFIG, 'utf8');
-  } catch (err) {
-    return json(res, 500, { error: `读不到 ${CODEX_CONFIG}：${err.message}` });
-  }
-  const stamp = new Date().toISOString().replace(/[:T]/g, '').slice(0, 14);
-  const backup = `${CODEX_CONFIG}.bak.${stamp}`;
-  const tmp = `${CODEX_CONFIG}.tmp`;
-  try {
-    copyFileSync(CODEX_CONFIG, backup);          // 写前先备份
-    writeFileSync(tmp, updateConfigToml(text, kv), 'utf8');
-    renameSync(tmp, CODEX_CONFIG);               // 原子替换
-  } catch (err) {
-    try { renameSync(tmp, CODEX_CONFIG); } catch { /* tmp 可能根本没写出来 */ }
-    return json(res, 500, { error: `写配置失败（原文件未动，备份在 ${backup}）：${err.message}` });
-  }
-  const { top } = parseConfigToml(await readFile(CODEX_CONFIG, 'utf8'));
-  log(`config.toml 已更新：${Object.keys(kv).join(', ')}（备份 ${path.basename(backup)}）`);
-  return json(res, 200, { ok: true, applied: kv, now: top, backup: path.basename(backup) });
+  return withConfigWriteLock(async () => {
+    let text;
+    try { text = await readFile(CODEX_CONFIG, 'utf8'); }
+    catch (err) { return json(res, 500, { error: `读不到 ${CODEX_CONFIG}：${err.message}` }); }
+    const unique = `${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}`;
+    const backup = `${CODEX_CONFIG}.bak.${unique}`;
+    const tmp = `${CODEX_CONFIG}.tmp.${unique}`;
+    try {
+      validateToml(text);
+      const updated = updateConfigToml(text, kv);
+      validateToml(updated);
+      copyFileSync(CODEX_CONFIG, backup);
+      writeFileSync(tmp, updated, 'utf8');
+      if (process.env.BRIDGE_TEST_FAIL_BEFORE_RENAME === '1') throw new Error('故障注入：rename 前失败');
+      renameSync(tmp, CODEX_CONFIG);
+      validateToml(await readFile(CODEX_CONFIG, 'utf8'));
+    } catch (err) {
+      try { unlinkSync(tmp); } catch { /* 临时文件可能尚未创建 */ }
+      return json(res, 500, { error: `写配置失败（原文件未动，备份在 ${backup}）：${err.message}` });
+    }
+    const { top } = parseConfigToml(await readFile(CODEX_CONFIG, 'utf8'));
+    log(`config.toml 已更新：${Object.keys(kv).join(', ')}（备份 ${path.basename(backup)}）`);
+    return json(res, 200, { ok: true, applied: kv, now: top, backup: path.basename(backup) });
+  });
 }
 
 async function handleSend(req, res, payload) {

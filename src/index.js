@@ -156,7 +156,8 @@ const CONSULT_KEEP_LIMIT = 20
 
 
 // ── 绕圈自动提醒（policy-watch）：检测在 turn/end，投递只追加到当次 pre-step ──
-const POLICY_WATCH_PATH = '/root/dsha-second-engine/tools/policy-watch.py'
+const POLICY_WATCH_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'tools', 'policy-watch.py')
+const POLICY_WATCH_PYTHON = process.env.SECOND_ENGINE_PYTHON || 'python3'
 const POLICY_WATCH_STATE_PATH = join(homedir(), '.dsh', 'policy-watch', 'last.json')
 const POLICY_WATCH_TIMEOUT_MS = 5000
 const POLICY_WATCH_DELIVERY_COOLDOWN_MS = 10 * 60 * 1000
@@ -164,6 +165,29 @@ const POLICY_WATCH_KEEP_LIMIT = 50
 const policyWatchPending = new Map()
 const policyWatchDelivered = new Map()
 const policyWatchHitKeys = new Map()
+const policyWatchFlights = new Map()
+const policyWatchLastStart = new Map()
+const policyWatchLastStat = new Map()
+const POLICY_WATCH_MIN_INTERVAL_MS = 30_000
+let policyWatchPythonReady = false
+let policyWatchPythonUnavailable = false
+let policyWatchErrAt = 0
+function policyWatchSessionFile(sessionId) {
+  const root = join(homedir(), '.dsh', 'sessions')
+  try {
+    for (const group of readdirSync(root)) {
+      const candidate = join(root, group, String(sessionId), 'session.v4.jsonl.zstd')
+      if (existsSync(candidate)) return candidate
+    }
+  } catch {}
+  return null
+}
+function policyWatchErr(tag, err) {
+  const now = Date.now()
+  if (now - policyWatchErrAt < 60_000) return
+  policyWatchErrAt = now
+  noteErr(tag, err)
+}
 
 function loadPolicyWatchState() {
   try {
@@ -190,9 +214,8 @@ function persistPolicyWatchState() {
       delivered: Object.fromEntries(policyWatchDelivered),
       hitKeys: Object.fromEntries([...policyWatchHitKeys].map(([id, keys]) => [id, [...keys]])),
     }
-    writeFileSync(POLICY_WATCH_STATE_PATH, JSON.stringify(payload), { mode: 0o600 })
-    chmodSync(POLICY_WATCH_STATE_PATH, 0o600)
-  } catch { /* persistence is best effort and never blocks a conversation */ }
+    atomicWriteFileSync(POLICY_WATCH_STATE_PATH, JSON.stringify(payload), 0o600)
+  } catch (e) { policyWatchErr('policy-watch-state', e) }
 }
 function policyWatchSummary(json) {
   const labels = []
@@ -201,25 +224,56 @@ function policyWatchSummary(json) {
   if (Array.isArray(json.m3) && json.m3.length) labels.push(`M3 连续无状态推进 ${json.m3.length} 处`)
   return labels.join('；')
 }
-function runPolicyWatch(sessionId) {
+function runPolicyWatch(sessionId, snapshot) {
   return new Promise((resolveResult) => {
     let settled = false
     const finish = (value) => { if (!settled) { settled = true; resolveResult(value) } }
     let child
     try {
-      child = execFile('/usr/bin/python3', [POLICY_WATCH_PATH, '--json', '--session', String(sessionId)], { timeout: POLICY_WATCH_TIMEOUT_MS, maxBuffer: 256 * 1024 }, (error, stdout) => {
+      child = execFile(POLICY_WATCH_PYTHON, [POLICY_WATCH_PATH, '--json', '--session', String(sessionId)], { timeout: POLICY_WATCH_TIMEOUT_MS, maxBuffer: 256 * 1024 }, (error, stdout) => {
         const code = error ? (Number.isInteger(error.code) ? error.code : null) : 0
-        if (code !== 0 && code !== 10) return finish(null)
-        try { finish({ code, json: JSON.parse(stdout) }) } catch { finish(null) }
+        if (code !== 0 && code !== 10) return finish({ error, snapshot })
+        try { finish({ code, json: JSON.parse(stdout), snapshot }) } catch (e) { finish({ error: e, snapshot }) }
       })
       const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} finish(null) }, POLICY_WATCH_TIMEOUT_MS)
       timer.unref?.()
-    } catch { finish(null) }
+    } catch (e) { finish({ error: e, snapshot }) }
   })
 }
 function startPolicyWatch(sessionId) {
-  void runPolicyWatch(sessionId).then((result) => {
-    if (!result) return
+  if (policyWatchPythonUnavailable) return
+  if (policyWatchFlights.has(sessionId)) return
+  let snapshot
+  try {
+    const path = policyWatchSessionFile(sessionId)
+    if (!path) return
+    const stat = statSync(path)
+    snapshot = { path, mtimeMs: stat.mtimeMs, size: stat.size }
+  } catch { return }
+  const prior = policyWatchLastStat.get(sessionId)
+  if (prior && (prior.mtimeMs !== snapshot.mtimeMs || prior.size !== snapshot.size)) {
+    policyWatchPending.delete(sessionId)
+    policyWatchLastStat.set(sessionId, snapshot)
+  } else if (!prior) policyWatchLastStat.set(sessionId, snapshot)
+  const started = policyWatchLastStart.get(sessionId) || 0
+  if (Date.now() - started < POLICY_WATCH_MIN_INTERVAL_MS) return
+  policyWatchLastStart.set(sessionId, Date.now())
+  if (!policyWatchPythonReady) {
+    const probe = spawnSync(POLICY_WATCH_PYTHON, ['--version'], { encoding: 'utf8', timeout: 3000 })
+    if (probe.error || probe.status !== 0) {
+      policyWatchPythonUnavailable = true
+      policyWatchErr('policy-watch-python', probe.error || new Error(probe.stderr || 'python interpreter unavailable'))
+      return
+    }
+    policyWatchPythonReady = true
+  }
+  const flight = runPolicyWatch(sessionId, snapshot)
+  policyWatchFlights.set(sessionId, flight)
+  void flight.then((result) => {
+    if (result?.error) { policyWatchErr('policy-watch-scan', result.error); return }
+    let current
+    try { const s = statSync(result.snapshot.path); current = { mtimeMs: s.mtimeMs, size: s.size } } catch { return }
+    if (current.mtimeMs !== result.snapshot.mtimeMs || current.size !== result.snapshot.size) return
     if (result.code === 0) {
       policyWatchPending.delete(sessionId)
       persistPolicyWatchState()
@@ -242,7 +296,7 @@ function startPolicyWatch(sessionId) {
     policyWatchPending.set(sessionId, { summary, key, at: now })
     trimPolicyWatchMaps()
     persistPolicyWatchState()
-  }).catch(() => {})
+  }).catch((e) => policyWatchErr('policy-watch-scan', e)).finally(() => policyWatchFlights.delete(sessionId))
 }
 
 // ── 吞错留痕（D，2026-10-25）──
@@ -5465,8 +5519,8 @@ export function apply(ctx) {
     persistPolicyWatchState()
     const message = {
       id: `policy-watch-${randomBytes(8).toString('hex')}`,
-      role: 'system',
-      source: { kind: 'system-prompt' },
+      role: 'user',
+      source: { kind: 'policy-watch' },
       content: [{ type: 'text', text: `[POLICY_WATCH] 检测到${pending.summary}；考虑把当前卡点派单给第二引擎。` }],
     }
     return { ...decision, messages: [...decision.messages, message] }
