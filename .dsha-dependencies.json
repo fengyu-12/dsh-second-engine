@@ -2,7 +2,7 @@
   "format": 1,
   "state": "bundled-verified",
   "plugin": "dsh-second-engine",
-  "version": "3.1.1",
+  "version": "3.8.5",
   "archiveSha256": "",
   "manifestSha256": "2747129d42fabad3fe41217482ceece8acbbcf04817ebf69454c2acccbbe501e",
   "treeSha256": "7c013e17886dc693bdfacf571b5e7ce56e333061f79c94684b6d562d04ee0176",
@@ -31,5 +31,7 @@
   "managerVersion": "not-executed",
   "integrity": "actual file tree SHA-256 and native pnpm lockfile",
   "runtimeDsh": "0.2.1-rc.2",
-  "authorClaims": {}
+  "authorClaims": {
+    "_note": "version 2026-11-01 手工对齐 package.json；manifest/tree/lock hash 未重算（本机无读取方，且本文件不在 package.json files 白名单内、不入包）"
+  }
 }
