@@ -57,7 +57,7 @@ run_board() { bash "$B" "$@" >>"$TMP/board.log" 2>&1; }
 if run_board new t1 --subject smoke --task "干净环境验证" --context c --scope x; then ok "new（板不存在时自建）"; else bad "new: $(tail -3 "$TMP/board.log")"; fi
 if run_board claim t1 --owner lead; then ok "claim"; else bad "claim: $(tail -3 "$TMP/board.log")"; fi
 if run_board complete t1 --owner lead --result ok >/dev/null 2>&1; then bad "complete 未带 --reviewed-by human 竟然成功"; else ok "complete 无人确认被拒"; fi
-if run_board complete t1 --owner lead --result ok --reviewed-by human; then ok "complete（人确认）"; else bad "complete: $(tail -3 "$TMP/board.log")"; fi
+if run_board complete t1 --owner lead --result $'ok\n$ true\nexit=0' --reviewed-by human; then ok "complete（人确认）"; else bad "complete: $(tail -3 "$TMP/board.log")"; fi
 if run_board new t2 --subject s2 --task t2 --acceptance a2 >/dev/null 2>&1 && run_board complete t2 --owner lead --result r2 --keep >/dev/null 2>&1; then ok "complete --keep 免人审留在板"; else bad "complete --keep 失败: $(tail -3 "$TMP/board.log")"; fi
 if run_board doctor >>"$TMP/board.log" 2>&1; then ok "doctor"; else bad "doctor: $(tail -3 "$TMP/board.log")"; fi
 
@@ -115,10 +115,13 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 发布树剔私版：只比存在、不比内容（本机路径被换成「不随包分发」说明）
   # 发布树剔私版：只比存在、不比内容（本机路径被换成占位符）
   PRIVATE_STRIPPED=" src/app-server-client.js tools/dual-board/PROTOCOL.md bridge/README.md bridge/env.example bridge/CHANGELOG.md tools/README.md "
-  EXPLICIT="tools/web-base.sh tools/smoke.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs bridge/pi/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js src/engine/pi-runtime.js src/engine/pi-rpc-runtime.js src/engine/registry.js src/engine/pi-probe.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py"
+  EXPLICIT="tools/web-base.sh tools/wait-task.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs bridge/pi/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js src/engine/pi-runtime.js src/engine/pi-rpc-runtime.js src/engine/registry.js src/engine/pi-probe.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py"
   # 2026-10-29：清单 = 精选 + 全量 JS 动态。手写清单曾漏 as-client.mjs / pi-bridge.js 等 6 个文件，
   # 那天只改了实体没同步另两处，smoke 照样全绿 → 新增文件必须自动纳入，不靠人记得改清单。
-  DYNAMIC=$(git -C "$ROOT" ls-files 2>/dev/null | grep -E '\.(js|mjs|cjs)$')
+  # 2026-10-31：发布包按 package.json.files 打包，不含开发件（selftest / smoke 自身 /
+  # lint 配置 / 回归脚本 / pi-cards 留档）。装发布包后加载层必然缺它们 ⇒ 不纳入三方比对，
+  # 否则「正确安装发布包」会把 smoke 判红。
+  DYNAMIC=$(git -C "$ROOT" ls-files 2>/dev/null | grep -E '\.(js|mjs|cjs)$' | grep -vE '^(selftest-block\.mjs|tools/smoke\.sh|tools/lint-undef\.config\.mjs|tools/message-role-regression\.mjs|lib/pi-cards\.js)$' | grep -v '^tests/')
   # 发布树有权不含的开发件（仍与生效层比对，缺了不算失败）
   # smoke.sh 自己与 eslint 配置只对「改插件的人」有意义，下游拿到没有用处 → 不进发布包（2026-10-29 定）
   PUB_OPTIONAL=" selftest-block.mjs tools/smoke.sh tools/lint-undef.config.mjs "
@@ -149,6 +152,10 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 发布树是有意剔私的（appserver-* 本机排查记录、capabilities 派单计划都不随包），故不比。
   # 2026-10-28 立：此前 docs 完全不在检查范围，加载层的 task-runtime-contract.md
   # 落后实体 6 行注释（cancel 语义）却没被发现——只能靠手工全量 md5 扫才看见。
+  # 发布包 files 不含 docs ⇒ 加载层可无 docs；有才要求镜像
+  if [ ! -d "$LOAD_DIR/docs" ]; then
+    skip "加载层无 docs（发布包不含 docs，跳过实体=加载比对）"
+  else
   docs_bad=0; docs_n=0
   for f in $(cd "$ROOT" && ls docs/*.md 2>/dev/null); do
     [ -f "$ROOT/$f" ] || continue
@@ -160,6 +167,7 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
     fi
   done
   [ "$docs_bad" = 0 ] && ok "docs 实体=加载（$docs_n 个；发布树剔私不比）" || bad "docs 有 $docs_bad 个不一致/缺失"
+  fi
   # 可执行位：zip 打包（含手机端 MT 管理器）会丢掉 Unix 权限位。
   # 2026-10-28 实测：从 zip 同步回来后 ctl.sh 变 600，面板点「聊天桥→启动」报
   # EACCES: permission denied, access '.../bridge/web/ctl.sh'。加这道闸免得再发一次。
