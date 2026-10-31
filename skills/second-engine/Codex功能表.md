@@ -2,10 +2,10 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `~/codex/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `src/index.js:3460` 本就当合法终态）。
-> **二进制**：`~/codex/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
+> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `<Codex 安装目录>/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `src/index.js:3460` 本就当合法终态）。
+> **二进制**：`<Codex 安装目录>/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
 > **升级方式（2026-10-31 实测修订 —— 正选换成 npm 平台包）**：`curl -fL -o pkg.tgz https://registry.npmmirror.com/@openai/codex/-/codex-<版本>-linux-arm64.tgz`，**单文件整包**（0.166.0 = 164,402,913 B，约 3 分钟，字节数校验相符），不走 GitHub release。**release 直连 2026-10-31 实测 75 秒零字节、`ghproxy.net` 同样卡、`ghfast.top` 更早已挂** ⇒ 本机现状是 release 资产走不动，10-17 那条"直连通"已过期（网络会变，但"能通"也要先探再信）。
-> **包内结构与取用**：`vendor/aarch64-unknown-linux-musl/` 内含 `bin/codex`(~277 MB) + `bin/codex-code-mode-host`(~70 MB) + `codex-resources/`(voice host、bwrap、gstreamer 库) + `codex-path/rg`。**只取两个二进制**装进 `~/codex/`，sidecar 必须叫**无后缀** `codex-code-mode-host`；`codex-resources/` 本机当前**未装**（exec / app-server / 代码模式用不到，要 voice 或沙箱资源再补）。替换姿势：`cp -a` 备份 → `cp` 到临时名 → `mv -f` 原子落位 → `codex --version` 复核。
+> **包内结构与取用**：`vendor/aarch64-unknown-linux-musl/` 内含 `bin/codex`(~277 MB) + `bin/codex-code-mode-host`(~70 MB) + `codex-resources/`(voice host、bwrap、gstreamer 库) + `codex-path/rg`。**只取两个二进制**装进 `<Codex 安装目录>/`，sidecar 必须叫**无后缀** `codex-code-mode-host`；`codex-resources/` 本机当前**未装**（exec / app-server / 代码模式用不到，要 voice 或沙箱资源再补）。替换姿势：`cp -a` 备份 → `cp` 到临时名 → `mv -f` 原子落位 → `codex --version` 复核。
 
 ---
 
@@ -125,9 +125,9 @@ codex features list | grep -E 'removed'            # 3. 有哪些被移除（老
 codex doctor                                       # 4. 环境体检（连通性/auth/sandbox/记忆库）
 grep -nE '^\[' ~/.codex/config.toml                # 5. ★配置段是否完整
 curl -s "$DSH_WEB_URL/second-engine/api/version"   # 6. 插件侧版本核对
-ls -l ~/codex/codex-code-mode-host             # 7. ★sidecar 是否在位（换源重装/升级后必查，见 §6）
+ls -l <Codex 安装目录>/codex-code-mode-host             # 7. ★sidecar 是否在位（换源重装/升级后必查，见 §6）
 grep -n 'model_context_window\|model_max_output_tokens' ~/.codex/config.toml  # 8. 模型元数据是否写入（见 §7）
-ls -l ~/codex/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下）
+ls -l <Codex 安装目录>/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下）
 ```
 
 ### ★ 第 5 条是 2026-10-02 事故换来的
@@ -190,8 +190,8 @@ aria2c -c -x 8 -s 8 -k 1M -d /tmp -o cmh.tar.gz \
   "https://ghproxy.net/https://github.com/openai/codex/releases/download/rust-v<版本>/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz"
 tar -xzf /tmp/cmh.tar.gz -C /tmp
 # 2) ★与 codex 主二进制同目录，且必须命名为 codex-code-mode-host
-cp /tmp/codex-code-mode-host-aarch64-unknown-linux-musl ~/codex/codex-code-mode-host
-chmod +x ~/codex/codex-code-mode-host
+cp /tmp/codex-code-mode-host-aarch64-unknown-linux-musl <Codex 安装目录>/codex-code-mode-host
+chmod +x <Codex 安装目录>/codex-code-mode-host
 ```
 
 - 备选通道：npmmirror 平台包 `@openai/codex@<版本>-linux-arm64`（`vendor/<arch>/bin/` 内含它）——本机 codex 本来就是那条渠道装的，下次升级顺手把它一起取出来更省事。
@@ -239,7 +239,7 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 | | `queue_1` / `goals_1` / `memories_1.sqlite` | 41 K / 32 K / 44 K | 队列 / 目标 / 记忆 |
 | 内容 | **`sessions/`** | 16 M | 会话 rollout —— 落盘路径与读法见附A.1 |
 | | **`task-*.out.live` ×~100** | **~10 M** | **second-engine 每个工单的原始输出**；清理走 `POST /second-engine/api/cleanup`（按 mtime）。**2026-10-26 复核：现 14 个 / ~595 KB**（2026-10-25 起 `finalizeJob` 统一删 `.out`/`.live`，积压已消化） |
-| | `skills/` | 630 K | Codex 侧技能（`relay-probe` 在此） |
+| | `skills/` | 630 K | Codex 侧技能（`<本机私有技能>` 在此） |
 | | `memories/` / `archived_sessions/` | 189 K / 空 | 记忆 / 已归档会话 |
 | 运行时 | `.tmp/` | **102 M** | `plugins/` 缓存 + `git-XXXXXX/`（**裸仓库**，只有 `HEAD`/`objects`/`refs`，各 15 K） |
 | | `shell_snapshots/` | 3.5 K | **exec 模式**工单会建 |
@@ -345,19 +345,19 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 ```
 -c model_provider=relay -c model="<模型名>" \
 -c 'model_providers.relay.name="relay"' \
--c 'model_providers.relay.base_url="https://laneai.dev/v1"' \
+-c 'model_providers.relay.base_url="<你的中转站 base_url>"' \
 -c 'model_providers.relay.wire_api="responses"' \
 -c 'model_providers.relay.env_key="RELAY_API_KEY"'
 ```
 
 ## 附D. 2026-09-25 新增能力（第二引擎侧，已实测）
 
-> **2026-10-26 复核**：① **relay-forge 管线已退役**——`~/proj/relay-forge/` 不存在，原件在 `~/.dsh/refs/retired-proj-20261015/relay-forge`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `~/proj/共同工作区/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
+> **2026-10-26 复核**：① **<本机退役管线> 管线已退役**——`~/proj/<本机退役管线>/` 不存在，原件在 `<DSH 数据目录>/refs/retired-proj-20261015/<本机退役管线>`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `<本机私有记录>` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
 
 ### 中转站算力：探测与并发咨询
 
-- **技能 `relay-probe`**（Codex 侧 `~/.codex/skills/relay-probe/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`~/.dsh/skills/relay-forensics`），此处不重复。
-- **管线 `~/proj/relay-forge/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
+- **技能 `<本机私有技能>`**（Codex 侧 `~/.codex/skills/<本机私有技能>/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`<DSH 技能目录>/relay-forensics`），此处不重复。
+- **管线 `~/proj/<本机退役管线>/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
   模型发 `tool_calls` → `forge.py` 本地 `fetch_url` → 回灌。铁律：产出只落 `out/<时间戳>/`，
   **绝不自动改目标文件**；要"整文件重写"会得 0 字符，只喂"定位锚点 → 替换为"的补丁。
 

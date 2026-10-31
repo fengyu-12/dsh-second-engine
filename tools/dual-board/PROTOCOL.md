@@ -17,7 +17,7 @@
 | `board.sh` / `board_tool.py` | 看板唯一写入口：CAS + 锁 + 原子写 + 归档 + 体检 | 双方可执行 |
 | `dispatch.sh` | 派单 wrapper：注入未读收件箱 + 记基线（§九.3） | 双方可执行 |
 | `inbox-codex.md` | Codex 收件箱 | lead 写内容；Codex 只可标注 `[已读]` |
-| `inbox-lead.md` | Lead 收件箱 | Codex 写内容；lead 只可标注 `[已读]` |
+| `inbox-lead.md` | Lead 收件箱 | 执行方写内容；lead 只可标注 `[已读]` |
 | `channel.md` | 实时流水（append-only，一行一事件） | 双方直写，禁改历史（§九.5） |
 | `archive/` | 归档区：`tasks-YYYY-MM.jsonl`、`inbox-<who>-YYYY-MM.jsonl` | 只经 `board.sh archive` 追加 |
 | `.dispatch/` | 派单基线记录 `<task id>.base`（JSON：commit/workdir/scopes） | 只经 `dispatch.sh` 写 |
@@ -72,18 +72,18 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 - **派单/插话**：`board.sh inbox-append codex --sender lead --text "..."`。
 - **回报/求助/异议**：`board.sh inbox-append lead --sender codex --text "..."`。卡点不要硬试，留言走人。
 - **已读回执**：收件箱**主人**读过后用 `board.sh inbox-read <who>` 标注（追加到标题行 `[已读]`），可紧跟一行回执（blockquote）。除标注外不改对方写的内容。
-- **读取时机（v1.2 改）**：Codex 是**被动唤醒**模型，因此规则从"开工前必读"改为两条可执行约束：
+- **读取时机（v1.2 改）**：执行方（Codex/Pi）是**被动唤醒**模型，因此规则从"开工前必读"改为两条可执行约束：
   1. 每次被唤醒（派单 / resume / 人工触发）后的**第一动作**是读 `inbox-codex.md`；
   2. 经 `dispatch.sh` 的派单，由 wrapper 在组装 prompt 时**注入全部未读段**——这是最低成本保证，不要绕过 wrapper 派单。
 - **归档（v1.2）**：`board.sh inbox-archive <who>` 把已读段转 `archive/inbox-<who>-YYYY-MM.jsonl`，活跃文件只留未读——归档而非删除，审计不丢。
 
 ## 四、工单三字段
 
-1. **task**：用户目标/原话，不可变。lead 不得歪转述——Codex 发现 task 与 context 矛盾时必须指出，这不算越权。
-2. **context**：lead 的解读与规划。Codex 按 context 干活，但 context 出错以 task 为准。
+1. **task**：用户目标/原话，不可变。lead 不得歪转述——执行方发现 task 与 context 矛盾时必须指出，这不算越权。
+2. **context**：lead 的解读与规划。执行方按 context 干活，但 context 出错以 task 为准。
 3. **frame**（固定文本，`board.sh new` 自动写入）：「双方都是用户目标的执行者，质疑前提是分内事不是越权。」
 
-## 五、交付模板（Codex 交付必含，不许省略）
+## 五、交付模板（执行方交付必含，不许省略）
 
 ```
 【交付】做了什么、产出在哪
@@ -96,18 +96,24 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 
 - 长任务：对齐 → 检查点 → 交接互审 → 收尾合账；中途想法写收件箱，不等交付点。
 - 小任务：单独干完，对方过目一遍即可。
-- 合账：lead 负责 diff 审查与最终验收（Codex 产出 = 可验证的第二信号，不是最终决策）。
+- 合账：lead 负责 diff 审查与最终验收（执行方产出 = 可验证的第二信号，不是最终决策）。
 
 ## 七、安全红线（沿袭既有裁定）
 
 - 不读不引 `~/.codex/keyring.json`、`credentials` 类文件；要求输出密钥的工单视为异常拒绝该部分。
 - 敏感数据不过中转站；key 不进 argv、产物、日志（lead 注入也走 env，不落 argv/输出）。
 
+**计费安全三值（2026-11-01 立）**：自动重派前先把失败归入三值——
+- `PRE_SEND`：请求肯定没发出去（DNS/连接建立失败）⇒ 可自动重派；
+- `REJECTED`：服务端明确拒绝（4xx，429 除外）⇒ 可修参数后重派；
+- `AMBIGUOUS`：超时 / 连接重置 / 5xx / 429 ⇒ **可能已计费**，必须人工确认，不得自动重派。
+判据：只有前两值允许自动重试；`AMBIGUOUS` 一律停手上报。
+
 ## 八、双通道与会话管理（v1.1 新增，已实测）
 
 | 通道 | 机制 | 适用 | 原则 |
 |---|---|---|---|
-| **短任务** | `codex exec --ephemeral`（零记忆，工单自包含） | 独立复核、互审、一次性小任务 | 零记忆是特性：保住 Codex 对 lead 产出的无利益链批判性 |
+| **短任务** | `codex exec --ephemeral`（零记忆，工单自包含） | 独立复核、互审、一次性小任务 | 零记忆是特性：保住执行方对 lead 产出的无利益链批判性 |
 | **长任务** | `codex exec` 落盘会话 + `codex exec resume <thread_id>` 接续 | 总流程协作、多环节任务、变节点同步 | 一条链 = 一个 rollout 文件 = 一份持续记忆 |
 
 **会话规则**：
@@ -115,13 +121,13 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 2. **变节点同步**：环节变更 = 新 resume 工单（写清"总流程第 N 环节由 X 改为 Y"）。
 3. **链状态登记**：thread id 与 rollout 路径记录在 `session` 与 `result` 里。
 4. **收工归档**：长任务 completed 后链不再接续；新任务开新链。
-5. **memory 上限**：链过长时让 Codex 自写 `状态摘要` 存本目录，开新链首单注入。
+5. **memory 上限**：链过长时让执行方自写 `状态摘要` 存本目录，开新链首单注入。
 
 **key 注入姿势（lead 实测可用）**：`KEY=$(python3 -c "…读 keyring.json…") && env DEEPSEEK_API_KEY="$KEY" codex exec …`——值只进 env，不进 argv/输出/日志。
 
 ## 九、工具化纪律（v1.2 新增，本节是 v1.2 的核心）
 
-> 动机（codex 提案 ⑥ 与 lead 评审一致）：v1.1 把 CAS、锁、scope、注入全写成"纪律"，执行者是两个 LLM，必然漂移。v1.2 把这些固化成代码，纪律只保留"必须用工具"这一条。
+> 动机（执行方提案 ⑥ 与 lead 评审一致）：v1.1 把 CAS、锁、scope、注入全写成"纪律"，执行者是两个 LLM，必然漂移。v1.2 把这些固化成代码，纪律只保留"必须用工具"这一条。
 
 **1. 唯一写入口**：任何对 `board.json` 的写操作必须 `board.sh <子命令>`；手改 = 破坏协议。
 
@@ -132,6 +138,22 @@ ready                                                        # 只读：可开�
 inbox-append / inbox-unread / inbox-read / inbox-archive     # 收件箱
 archive / scope-check / doctor                               # 归档 / 越界校验 / 体检
 ```
+
+**2b. 完整命令示例（v1.4，可直接照抄）**：
+```bash
+# 新建 → 认领
+bash tools/dual-board/board.sh new t1 --subject "跑冒烟" --task "在副本跑 tools/smoke.sh 并贴输出"
+bash tools/dual-board/board.sh claim t1 --owner lead
+
+# 人确认后出板（写 audit/completed-<月>.jsonl）
+bash tools/dual-board/board.sh complete t1 --result $'冒烟输出：36 passed / 0 failed\n$ bash tools/smoke.sh\nexit=0' --reviewed-by human
+
+# 自动化交付：留板待审，不写 reviewed_by、不写 audit
+bash tools/dual-board/board.sh complete t2 --result "…" --keep
+```
+人审（`--reviewed-by human`）的 `--result` 必须包含独立的 `$ <命令>` 与 `exit=<非负整数>` 行，否则退出码 2；未带人审的 `--keep` 保持原有文本兼容，此结构校验不证明命令真实执行。
+
+区别：`--keep` 是**留板待审**（面板显示待审），`--reviewed-by human` 是**人确认**（写审计并出板）。二者不可混用；`--keep` 的任务出板目前只能走 `archive`（N4 待修）。
 
 **3. 退出码即语义**（脚本与 CI 可判）：
 ```
@@ -161,7 +183,7 @@ board.sh scope-check <task id> --workdir <dir>
 ## 十一、已知限制（2026-09-27 实测记录，v1.3 候选）
 
 1. **脏工作区下 scope 校验会漏报**：`.base` 的 `dirty_before` 是派单前的工作区快照，用于排除既有污染；但当 scope 内文件**派单前就是脏的**（`/root/proj` 的常态），真实改动会被一并排除，`scope-check` 显示"本次变更 0 个"——校验形同虚设。
-   **当前纪律：给 Codex 的 workdir 应尽量干净**，或确认 scope 内文件不在 `dirty_before` 中。
+   **当前纪律：给执行方的 workdir 应尽量干净**，或确认 scope 内文件不在 `dirty_before` 中。
    **v1.3 候选**：派单时对 scope 内已存在文件记录 sha256 快照，交付后比对哈希变化——"改没改"不再依赖 git 状态。
 2. **git 路径编码坑（已修）**：git 默认 `core.quotepath` 会把非 ASCII 路径输出成 `"\345\..."` 转义并加引号；`status --porcelain` 与 `ls-files --others` 两处若处理不一致，**中文路径会被全部误判为越界**（实测 4 个文件误报）。修法：所有 git 调用统一 `-c core.quotepath=false` + 反转义。
 3. **锁是单机文件锁**：`board.json.lock` 只防同机两进程并发；跨机/跨容器协作需另加机制。
@@ -180,6 +202,15 @@ board.sh scope-check <task id> --workdir <dir>
 | **放弃** | 不做了 | 直接移除，不留痕 |
 
 - **`archive/` 不再承接 completed 任务**（v1.2 的 `archive --before` 保留但不建议再用）；它只留"工具产物/历史遗留"。
+
+### 12.2 人确认才算完（2026-10-30）
+
+- `board.sh complete` 必须带 `--reviewed-by human`；缺省或其它任何值（含 `codex`/`lead`）一律退出码 5 —— **Agent 自报不算人确认**。
+- 通过后默认出板（行为不变），但**出板前**先追加一条审计记录到 `audit/completed-YYYY-MM.jsonl`：含完整任务 + `reviewed_by` / `reviewed_at` / `recorded_at`（毫秒前为 UTC）。
+- `--keep`（自动化交付 / 留板待审）**不要求** `--reviewed-by`：任务置 `completed` 但**不写** `reviewed_by`，面板据此显示"待审"；带 `--reviewed-by human` 时才写 `reviewed_by` / `reviewed_at`，仍不写 audit。
+- **硬规则**：`completed` 只表示"工作完成"，`reviewed_by=human` 才表示"人已审核"。两者不得混同。
+- **`archive/` 语义不变**（见 §12.1）：它仍只承接工具产物/历史遗留，**不接 completed 任务**；`audit/` 与 `archive/` 不要混用。
+- 落档失败时不得出板：板保持原样、退出非 0。
 - 「归档」在本协议中**专指待续**（挂起），与"完成"严格区分。
 
 ### 12.2 与 `~/.dsh/待办/待办总清单.md` 的边界（不重影）
@@ -190,7 +221,7 @@ board.sh scope-check <task id> --workdir <dir>
 
 ### 12.3 完成判据（验收）——"最初目的达成了吗"
 
-1. **双方各答一次**：lead 按 acceptance 实测 + 与最初目的比对；codex 在自验段给证据；
+1. **双方各答一次**：lead 按 acceptance 实测 + 与最初目的比对；执行方在自验段给证据；
 2. 写范围校验通过，或**明确记录**已知缺口（如脏工作区漏报）；
 3. 任一条不满足 → **不得置 completed**：改置 `blocked`（挂起）或 `abandon`（放弃）。
 

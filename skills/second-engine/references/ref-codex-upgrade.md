@@ -14,7 +14,7 @@ pkg/package/vendor/aarch64-unknown-linux-musl/bin/codex --version   # 先验活�
 
 vendor 里有 `bin/codex` + `bin/codex-code-mode-host`（**须与主二进制同目录、无后缀命名**）+ `codex-resources/`（voice host / bwrap / gstreamer 库，本机当前**不装**，exec 与 app-server 用不到）+ `codex-path/rg`（PATH 已有 `/usr/bin/rg`，免装）。
 
-**只取两个二进制**：`cp -a` 备份旧版到 `~/codex/*.bak-<旧版>` → `cp` 到临时名再 `mv -f` 原子替换 → `codex --version` 复核；回滚＝把 `.bak-<旧版>` 换回。
+**只取两个二进制**：`cp -a` 备份旧版到 `<Codex 安装目录>/*.bak-<旧版>` → `cp` 到临时名再 `mv -f` 原子替换 → `codex --version` 复核；回滚＝把 `.bak-<旧版>` 换回。
 
 ⚠️ **GitHub release 资产不要当正选**：2026-10-31 实测主二进制与 sidecar **直连 75 秒零字节**、`ghproxy.net` 同样卡（`ghfast.top` 更早已挂）。release 不通时**不要在它上面反复换镜像耗着**，直接走 npm 平台包。⚠️ 也别用"多文件并行各走一个镜像"解——包只有一个文件，两路并行是浪费带宽，取先完成的那路即可。
 
@@ -32,7 +32,7 @@ vendor 里有 `bin/codex` + `bin/codex-code-mode-host`（**须与主二进制同
 
 ⚠️ 探针数量会变（曾 3 条增至 6 条），按脚本当次输出比对，别照旧数字核。
 
-## 3. 🔴 升级后第一件事：维护旧结论（本机私有判据 · 勿同步发布树）
+## 3. 🔴 升级后第一件事：维护旧结论
 
 真正的腐化源是"旧结论还挂在新版本号旁边"。每次升级后回扫 `SKILL.md` 与 `<本机功能核对表>` 的**状态性结论**（开关态、能力对照、扩展表、CLI 面），逐条二选一：
 

@@ -397,7 +397,16 @@ async function tryPendingCancel(entry) {
   if (!entry || !entry.pendingCancel || !entry.turnId) return;
   entry.pendingCancel = false;
   log(`补发中断（turnId 刚就绪）：${entry.threadId.slice(0, 8)}/${String(entry.turnId).slice(0, 8)}`);
-  await interrupt(entry.threadId, entry.turnId);
+  // 2026-11-01 实测：turnId 就绪后 42–55ms 补发仍会被 app-server 回
+  // 「no active turn to interrupt」（turn 尚未真正 active）⇒ 回合继续跑。
+  // 这里短延迟重试 ≤3 次；仍失败只记日志，不再让前端误以为已中断。
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (await interrupt(entry.threadId, entry.turnId)) return true;
+    if (entry.finished) return false;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  log(`补发中断失败（3 次），回合继续：${entry.threadId.slice(0, 8)}`);
+  return false;
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@
 //
 // 只用 node 标准库：node:child_process、node:fs。无第三方、**无 readline**（原因见帧格式）。
 
-import { spawn } from 'node:child_process'
+import { spawnLimited } from '../process-safety.js'
 import { statSync, writeFileSync } from 'node:fs'
 import { mapPiEvent } from './pi-runtime.js'
 
@@ -96,9 +96,11 @@ const RPC_KIND_OVERRIDE = {
  * 每条完整记录再单独 utf8 解码。
  */
 function makeFrameSplitter(onLine) {
+  /** @type {Buffer} */
   let buf = Buffer.alloc(0)
   return {
     feed(chunk) {
+      /** @type {Buffer} */
       const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
       buf = buf.length === 0 ? part : Buffer.concat([buf, part])
       let idx = buf.indexOf(0x0a)
@@ -537,11 +539,11 @@ export function createPiRpcRuntime(task, deps = {}) {
       args.push(...extraArgs)
       // rpc.md「Start RPC mode」：RPC 模式**拒绝 @file 形式的 prompt 参数** ⇒ 提示词只经
       // stdin 的 prompt 命令下发，绝不进 argv（顺带避免 /proc/cmdline 泄提示词，同 exec 支）。
-      child = spawn(piBinary, args, {
+      child = spawnLimited(piBinary, args, {
         cwd: spec.workdir || process.cwd(),
         env: { ...process.env, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
-      })
+      }, 'pi-rpc')
       rt.setChild(child)
       runEpoch += 1
       runOutPath = typeof spec.outPath === 'string' && spec.outPath !== '' ? spec.outPath : null
@@ -760,6 +762,8 @@ export function createPiRpcRuntime(task, deps = {}) {
       if (runOutPath !== null && lastAssistantText === '' && child !== null && child.exitCode === null) {
         try { await captureAssistantText() } catch { /* 忽略 */ }
       }
+      // Snapshot final session usage while RPC is alive; failures remain unknown.
+      if (child !== null && child.exitCode === null && !stdinEnded) await rt.fetchStats()
       flushAssistantToOut()
       if (typeof evidence.lost === 'string' && evidence.lost !== '') rt.setReconcileLost(evidence.lost)
       if (typeof evidence.error === 'string' && evidence.error !== '') task.error = evidence.error

@@ -6,7 +6,7 @@
 #   2) 附固定【派单纪律】尾段
 #   3) 派单「之前」记录 workdir 基线 commit + write_scopes → .dispatch/<task id>.base（供 board.sh scope-check 用）
 #
-# 用法：dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "路径1,路径2" | --read-only] [--workdir DIR] [--dry-run]
+# 用法：dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "路径1,路径2" | --read-only] [--workdir DIR] [--board-id ID] [--force] [--dry-run]
 # 纪律（2026-10-13 起为硬约束）：真实派单必须带 --context（lead 的解读）、--self-test（自测/验收）
 #       以及 write_scopes（或显式 --read-only），缺任一即拒发。
 #       由来：协议层定了工单三字段 task/context/frame，但 wrapper 的 build_prompt(task, scopes)
@@ -41,9 +41,17 @@ DISPATCH_DIR = BOARD_DIR / ".dispatch"
 API_URL = (os.environ.get("SECOND_ENGINE_BASE_URL") or os.environ.get("DSH_WEB_URL") or "http://127.0.0.1:3080").rstrip("/") + "/second-engine/api/task"
 
 
+class DispatchRequestError(RuntimeError):
+    pass
+
+
+class DuplicateDispatchError(RuntimeError):
+    pass
+
+
 def usage(parser):
     parser.print_usage(sys.stderr)
-    print('dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--dry-run]', file=sys.stderr)
+    print('dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--force] [--dry-run]', file=sys.stderr)
 
 
 def unread_segments(text):
@@ -209,7 +217,7 @@ def write_base(task_id, commit, workdir, scopes, dirty, hashes):
         json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def dispatch_task(prompt, workdir, scopes):
+def dispatch_task(prompt, workdir, scopes, force=False):
     # 基线必须在派单之前取：派单后 codex 可能已开始改文件
     commit = baseline_commit(workdir)
     dirty = dirty_paths(workdir)
@@ -225,26 +233,42 @@ def dispatch_task(prompt, workdir, scopes):
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             response_body = response.read().decode("utf-8", errors="replace")
-            if response.status != 200:
-                raise RuntimeError(f"HTTP {response.status}: {response_body}")
+            if not 200 <= response.status < 300:
+                raise DispatchRequestError(f"HTTP {response.status}")
     except urllib.error.HTTPError as error:
         response_body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {error.code}: {response_body}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"请求失败: {error}") from error
+        raise DispatchRequestError(f"HTTP {error.code}") from error
+    except (urllib.error.URLError, OSError) as error:
+        raise DispatchRequestError(f"网络错误: {type(error).__name__}") from error
 
     try:
         payload = json.loads(response_body)
     except json.JSONDecodeError as error:
-        raise RuntimeError(f"响应不是 JSON: {response_body}") from error
-    if payload.get("ok") is not True:
-        raise RuntimeError(f"响应不是 ok: {response_body}")
+        raise DispatchRequestError("响应不是 JSON") from error
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise DispatchRequestError("服务端返回错误（ok 非 true）")
     task_id = payload.get("id")
     if not isinstance(task_id, str) or not task_id:
-        raise RuntimeError(f"响应缺少有效 id: {response_body}")
+        raise DispatchRequestError("响应缺少有效 id")
 
+    existing_base = DISPATCH_DIR / f"{task_id}.base"
+    if (existing_base.exists() or existing_base.is_symlink()) and not force:
+        raise DuplicateDispatchError("该任务已派过，重复派单请加 --force")
     write_base(task_id, commit, workdir, scopes, dirty, hashes)
     return task_id, commit
+
+
+def update_failure(board_id, reason=None):
+    if not board_id:
+        return
+    argv = ["failure", board_id] + (["--clear"] if reason is None else ["--reason", reason])
+    try:
+        proc = subprocess.run(["bash", str(SCRIPT_DIR / "board.sh"), *argv],
+                              text=True, capture_output=True, timeout=30)
+        if proc.returncode:
+            print(f"warn: 派单诊断写板失败（exit={proc.returncode}）", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"warn: 派单诊断写板失败（{type(error).__name__}）", file=sys.stderr)
 
 
 def auto_archive():
@@ -287,6 +311,8 @@ def main():
     parser.add_argument("--board-id", default=None,
                         help="看板任务 id（如 T5）：写一份 <board-id>.base 别名，"
                              "让 scope-check 能按看板 id 找到基线（v1.3）")
+    parser.add_argument("--force", action="store_true",
+                        help="已有同 board-id 派单基线时仍强制重复派单")
     parser.add_argument("--to", default="codex")
     parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args()
@@ -294,7 +320,7 @@ def main():
     ROLE = args.to
 
     if args.help:
-        print('用法: dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--to ROLE] [--dry-run]')
+        print('用法: dispatch.sh "<工单正文>" --context "…" --self-test "…" [--scope "p1,p2" | --read-only] [--workdir DIR] [--board-id ID] [--force] [--to ROLE] [--dry-run]')
         return 0
     if not args.task or not args.task.strip():
         usage(parser)
@@ -335,7 +361,13 @@ def main():
             for item in missing:
                 print(f"  - 缺 {item}", file=sys.stderr)
             return 2
-        task_id, commit = dispatch_task(prompt, args.workdir, scopes)
+        if args.board_id and not args.force:
+            existing_base = DISPATCH_DIR / f"{args.board_id}.base"
+            if existing_base.exists() or existing_base.is_symlink():
+                print("该任务已派过，重复派单请加 --force", file=sys.stderr)
+                return 2
+        task_id, commit = dispatch_task(prompt, args.workdir, scopes, args.force)
+        update_failure(args.board_id)
         # P0：归档必须在派单成功之后 —— 否则派单失败会静默吞掉收件箱未读段
         auto_archive()
         if args.board_id:
@@ -351,6 +383,13 @@ def main():
         print(f"基线: {commit}")
         print(f"记录: {DISPATCH_DIR}/{task_id}.base")
         return 0
+    except DuplicateDispatchError as error:
+        print(error, file=sys.stderr)
+        return 2
+    except DispatchRequestError as error:
+        update_failure(args.board_id, str(error))
+        print(error, file=sys.stderr)
+        return 1
     except RuntimeError as error:
         print(error, file=sys.stderr)
         return 1

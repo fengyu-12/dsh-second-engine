@@ -54,9 +54,9 @@ DSHA App 启动 proot 容器时把 `DEEPSEEK_API_KEY` 明文放进**命令行参
 
 ## 7. 中转站速查（选型判据不在本文件）
 
-Base `https://laneai.dev/v1`；key 在 `~/.dsh/中转站/keys/*.txt`（只读取、不写产物）；模型名以 `GET /v1/models` 实拉为准；一账号 5 并发；**敏感数据不过中转**。详见 `~/.dsh/中转站/接入档案.md`；选型判据归 skill `relay-forensics`（`~/.dsh/skills/relay-forensics`）。
+Base `<你的中转站 base_url>`；key 在 `<你的 keyring 目录>/*.txt`（只读取、不写产物）；模型名以 `GET /v1/models` 实拉为准；一账号 5 并发；**敏感数据不过中转**。详见 `<你的中转站目录>/接入档案.md`；选型判据归 skill `relay-forensics`（`<DSH 技能目录>/relay-forensics`）。
 
-relay 侧现场查：`ls ~/.codex/skills/relay-probe/ && ls ~/.dsh/refs/retired-proj-20261015/relay-forge/`；桥 UI 改动记录：`head -60 <插件目录>/bridge/CHANGELOG.md`。
+relay 侧现场查：`ls ~/.codex/skills/<本机私有技能>/ && ls ~/.dsh/refs/retired-proj-20261015/<本机退役管线>/`；桥 UI 改动记录：`head -60 <插件目录>/bridge/CHANGELOG.md`。
 
 ## 8. CLI 现场速查（完整速查已外移 `<本机功能核对表>` 附B）
 
@@ -76,7 +76,7 @@ relay 侧现场查：`ls ~/.codex/skills/relay-probe/ && ls ~/.dsh/refs/retired-
 
 ```bash
 du -sm ~/.codex ~/.codex/.tmp /tmp/codex-upgrade 2>/dev/null; ls ~/.codex/*.bak-* | wc -l
-python3 -c "import sqlite3;c=sqlite3.connect('file:~/.codex/logs_2.sqlite?mode=ro',uri=True);print('碎片 %d/%d 页'%(c.execute('PRAGMA freelist_count').fetchone()[0],c.execute('PRAGMA page_count').fetchone()[0]))"
+python3 -c "import sqlite3;c=sqlite3.connect('file:<CODEX_HOME>/logs_2.sqlite?mode=ro',uri=True);print('碎片 %d/%d 页'%(c.execute('PRAGMA freelist_count').fetchone()[0],c.execute('PRAGMA page_count').fetchone()[0]))"
 ```
 
 - **能删**：`/tmp/codex-upgrade`（升级残留）· `.tmp/git-*`（Codex **每次运行建一个、从不自清**）· `.live`/`task-*.out`（`POST /api/cleanup {"keepDays":7}`，自动清理卡在 200 MB 阈值上所以永远跑不到）· bak 每类各留最新一份

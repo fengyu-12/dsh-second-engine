@@ -43,6 +43,7 @@ export const ENGINES = {
     label: 'Codex',
     create: createRuntime,
     capabilities: {
+      executor: { protocolVersion: 1, events: true, cancel: true, resume: false },
       eventStream: 'fine',        // appserver 有流式进度；exec 无（同一引擎两种传输）
       approvals: false,
       resume: true,               // codex exec resume <uuid>
@@ -60,6 +61,7 @@ export const ENGINES = {
     label: 'Pi',
     create: createPiRpcRuntime,
     capabilities: {
+      executor: { protocolVersion: 1, events: true, cancel: true, resume: false },
       eventStream: 'fine',         // 15 种 JSONL 事件
       approvals: false,            // extension_ui_request 暂无人应答
       resume: false,               // 未接 --session / fork

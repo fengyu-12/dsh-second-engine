@@ -308,6 +308,7 @@ def cmd_new(a) -> None:
             "session": a.session,
             "engine": a.engine,
             "result": "",
+            "createdAt": now_utc(),
             "updated_at": now_utc(),
         })
         data["tasks"].append(task)
@@ -341,11 +342,19 @@ def cmd_complete(a) -> None:
     if not keep and reviewed != "human":
         die(5, "未经人确认的完成不算完成：出板需要 --reviewed-by human（Agent 自报不算）；"
                "自动化交付请用 --keep 留在板等人审")
+    if reviewed == "human" and (
+        not re.search(r"(?m)^\$[^\S\n]+\S[^\n]*$", a.result)
+        or not re.search(r"(?m)^exit=[0-9]+[ \t]*$", a.result)
+    ):
+        die(2, "人审 complete 的 --result 必须含 $ <命令> 行与 exit=<非负整数> 行；自动化请用 --keep")
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
         t = find_task(data, a.id)
-        if t.get("status") in TERMINAL:
+        pending_review = bool((t.get("review") or {}).get("pending"))
+        review_finalization = (t.get("status") == "completed" and pending_review
+                               and reviewed == "human" and not keep)
+        if t.get("status") in TERMINAL and not review_finalization:
             die(5, f"{a.id} 已终结（{t['status']}），completed 不可复改——有问题请开新任务并引用 {a.id}")
         if not a.result.strip():
             die(2, "complete 必须给 --result（产出位置 + 摘要）")
@@ -356,9 +365,13 @@ def cmd_complete(a) -> None:
         t["owner"] = t.get("owner") or a.owner
         t["result"] = a.result
         t["updated_at"] = reviewed_at
-        if reviewed == "human":
+        if reviewed == "human" and not keep:
             t["reviewed_by"] = "human"
             t["reviewed_at"] = reviewed_at
+            if "review" in t:
+                t["review"]["pending"] = False
+        else:
+            t["review"] = {"pending": True, "at": reviewed_at}
         summary = a.result.strip().splitlines()[0][:120]
         if getattr(a, "keep", False):
             commit(data, f"{a.id} 完成（--keep 保留在板）")
@@ -408,7 +421,7 @@ def cmd_abandon(a) -> None:
 
 def cmd_set(a) -> None:
     allow = {"owner", "session", "engine", "result", "acceptance", "subject", "context", "status",
-             "write_scopes", "blocked_by", "steps"}
+             "write_scopes", "blocked_by", "steps", "child_pid", "child_start"}
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
@@ -432,12 +445,29 @@ def cmd_set(a) -> None:
                 die(5, f"角色不存在：{v}")
             if k == "engine" and v not in ("dsh", "codex", "pi"):
                 die(5, f"engine 非法：{v}")
-            if k == "steps":
+            if k in ("child_pid", "child_start"):
+                t[k] = None if v in ("", "null") else v
+            elif k == "steps":
                 t[k] = parse_steps(v)
             else:
                 t[k] = [x for x in v.split(",") if x] if k in ("write_scopes", "blocked_by") else v
         t["updated_at"] = now_utc()
         commit(data, f"{a.id} 字段更新")
+        save_board(data)
+
+
+def cmd_failure(a) -> None:
+    """派单诊断元数据；不改变任务状态或创建时间。"""
+    with _Lock():
+        data = load_board()
+        check_cas(data, a.expect)
+        t = find_task(data, a.id)
+        if a.clear:
+            t.pop("failure", None)
+        else:
+            t["failure"] = {"reason": a.reason, "at": now_utc()}
+        t["updated_at"] = now_utc()
+        commit(data, f"{a.id} 派单诊断更新")
         save_board(data)
 
 
@@ -486,7 +516,10 @@ def cmd_show(a) -> None:
     print(f"revision={data['revision']}  tasks={len(data['tasks'])}")
     for t in tasks:
         print(f"  {t['id']:<6} {t.get('status',''):<12} owner={str(t.get('owner')):<6} "
-              f"blocked_by={t.get('blocked_by')}  {t.get('subject','')}")
+              f"blocked_by={t.get('blocked_by')}  {t.get('subject','')} "
+              f"child_pid={t.get('child_pid')} child_start={t.get('child_start')} "
+              f"review.pending={t.get('review', {}).get('pending', False)} "
+              f"failure={json.dumps(t.get('failure'), ensure_ascii=False)}")
         if a.id:
             print(f"    task: {t.get('task','')}")
             print(f"    scopes: {t.get('write_scopes')}  session: {t.get('session')}")
@@ -945,7 +978,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id"); sp.add_argument("pairs", nargs="+"); add_cas(sp)
     sp.set_defaults(func=cmd_set)
 
-    sp = sub.add_parser("show", help="查看看板/单任务")
+    sp = sub.add_parser("failure", help="记录或清除派单失败原因")
+    sp.add_argument("id")
+    group = sp.add_mutually_exclusive_group(required=True)
+    group.add_argument("--reason")
+    group.add_argument("--clear", action="store_true")
+    add_cas(sp); sp.set_defaults(func=cmd_failure)
+
+    sp = sub.add_parser("show", aliases=["ls"], help="查看看板/单任务")
     sp.add_argument("id", nargs="?"); sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_show)
 

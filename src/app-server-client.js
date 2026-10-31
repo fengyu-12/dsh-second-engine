@@ -11,7 +11,7 @@
  *   · 事件归一化为 {kind, text|itemType|usage|status}，供上层投影成进度。
  *   · 失败/退出都会 resolve/reject 一次（settled 幂等），绝不让子进程悬空。
  */
-import { spawn } from 'node:child_process'
+import { spawnLimited } from './process-safety.js'
 import { writeFileSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
 
@@ -113,7 +113,7 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
   // 生产路径留空，走 ~/.codex/config.toml 的 active provider。
   // codexBinary：由调用方（src/index.js 的 resolveCodexBinary）注入，保证与 exec 模式
   // spawn 的是同一个二进制；缺省 'codex' 保持本模块独立可用。
-  const child = spawn(codexBinary, [...codexArgs, 'app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  const child = spawnLimited(codexBinary, [...codexArgs, 'app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] }, 'codex-app-server')
   // stdin EPIPE 兜底：app-server 早退后 write() 触发的 error 是异步事件，try/catch
   // 接不住；不挂监听器就是 uncaughtException（write() 外层的 try/catch 防不了这个）。
   child.stdin.on('error', () => { /* 已退出：exit/error 回调负责收尾 */ })
@@ -302,14 +302,18 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
         const type = String(item.type ?? p.itemType ?? '')
         const isTool = /commandExecution|fileChange|mcpToolCall|dynamicToolCall|Tool/.test(type)
         const kind = isTool ? 'tool' : (type === 'reasoning' ? 'reasoning' : (type === 'agentMessage' ? 'text' : 'status'))
+        const completedItemId = item.id ?? p.itemId
+        const hadDelta = completedItemId !== undefined && itemText.has(completedItemId)
         if (msg.method === 'item/completed' && type === 'agentMessage' && typeof item.text === 'string') {
           // 权威替换：以最终 item 文本为准，丢弃该 item 的流式累积（MAPPING §1 规则 4）
-          itemText.set(item.id ?? p.itemId ?? 'item', { text: item.text, done: true })
+          itemText.set(completedItemId ?? 'item', { text: item.text, done: true })
           flushOut()
         }
         emit({
           kind,
-          ...(typeof item.text === 'string' ? { text: item.text } : {}),
+          // 2026-11-01：已收到该 item 的流式 delta 时，completed 不再重复推整段文本
+          // （否则 progress 里同一段话出现两遍；-o 落盘仍用权威文本替换）。
+          ...(typeof item.text === 'string' && !(msg.method === 'item/completed' && type === 'agentMessage' && hadDelta) ? { text: item.text } : {}),
           ...(isTool ? { tool: {
             type,
             itemId: item.id ?? p.itemId,

@@ -229,13 +229,30 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
 // output 里取第一段 assistant 文本（用于回放 output_text.delta）。
 function firstText(response) {
-  for (const item of response.output) {
+  for (const item of Array.isArray(response.output) ? response.output : []) {
     if (item.type !== 'message') continue
-    for (const part of item.content) {
+    for (const part of Array.isArray(item.content) ? item.content : []) {
       if (part.type === 'output_text' && part.text !== '') return part.text
     }
   }
   return ''
+}
+
+function firstTextOutputIndex(response) {
+  const output = Array.isArray(response.output) ? response.output : []
+  for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
+    const item = output[outputIndex]
+    if (item?.type !== 'message') continue
+    for (const part of Array.isArray(item.content) ? item.content : []) {
+      if (part?.type === 'output_text' && part.text !== '') return outputIndex
+    }
+  }
+  return -1
+}
+
+function functionCallArguments(item) {
+  if (typeof item.arguments === 'string') return item.arguments
+  return JSON.stringify(item.arguments ?? {})
 }
 
 // ── 本地桥 server ──
@@ -361,51 +378,84 @@ function replayAsSse(res, response) {
   })
 
   const text = firstText(response)
-  if (text !== '') {
-    const itemId = `msg_${response.id}`
+  const textOutputIndex = firstTextOutputIndex(response)
+  const output = Array.isArray(response.output) ? response.output : []
+  for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
+    const item = output[outputIndex]
+    if (item?.type === 'message' && text !== '' && outputIndex === textOutputIndex) {
+      const itemId = `msg_${response.id}`
+      writeEvent(res, 'response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: outputIndex,
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+      })
+      writeEvent(res, 'response.content_part.added', {
+        type: 'response.content_part.added',
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] },
+      })
+      writeEvent(res, 'response.output_text.delta', {
+        type: 'response.output_text.delta',
+        delta: text,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+      })
+      writeEvent(res, 'response.output_text.done', {
+        type: 'response.output_text.done',
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        text,
+      })
+      writeEvent(res, 'response.content_part.done', {
+        type: 'response.content_part.done',
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        part: { type: 'output_text', text, annotations: [] },
+      })
+      writeEvent(res, 'response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: outputIndex,
+        item: {
+          id: itemId,
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text, annotations: [] }],
+        },
+      })
+      continue
+    }
+    if (item?.type !== 'function_call') continue
+    const argumentsText = functionCallArguments(item)
+    const itemId = item.id ?? item.call_id ?? `fc_${response.id}_${outputIndex}`
+    const addedItem = {
+      ...item,
+      id: itemId,
+      type: 'function_call',
+      status: 'in_progress',
+      arguments: '',
+    }
+    const doneItem = { ...addedItem, status: 'completed', arguments: argumentsText }
     writeEvent(res, 'response.output_item.added', {
       type: 'response.output_item.added',
-      output_index: 0,
-      item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+      output_index: outputIndex,
+      item: addedItem,
     })
-    writeEvent(res, 'response.content_part.added', {
-      type: 'response.content_part.added',
+    writeEvent(res, 'response.function_call_arguments.delta', {
+      type: 'response.function_call_arguments.delta',
       item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      part: { type: 'output_text', text: '', annotations: [] },
-    })
-    writeEvent(res, 'response.output_text.delta', {
-      type: 'response.output_text.delta',
-      delta: text,
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-    })
-    writeEvent(res, 'response.output_text.done', {
-      type: 'response.output_text.done',
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      text,
-    })
-    writeEvent(res, 'response.content_part.done', {
-      type: 'response.content_part.done',
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      part: { type: 'output_text', text, annotations: [] },
+      output_index: outputIndex,
+      delta: argumentsText,
     })
     writeEvent(res, 'response.output_item.done', {
       type: 'response.output_item.done',
-      output_index: 0,
-      item: {
-        id: itemId,
-        type: 'message',
-        role: 'assistant',
-        status: 'completed',
-        content: [{ type: 'output_text', text, annotations: [] }],
-      },
+      output_index: outputIndex,
+      item: doneItem,
     })
   }
 

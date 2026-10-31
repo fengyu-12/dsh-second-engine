@@ -7,7 +7,7 @@
 //   · **Pi**  —— 15 种 JSONL 事件，含 turn/message 边界、usage 增量、aborted
 // 本文件只做一件事：把 Pi 的事件收敛成 TaskRuntime 期望的 ViewEvent（{kind,text,at}）。
 // 不含状态机 —— 状态归属仍由 index.js 的 runtime + finalizeJob 负责。
-import { spawn } from 'node:child_process'
+import { spawnLimited } from '../process-safety.js'
 
 /** Pi 事件类型 → 我们的封闭 kind（6 个）。未列出的降级为 status，绝不透传。 */
 const KIND_BY_TYPE = {
@@ -66,7 +66,7 @@ export function runPi({ prompt, workdir, env = {}, provider, model, extraArgs = 
   if (model) args.push('--model', model)
   args.push(...extraArgs, prompt)
 
-  const child = spawn('pi', args, { cwd: workdir, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = spawnLimited('pi', args, { cwd: workdir, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] }, 'pi-print')
   const events = []
   let buf = ''
   let aborted = false

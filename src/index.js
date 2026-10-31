@@ -1,3 +1,5 @@
+import { spawnLimited, finishSpawnAudit } from './process-safety.js'
+import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 // dsh-second-engine —— DeepSeek Harness 的 Codex 二元引擎插件。
 //
 // 进程内提供：设置页所需的 HTTP API（经 webServer 注册为 exact 路由）
@@ -36,9 +38,10 @@
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, renameSync, openSync, fstatSync, readSync, closeSync, createWriteStream, accessSync, constants } from 'node:fs'
-import { spawn, execFile, spawnSync } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
+import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
 import { piProbe, piAvailableModels, resolvePiProvider, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
 import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl, PI_BRIDGE_PORT } from './engine/pi-bridge.js'
@@ -135,6 +138,38 @@ const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 // ── 异步工单 ──
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
 // 另外挂 child（进程句柄，取消用）与 outPath（-o 落点，读完输出后删除）；这两项不外发。
+const TOKEN_LEDGER_PATH = join(homedir(), '.codex', 'second-engine-token-ledger.jsonl')
+let tokenLedgerError = null
+function checkTokenBudget(res) {
+  try {
+    if (tokenLedgerError) throw new Error(tokenLedgerError)
+    const accounting = budgetGate(TOKEN_LEDGER_PATH, process.env.SECOND_ENGINE_TOKEN_BUDGET)
+    if (accounting.blocked) {
+      send(res, { ok: false, error: '跨工单 token 预算已耗尽（unknown 用量未包含在已知总数中）', accounting }, 429)
+      return false
+    }
+    return true
+  } catch (e) {
+    send(res, { ok: false, error: `成本账本不可用：${errMsg(e)}` }, 400)
+    return false
+  }
+}
+function accountJob(task) {
+  const source = task.engine === 'pi' ? 'pi-session-stats' : task.mode === 'appserver' ? 'appserver-total' : 'codex-exec'
+  let tokens = task.accountedTokens ?? null
+  if (task.engine === 'pi') {
+    const stats = rtOf(task).snapshot().details?.stats
+    tokens = tokenTotal(stats?.tokens ?? stats)
+  }
+  if (task.kind === 'review') tokens = task.usageUnknown ? null : (task.reviewTokens ?? null)
+  if (source === 'codex-exec' && task.kind !== 'review') {
+    const match = /tokens used\s*\n?\s*([\d,]+)/i.exec(task.usageTail ?? '')
+    tokens = match ? tokenTotal(Number(match[1].replace(/,/g, ''))) : null
+  }
+  task.tokenUsage = { source, status: tokens === null ? 'unknown' : 'known', tokens, knownTokens: task.reviewTokens ?? tokens }
+  try { recordTokens(TOKEN_LEDGER_PATH, task.id, source, tokens ?? task.reviewTokens ?? null, tokens === null) }
+  catch (e) { tokenLedgerError = errMsg(e); noteErr('token-ledger', e) }
+}
 const tasks = new Map()
 const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(process.env.HOME || '/root', 'proj')
 const TASK_LIST_LIMIT = 10
@@ -612,7 +647,9 @@ function agentsSectionFor(targetPath) {
 const AGENTS_SECTION = `${AGENTS_MARK}
 # Codex 全局协作协议（by dsh-second-engine）
 
-你是「第二引擎」，与主 AI（DSH）互为伙伴。卡点自救协议：
+- 你是 DeepSeek Harness（DSH）里的「第二引擎」执行体，由插件 dsh-second-engine 唤起；与主 AI（DSH）互为伙伴；派单、复核、验收都来自 DSH 主 AI，最终决策在用户。
+
+卡点自救协议：
 - 同一路径/命令连续失败 2 次、或在绕圈、或缺信息/权限无法自行获取时，必须主动求助而非硬试：
   curl -s -X POST ${AGENTS_BASE_URL}/second-engine/api/consult -H 'Content-Type: application/json' \\
     -d '{"from":"codex","task":"<当前任务一句话>","stuckContext":"<试过什么、错在哪、需要什么>"}'
@@ -1152,6 +1189,104 @@ function readProcStartTime(pid) {
     const raw = parts[19]
     return raw === undefined ? null : raw
   } catch { return null }
+}
+
+// 看板进程身份与独立清扫；不依赖 Web 重启后会丢失的 tasks。
+const BOARD_SCRIPT = fileURLToPath(new URL('../tools/dual-board/board.sh', import.meta.url))
+const boardDir = () => process.env.DUAL_BOARD_DIR || join(homedir(), 'proj', 'dual-board')
+function boardCommand(args) {
+  return new Promise((resolve, reject) => {
+    execFile('bash', [BOARD_SCRIPT, ...args], { env: process.env, timeout: 15000 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`board ${args[0]} failed (${error.code}): ${stderr.trim()}`))
+      else resolve(stdout)
+    })
+  })
+}
+function requestedBoardId(body) {
+  const value = body.boardId ?? body['board-id'] ?? body.board_id ?? body.task?.boardId ?? body.task?.['board-id']
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+async function persistBoardChild(task) {
+  if (!task.boardId) {
+    console.warn(`[second-engine] board pid skipped: task ${task.id} has no board-id`)
+    return
+  }
+  const rt = rtOf(task)
+  const pid = rt.getChildPid()
+  if (!Number.isInteger(pid) || pid <= 0) {
+    console.warn(`[second-engine] board pid skipped: task ${task.id} has no child pid`)
+    return
+  }
+  const start = readProcStartTime(pid)
+  rt.setChildStart(start)
+  try {
+    await boardCommand(['set', task.boardId, `child_pid=${pid}`, `child_start=${start ?? ''}`])
+    console.log(`[second-engine] board pid persisted: ${task.boardId} pid=${pid} start=${start}`)
+    if (start === null) console.warn(`[second-engine] board ${task.boardId}: starttime unavailable; ESRCH only`)
+  } catch (e) { console.error('[second-engine] board pid persistence:', errMsg(e)) }
+}
+
+let boardSweepTimer = null
+let boardSweepRunning = false
+async function sweepBoardOnce() {
+  const dir = boardDir()
+  const summary = { at: new Date().toISOString(), checked: 0, blocked: [], stuckSuspect: [], errors: [] }
+  try {
+    const initial = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+    for (const candidate of initial.tasks) {
+      if (candidate.status !== 'in_progress' || candidate.session === null || candidate.child_pid == null || candidate.child_pid === '') continue
+      // 每个动作重新读取 revision，CAS 阻止探测期间发生的认领/身份更新。
+      const snapshot = JSON.parse(readFileSync(join(dir, 'board.json'), 'utf8'))
+      const task = snapshot.tasks.find(t => t.id === candidate.id)
+      if (!task || task.status !== 'in_progress' || task.session === null || task.child_pid == null || task.child_pid === '') continue
+      const pid = Number(task.child_pid)
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue
+      summary.checked++
+      let dead = false
+      try { process.kill(pid, 0) } catch (e) { dead = e?.code === 'ESRCH' }
+      const start = readProcStartTime(pid)
+      if (start !== null && task.child_start != null && task.child_start !== '' && start !== String(task.child_start)) dead = true
+      if (!dead) {
+        // mtime 只能告警；缺文件/权限问题也绝不是死亡证据。
+        if (typeof task.rollout_path === 'string') {
+          try {
+            if (Date.now() - statSync(task.rollout_path).mtimeMs > 300000) summary.stuckSuspect.push(task.id)
+          } catch { /* 无法读取不判死 */ }
+        }
+        continue
+      }
+      const reason = `持有进程已死（pid ${pid}, start ${task.child_start ?? 'unknown'}）`
+      try {
+        await boardCommand(['block', task.id, '--reason', reason, '--expect', String(snapshot.revision)])
+        summary.blocked.push(task.id)
+        // block 成功才记成功审计；失败仍在 summary/errors 与日志中可见。
+        mkdirSync(join(dir, 'audit'), { recursive: true })
+        appendFileSync(join(dir, 'audit', 'process-sweep.jsonl'), JSON.stringify({ at: summary.at, id: task.id, pid, start: task.child_start, reason, action: 'blocked' }) + '\n')
+      } catch (e) { summary.errors.push(`${task.id}: ${errMsg(e)}`) }
+    }
+  } catch (e) {
+    if (e?.code !== 'ENOENT') summary.errors.push(errMsg(e))
+  }
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'second-engine-board-sweep.last.json'), JSON.stringify(summary) + '\n')
+  } catch (e) { summary.errors.push(`marker: ${errMsg(e)}`) }
+  console.log('[second-engine] board sweep:', JSON.stringify(summary))
+  return summary
+}
+function stopBoardSweep() {
+  if (boardSweepTimer !== null) clearInterval(boardSweepTimer)
+  boardSweepTimer = null
+}
+function startBoardSweep() {
+  stopBoardSweep()
+  // 独立低频计时器，不进行仅凭内存态的 boot sweep。
+  boardSweepTimer = setInterval(async () => {
+    if (boardSweepRunning) return
+    boardSweepRunning = true
+    try { await sweepBoardOnce() } finally { boardSweepRunning = false }
+  }, 60000)
+  boardSweepTimer.unref?.()
 }
 
 // config.toml 里的 base_url 是否已指向给定端点。
@@ -2970,6 +3105,7 @@ function taskView(task) {
     // ⚠️ 别用 `piProvider` 判：调用方不传 provider 时它是 undefined，会把 Pi 单误判成 codex
     // （2026-10-31 实机踩过：Pi 的单返回 engine:'codex'）。
     engine: task.engine === 'pi' ? 'pi' : 'codex',
+    tokenUsage: task.tokenUsage ?? { status: 'pending' },
   }
   // 实时进度可见性：exec 模式看 liveBytes（过程流字节数，在涨=在动），
   // appserver 模式另加 progress（归一化事件）。
@@ -3163,12 +3299,16 @@ function finalizeJob(task, exitCode, status, extra) {
   // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
   try { appendConsultBlock(task) } catch (e) { noteErr('consult', e) }
   task.endedAt = Date.now()
+  finishSpawnAudit(rtOf(task).child(), exitCode, rtOf(task).child()?.signalCode, new Date(task.endedAt).toISOString())
+  accountJob(task)
   return true
 }
 
 // 工单收尾：统一走 finalizeJob。
 function finalizeTask(task, exitCode, status) {
-  return finalizeJob(task, exitCode, status)
+  const first = finalizeJob(task, exitCode, status)
+  if (first) publishTaskReport(task, buildReport(task))
+  return first
 }
 
 function clearCancelTimers(task) {
@@ -3489,10 +3629,11 @@ function projectProgress(list) {
 
 // T5：app-server 执行模式 —— 长连接 JSON-RPC。归一化事件进 task.progress；
 // agentMessage 增量由客户端直接 append 到 -o 文件，故 finalizeTask/看门狗逻辑零改动。
-function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey }) {
+function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey, boardId, model }) {
   const env = { ...process.env, [envKey]: apiKey }
   const task = {
     id,
+    boardId,
     kind: 'task',
     status: 'running',
     exitCode: null,
@@ -3513,8 +3654,13 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     env,
     prompt,
     outPath,
+    model: typeof model === 'string' ? model : '',
     codexBinary: resolveCodexBinary(),
     onEvent: (evt) => {
+      if (evt.kind === 'usage') {
+        const total = evt.usage?.normalized?.total
+        task.accountedTokens = tokenTotal(total)
+      }
       if (evt.kind === 'appserverParseFailure') {
         // 独立累计快照：不会被 engineEvents 环形挤掉，也不算有效协议活动。
         task.appServerParseFailures = {
@@ -3556,6 +3702,8 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
     },
   })
   rtOf(task).setChild(handle.child)
+  rtOf(task).setChildPid(Number.isInteger(handle.child?.pid) ? handle.child.pid : null)
+  void persistBoardChild(task)
   rtOf(task).setApp(handle)
   tasks.set(id, task)
   pruneTasks()
@@ -3587,18 +3735,18 @@ function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, apiKey 
 // ephemeral 缺省 true（不落盘 rollout），只有显式 body.ephemeral === false 才持久化会话。
 async function handleTaskCreate(req, res) {
   try {
+    if (!checkTokenBudget(res)) return
     const body = await readBody(req)
-    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+    const boardId = requestedBoardId(body)
+    const request = normalizeTaskRequest(body, { workdir: DEFAULT_TASK_WORKDIR, engine: activeEngineId() })
+    const { prompt, workdir } = request
     if (prompt === '') return send(res, { ok: false, error: 'prompt 不能为空' }, 400)
-    const workdir = typeof body.workdir === 'string' && body.workdir.trim() !== ''
-      ? body.workdir.trim()
-      : DEFAULT_TASK_WORKDIR
     if (!existsSync(workdir)) {
       return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
     }
     // P4.2（2026-10-28）：按引擎分流。Pi 走自己的 provider（env/models.json），
     // 不依赖 Codex 的 keyring，所以这一支必须在 loadKeyring 之前。
-    const engineId = (typeof body.engine === 'string' && body.engine !== '') ? body.engine : activeEngineId()
+    const engineId = request.engine
     if (engineId === 'pi') {
       const requestedPiProvider = typeof body.provider === 'string' ? body.provider.trim() : ''
       const piProvider = resolvePiProvider(requestedPiProvider)
@@ -3626,6 +3774,7 @@ async function handleTaskCreate(req, res) {
       return startPiTask({
         res,
         id: piId,
+        boardId,
         outPath: join(CODEX_DIR, `task-${piId}.out`),
         workdir,
         prompt,
@@ -3649,6 +3798,8 @@ async function handleTaskCreate(req, res) {
         prompt,
         envKey: `${active.id.toUpperCase()}_API_KEY`,
         apiKey: active.apiKey,
+        boardId,
+        model: request.model,
       })
       return
     }
@@ -3667,12 +3818,12 @@ async function handleTaskCreate(req, res) {
     const envKey = `${active.id.toUpperCase()}_API_KEY`
     await ensureGitBaseline(workdir)
     const live = { bytes: 0, path: `${outPath}.live`, rotatedAt: 0 }
-    const child = spawn(resolveCodexBinary(), args, {
+    const child = spawnLimited(resolveCodexBinary(), args, {
       cwd: workdir,
       env: { ...process.env, [envKey]: active.apiKey },
       // stdin 改 pipe：写入提示词后立即 end()，EOF 自然到达（codex exec 等 stdin EOF 开始干活）。
       stdio: ['pipe', 'pipe', 'pipe'],
-    })
+    }, 'codex-exec')
     // stdin EPIPE 兜底：codex 启动失败/早退时写 stdin 触发的是异步 error 事件，
     // 不挂监听器即 uncaughtException，整个 Web 宿主跟着崩。
     child.stdin?.on('error', () => { /* codex 已退出：exit/error 回调收尾 */ })
@@ -3691,6 +3842,7 @@ async function handleTaskCreate(req, res) {
     }
     let liveStream = openLiveStream('a')
     const writeLive = (buf) => {
+      task.usageTail = ((task.usageTail ?? '') + buf.toString()).slice(-8192)
       live.bytes += buf.length
       // 保留最近两段；旧流排队中的写入继续落在 rename 后的 inode，绝不截断它。
       // 首次异步 open 完成后才能 rename；新 fd 同步打开，避免紧接着 finalize 又创建 .live。
@@ -3716,6 +3868,7 @@ async function handleTaskCreate(req, res) {
     child.stderr?.on('data', writeLive)
     const task = {
       id,
+      boardId,
       kind: 'task',
       status: 'running',
       exitCode: null,
@@ -3739,6 +3892,7 @@ async function handleTaskCreate(req, res) {
     // 只是这处一直没被触发路径暴露）。照复核分支的写法在 spawn 后立即固定身份。
     rtOf(task).setChildPid(Number.isInteger(child.pid) ? child.pid : null)
     rtOf(task).setChildStart(rtOf(task).getChildPid() === null ? null : readProcStartTime(rtOf(task).getChildPid()))
+    void persistBoardChild(task)
     startWatchdog(task)
 
     child.on('exit', (code, signal) => {
@@ -3769,9 +3923,10 @@ async function handleTaskCreate(req, res) {
 // Pi 任务启动（P4.2，2026-10-28）：与 Codex 的 exec / appserver 分支并列，
 // 共用同一套 tasks / pruneTasks / watchdog / finalizeTask —— 这正是 P3 归零的回报。
 // 终态按 A 方案：runtime 只 resolve `done` 给证据，**写终态仍是 finalizeTask**。
-function startPiTask({ res, id, outPath, workdir, prompt, model, provider }) {
+function startPiTask({ res, id, outPath, workdir, prompt, model, provider, boardId }) {
   const task = {
     id,
+    boardId,
     kind: 'task',
     engine: 'pi',
     status: 'running',
@@ -3800,6 +3955,7 @@ function startPiTask({ res, id, outPath, workdir, prompt, model, provider }) {
   void (async () => {
     try {
       await rt.start({ prompt, workdir, outPath })
+      await persistBoardChild(task)
     } catch (e) {
       rt.setAppError(errMsg(e))
       if (finalizeTask(task, -1, 'error')) void notifyTask(task)
@@ -4450,12 +4606,12 @@ function buildReviewPrompt(content, prev, context, reply) {
 function spawnReviewRound({ prompt, workdir, envKey, apiKey, outPath }) {
   // 与 /task 同改：提示词走 stdin（'-' 占位），argv 不携带正文，免疫 pkill -f 误杀父进程。
   const args = ['exec', '--skip-git-repo-check', '--ephemeral', '-o', outPath, '-']
-  const child = spawn(resolveCodexBinary(), args, {
+  const child = spawnLimited(resolveCodexBinary(), args, {
     cwd: workdir,
     env: { ...process.env, [envKey]: apiKey },
     // stdin 写入提示词后 end()，EOF 自然到达。
     stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  }, 'codex-review')
   // stdin EPIPE 兜底：codex 早退后写 stdin 触发的是异步 error 事件，无监听器会击穿宿主进程。
   child.stdin?.on('error', () => { /* codex 已退出：exit/error 回调收尾 */ })
   child.stdin?.write(prompt)
@@ -4580,7 +4736,10 @@ async function runReview(task, active) {
       const code = await wait
       if (wallTimer !== null) clearTimeout(wallTimer)
       // 本轮 codex 自报用量累加进总账（抽不到记 0 —— 宁可少算也不误停）。
-      tokensUsed += getUsage()
+      const roundTokens = getUsage()
+      tokensUsed += roundTokens
+      task.reviewTokens = tokensUsed
+      if (roundTokens === 0) task.usageUnknown = true
       rtOf(task).setChild(null)
       rtOf(task).setChildPid(null)
       rtOf(task).setChildStart(null)
@@ -4673,6 +4832,7 @@ async function runReview(task, active) {
 // POST /review：body { content, rounds? }。立刻返回 { ok, id }，服务层后台自动循环。
 async function handleReviewCreate(req, res) {
   try {
+    if (!checkTokenBudget(res)) return
     const body = await readBody(req)
     const content = typeof body.content === 'string' ? body.content.trim() : ''
     if (content === '') return send(res, { ok: false, error: 'content 不能为空' }, 400)
@@ -4988,6 +5148,25 @@ async function handleConfigSet(req, res) {
     if (rounds === null && wallMs === null && tokenLimit === null && collabBits === null && !hasEngine) {
       return send(res, { ok: false, error: '没给任何可设置字段（reviewRounds / preset / voice+longtask / engine）' }, 400)
     }
+    // P2-1（2026-11-01）：engine 的「未知」与「有运行中工单的 409」都必须在**任何写入之前**
+    // 判定——原先它们放在函数末尾，混合请求（reviewRounds + 非法 engine）会先写配置再回 400，
+    // 造成「部分成功却报失败」。这里只做校验，不落盘。
+    let engineSwitched = null
+    if (hasEngine) {
+      if (ENGINES[body.engine] === undefined) {
+        return send(res, { ok: false, error: `未知引擎：${body.engine}（可选 ${Object.keys(ENGINES).join(' / ')}）` }, 400)
+      }
+      const runningTasks = [...tasks.values()].filter((t) => t && typeof t === 'object' && t.status === 'running' && typeof t.id === 'string')
+      const engineNow = activeEngineId()
+      if (runningTasks.length && body.engine !== engineNow && body.force !== true) {
+        return send(res, {
+          ok: false,
+          error: `有 ${runningTasks.length} 个工单正在跑（${runningTasks.map((t) => t.id).join(', ')}），切换后面板会按新引擎展示而工单仍在旧引擎执行；确认切换请带 force:true`,
+          runningTasks: runningTasks.map((t) => ({ id: t.id, engine: t.engine || '' })),
+          activeEngine: engineNow,
+        }, 409)
+      }
+    }
     const doc = loadKeyring()
     if (rounds !== null) doc.reviewRounds = rounds
     if (wallMs !== null) doc.reviewWallMs = wallMs
@@ -5004,25 +5183,8 @@ async function handleConfigSet(req, res) {
       try { agentsWritten = readFileSync(join(CODEX_DIR, 'AGENTS.md'), 'utf8').includes(VOICE_MARK) } catch { agentsWritten = false }
     }
     // P4.3：切换当前引擎（写 ~/.dsh/second-engine-engine.txt，一行 id）
-    let engineSwitched = null
-    if (typeof body.engine === 'string' && body.engine !== '') {
-      if (ENGINES[body.engine] === undefined) {
-        return send(res, { ok: false, error: `未知引擎：${body.engine}（可选 ${Object.keys(ENGINES).join(' / ')}）` }, 400)
-      }
-      // 有工单在跑时切换 = 「面板按新引擎展示、工单仍在旧引擎执行」（activeEngineId 当场翻边，
-      // providers/key/active/delete 四条接口会转头去读另一个引擎的配置）。要显式 force:true 才放行。
-      const runningTasks = [...tasks.values()].filter((t) => t && typeof t === 'object' && t.status === 'running' && typeof t.id === 'string')
-      const engineNow = activeEngineId()
-      if (runningTasks.length && body.engine !== engineNow && body.force !== true) {
-        return send(res, {
-          ok: false,
-          error: `有 ${runningTasks.length} 个工单正在跑（${runningTasks.map((t) => t.id).join(', ')}），切换后面板会按新引擎展示而工单仍在旧引擎执行；确认切换请带 force:true`,
-          runningTasks: runningTasks.map((t) => ({ id: t.id, engine: t.engine || '' })),
-          activeEngine: engineNow,
-        }, 409)
-      }
-      engineSwitched = setActiveEngineId(body.engine)
-    }
+    // 校验（未知引擎 / 运行中工单 409）已在前置阶段完成，这里只落盘。
+    if (hasEngine) engineSwitched = setActiveEngineId(body.engine)
     send(res, {
       ok: true,
       reviewRounds: doc.reviewRounds,
@@ -5567,6 +5729,9 @@ export function apply(ctx) {
   // 期望态对账 tick（见 startReconcileTick 注释）：治「Web 重启后桥消失、config 仍指旧端口」。
   // 启动即跑一轮，之后每 7s 一次；只对差异动手，幂等。
   startReconcileTick()
+  startBoardSweep()
+  try { ctx.effect(() => stopBoardSweep, 'second-engine: board sweep teardown') }
+  catch { process.on('exit', stopBoardSweep) }
   try {
     ctx.effect(() => stopReconcileTick, 'second-engine: reconcile tick teardown')
   } catch {
