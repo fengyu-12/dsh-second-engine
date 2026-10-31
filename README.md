@@ -352,10 +352,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.2）
+## 支持能力一览（v3.8.5）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **3.8.5 编排与安全增强** | ✅ 3.8.5 | ① **人审证据门**：`complete --reviewed-by human` 的 `--result` 必须含 `$ 命令` 行 + `exit=<非负整数>` 行（不兼容变更；`--keep` 路径不变）② **看板**：`pending_review`（`--keep` 留板待审、人审后出板，顺带解决 `--keep` 无合法出板路径）、`createdAt` 写后不可改、`failure` 派单失败原因、`child_pid/child_start` 跨重启落盘 + 独立 60s 死持有清扫（ESRCH+starttime，mtime 只告警）③ **安全底座**：spawn 收窄 workdir + `ulimit -f/-u/-t`（`exec` 保 pid）+ 访问审计 JSONL（0600、argv 脱敏）④ **成本**：跨工单 token 账本 + `SECOND_ENGINE_TOKEN_BUDGET` 派单门禁（超预算 429，unknown 单独计数）⑤ **Executor 端口预埋**：`src/engine/task-port.js`（normalize/Report/capabilities），不绑定官方版本 ⑥ **修复**：appserver 下 `/api/task` 的 `model` 生效、progress 文本去重、桥「点太快中断失效」重试、config 校验前移（P2-1） |
 | **3.8.2 修复批** | ✅ 3.8.2 | 看板 `set` 不能再直接写终态（补完人审门禁的另一半，此前可从 pending 直达 completed 且不写审计）；`policy-watch` 把 `norm_err()` 接进 M1 判据、清掉死参数/死变量、zstd 缺失走干净退出而非抛 traceback；Web 桥接通宿主模型清单（`BRIDGE_HOST_API_URL` 未注入时 models 恒为空，此前下拉只有一个）并恢复会话内切模型/切思考（`initialize` 补 `experimentalApi` 能力，此前被 app-server 拒绝）；绕圈提醒两处（pending 读取顺序 + 去掉「文件一长就丢弃结果」的快照校验，此前提醒 8 小时发不出一次），现已实测能注入且同命中不重复；切引擎前检查运行中工单（409 + `force:true`） |
 | **协作信号检测的运行时加固** | ✅ 3.8.1 | 三条修正一并落地：① 脚本路径改为按模块自身位置定位，不再写死安装目录（换路径安装即失效的老问题）；② 启动前探测解释器可用性，缺 Python 只关掉检测、不影响正常对话，且错误留痕而非静默；③ 每会话 30s 最小间隔 + 会话文件 mtime/size 快照去重（同一状态不重复扫），状态落盘改原子写。注入的消息 role 固定为 `user`、来源标 `policy-watch` |
 | **桥配置写入加固** | ✅ 3.8.1 | 原实现有两个坑：并发写互相踩、失败分支还会把半截临时文件 `rename` 成正式配置。现改为按配置路径串行化 + TOML 写前写后双校验（python `tomllib`，fail-closed）+ 临时文件 `pid.时间戳.随机串` + 失败只删临时文件。已验故障注入下正式文件 MD5 逐字节不变、10 并发最终文件完整可解析 |
@@ -397,13 +398,16 @@ Codex 升到 **0.166.0**，命令面新增 `review` / `mcp` / `plugin` / `update
 
 ## 版本记录（择要）
 
-最新版本 **3.8.2** —— 修复版，无新功能：看板人审门禁补完之后被绕过的另一半、`policy-watch` 三处（归一化/死码/退出码）、Web 桥两处（模型清单通道、会话内切模型与切思考的能力声明）、绕圈提醒的读取顺序、切引擎前的运行中工单检查。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+最新版本 **3.8.5** —— 编排与安全增强版（跳过 3.8.3/3.8.4，改动跨度大）：人审证据门、看板待审/创建时间/失败原因/死持有清扫、spawn 限额与访问审计、跨工单 token 账本与派单门禁、Executor 端口预埋；另修 appserver `model` 参数、progress 文本重复、桥快速中断、config 部分成功报失败。上一版 3.8.2 是修复批：看板人审门禁补完之后被绕过的另一半、`policy-watch` 三处（归一化/死码/退出码）、Web 桥两处（模型清单通道、会话内切模型与切思考的能力声明）、绕圈提醒的读取顺序、切引擎前的运行中工单检查。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## 有哪些坑要提前知道（已知限制）
 
 - **沙箱**：proot 环境无 Landlock / bubblewrap，Codex 需 `danger-full-access` 运行——安全防线在流程层（工作副本隔离 + diff 审查 + git 仲裁），**不要把主工作区直接交给 Codex**；
 - **翻译桥**：实验性；内部以非流式请求上游、以流式事件回放，长任务首包延迟等于整段生成时间；
-- **工单记录**：内存态，重启 Web 即清空（复核记录自 2026-10-25 起持久化到 `~/.codex/reviews/`，不受影响）；
+- **工单记录**：任务视图仍是内存态，重启 Web 即清空；**但派单的 `child_pid/child_start` 已落看板**，重启后 60s 清扫可识别「持有进程已死」并 `block`；token 用量落 `~/.codex/second-engine-token-ledger.jsonl`；
+- **成本预算**：只比较已知用量，`unknown` 是下界；并发任务可能越过预算；
+- **访问审计**：`~/.codex/second-engine-audit.jsonl` 只记 spawn 生命周期（pid/workdir/argv 脱敏），**不记录文件访问**；
+- **证据门**：人审 `--result` 的结构校验只证明「填了命令与退出码」，不证明命令真的执行过；
 - **完成提醒**：经 App 通知提醒用户回 Web 唤起 DSH 侧 agent 验收（DSH 暂无会话主动注入 API；唤醒层是其实验性前置，见上）；
 - **唤醒层**：实验端点，需 `session-<uuid>` 前缀与 DSH 侧 provider，对运行中的会话发跟进会打断它当前回合；转正留后续版本；
 - **t-tool run 前提**：目标会话须停在 shell 提示符；pane 正跑前台程序时哨兵等不到，表现为 TIMEOUT（会话不损，等程序结束即可）；命令须写单行；
@@ -419,6 +423,9 @@ dsh-second-engine/
 ├── skills/second-engine/SKILL.md   # 知识层：agent 的操作流程正文（约 400 行）
 ├── skills/second-engine/references/ # 知识层按需文件（Pi 现场 / Codex 事实 / 升级 / dual-board）
 ├── src/index.js                    # 服务层：路由 / 提供方 / 工单 / 桥
+├── src/engine/task-port.js         # Executor 端口预埋（normalize / Report / capabilities）
+├── src/process-safety.js           # spawn 收窄 + ulimit + 访问审计
+├── src/token-ledger.js             # 跨工单 token 账本 + 预算门禁
 ├── src/bridge.js                   # 翻译桥：responses ↔ chat
 ├── lib/client.js                   # 界面层：设置面板 + 浮动球
 ├── tools/dual-board/               # 看板：board.sh / board_tool.py / dispatch.sh / PROTOCOL.md
