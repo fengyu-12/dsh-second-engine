@@ -24,8 +24,7 @@
     "tools/t-tool.sh",
     "tools/web-base.sh",
     "tools/policy-watch.py",
-    "tools/README.md",
-    "tools/post-change.sh"
+    "tools/README.md"
   ],
   "engines": {
     "node": ">=22",
