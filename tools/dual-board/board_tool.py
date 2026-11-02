@@ -33,7 +33,11 @@ BOARD_DIR = os.environ.get("DUAL_BOARD_DIR") or os.path.dirname(os.path.abspath(
 BOARD = os.path.join(BOARD_DIR, "board.json")
 LOCK = os.path.join(BOARD_DIR, "board.json.lock")
 ARCHIVE_DIR = os.path.join(BOARD_DIR, "archive")
-AUDIT_DIR = os.path.join(BOARD_DIR, "audit")   # 完成审计（人确认留痕）；与 archive 语义分开，见 PROTOCOL §12.2
+AUDIT_DIR = os.path.join(BOARD_DIR, "audit")   # 完成审计（人确认/自签留痕）；与 archive 语义分开，见 PROTOCOL §12.2
+# --reviewed-by 的两个合法值：human = 用户确认过；auto = 低风险自签（审计按原值记录，不归一）
+REVIEWED_BY_VALUES = ("human", "auto")
+# 证据行（$ <命令> / exit=N）不是授权原话，判「用户授权原话」时先剔掉
+EVIDENCE_LINE_RE = re.compile(r"^(?:\$[^\S\n]+\S[^\n]*|exit=[0-9]+[ \t]*)$")
 DISPATCH_DIR = os.path.join(BOARD_DIR, ".dispatch")
 STALE_SEC = 600
 LOCK_TRIES = 50          # 50 × 0.1s = 5s
@@ -308,6 +312,7 @@ def cmd_new(a) -> None:
             "session": a.session,
             "engine": a.engine,
             "result": "",
+            "attempts": 0,
             "createdAt": now_utc(),
             "updated_at": now_utc(),
         })
@@ -327,6 +332,37 @@ def cmd_claim(a) -> None:
         check_deps(data, t)
         if t.get("status") not in ("pending", "blocked"):
             die(5, f"{a.id} 状态为 {t.get('status')}，不可认领")
+        if t.get("status") == "blocked" or t.get("owner") is not None:
+            t["attempts"] = int(t.get("attempts", 0)) + 1
+        else:
+            t.setdefault("attempts", 0)
+        if not t.get("base"):
+            workdir = t.get("workdir") or "."
+            r = subprocess.run(["git", "-C", workdir, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                t["base"] = r.stdout.strip()
+            else:
+                scopes = t.get("write_scopes") or []
+                if scopes:
+                    digest = hashlib.sha256()
+                    count = 0
+                    snapshot = {}
+                    for scope in scopes:
+                        p = os.path.join(workdir, scope)
+                        paths = [p] if os.path.isfile(p) else []
+                        if os.path.isdir(p):
+                            paths = [os.path.join(root, fn) for root, _, files in os.walk(p) for fn in files]
+                        for path in sorted(paths):
+                            rel = os.path.relpath(path, workdir).replace(os.sep, "/")
+                            with open(path, "rb") as fh: content_hash = hashlib.sha256(fh.read()).hexdigest()
+                            digest.update(rel.encode()); digest.update(b"\0"); digest.update(content_hash.encode())
+                            snapshot[rel] = content_hash
+                            count += 1
+                    t["base"] = f"md5:{count}:{digest.hexdigest()[:12]}"
+                    t["_base_snapshot"] = snapshot
+                else:
+                    print("warn: 非 git workdir 且无 write_scopes，未记录基线", file=sys.stderr)
         t["owner"] = a.owner
         t["status"] = "in_progress"
         t["updated_at"] = now_utc()
@@ -334,26 +370,40 @@ def cmd_claim(a) -> None:
         save_board(data)
 
 
+def _review_quote(result):
+    """返回 --result 里剥掉证据行（`$ <命令>` / `exit=N`）与空行后剩下的「授权原话」。
+
+    只用于 human：空串说明结果里只有命令证据，没有用户说过的话。
+    """
+    lines = [ln.strip() for ln in str(result or "").splitlines()]
+    return "\n".join(ln for ln in lines if ln and not EVIDENCE_LINE_RE.match(ln)).strip()
+
+
 def cmd_complete(a) -> None:
     reviewed = getattr(a, "reviewed_by", None)
     keep = getattr(a, "keep", False)
-    if reviewed is not None and reviewed != "human":
-        die(5, "--reviewed-by 只接受 human（Agent 自报不算）")
-    if not keep and reviewed != "human":
-        die(5, "未经人确认的完成不算完成：出板需要 --reviewed-by human（Agent 自报不算）；"
+    if reviewed is not None and reviewed not in REVIEWED_BY_VALUES:
+        die(5, "--reviewed-by 只接受 human|auto（Agent 自报不算）")
+    if not keep and reviewed is None:
+        die(5, "未经人确认的完成不算完成：出板需要 --reviewed-by human|auto（Agent 自报不算）；"
                "自动化交付请用 --keep 留在板等人审")
     if reviewed == "human" and (
         not re.search(r"(?m)^\$[^\S\n]+\S[^\n]*$", a.result)
         or not re.search(r"(?m)^exit=[0-9]+[ \t]*$", a.result)
     ):
         die(2, "人审 complete 的 --result 必须含 $ <命令> 行与 exit=<非负整数> 行；自动化请用 --keep")
+    if reviewed == "human" and not _review_quote(a.result):
+        die(2, "人审 complete 的 --result 必须含用户授权原话（不能只剩 $ <命令> / exit=N 证据行）；"
+               "低风险自动签请用 --reviewed-by auto")
     with _Lock():
         data = load_board()
         check_cas(data, a.expect)
         t = find_task(data, a.id)
+        if int(t.get("attempts", 0)) >= 2:
+            die(3, "返工已达 2 轮，请拆小任务或改由主 AI 处理")
         pending_review = bool((t.get("review") or {}).get("pending"))
         review_finalization = (t.get("status") == "completed" and pending_review
-                               and reviewed == "human" and not keep)
+                               and reviewed == "human" and not keep)  # auto 不得替人签字
         if t.get("status") in TERMINAL and not review_finalization:
             die(5, f"{a.id} 已终结（{t['status']}），completed 不可复改——有问题请开新任务并引用 {a.id}")
         if not a.result.strip():
@@ -365,8 +415,8 @@ def cmd_complete(a) -> None:
         t["owner"] = t.get("owner") or a.owner
         t["result"] = a.result
         t["updated_at"] = reviewed_at
-        if reviewed == "human" and not keep:
-            t["reviewed_by"] = "human"
+        if reviewed in REVIEWED_BY_VALUES and not keep:
+            t["reviewed_by"] = reviewed        # 照实写 human/auto，便于统计自动签比例
             t["reviewed_at"] = reviewed_at
             if "review" in t:
                 t["review"]["pending"] = False
@@ -398,6 +448,7 @@ def cmd_block(a) -> None:
         t = find_task(data, a.id)
         if t.get("status") in TERMINAL:
             die(5, f"{a.id} 已终结，不可置 blocked")
+        t["attempts"] = int(t.get("attempts", 0)) + 1
         t["status"] = "blocked"
         t["result"] = (t.get("result") or "") + f"\n[blocked {now_utc()}] {a.reason}"
         t["updated_at"] = now_utc()
@@ -431,7 +482,7 @@ def cmd_set(a) -> None:
             if "=" not in pair:
                 die(2, f"--field 需 key=value 形式：{pair}")
             k, v = pair.split("=", 1)
-            if k not in allow:
+            if k in ("base", "attempts", "createdAt", "_base_snapshot") or k not in allow:
                 die(2, f"字段不可改：{k}（允许：{', '.join(sorted(allow))}）")
             if k == "status":
                 if v not in VALID_STATUS:
@@ -953,7 +1004,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("complete", help="完成（目的达成 → 出板；v1.3）")
     sp.add_argument("id"); sp.add_argument("--owner")
     sp.add_argument("--result", required=True); sp.add_argument("--force", action="store_true")
-    sp.add_argument("--reviewed-by", default=None, help="人工确认：只接受 human（Agent 自报不算）")
+    sp.add_argument("--reviewed-by", default=None,
+                    help="确认方：human|auto（human=用户确认，须在 --result 带授权原话；auto=低风险自签）")
     sp.add_argument("--keep", action="store_true", help="保留在板（默认完成即出板）")
     add_cas(sp); sp.set_defaults(func=cmd_complete)
 

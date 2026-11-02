@@ -51,7 +51,7 @@ class PiRpc {
     this.dec = new StringDecoder('utf8')
     this.child.stdout.on('data', (c) => this.feed(c))
     this.child.stderr.on('data', (c) => { this.stderrTail = (this.stderrTail + c.toString()).slice(-4000) })
-    this.child.on('exit', (code) => { this.exitCode = code; for (const [,p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(`pi rpc 退出 code=${code}`)) } this.pending.clear() })
+    this.child.on('exit', (code) => { this.exitCode = code; try { log(`[pi-bridge] rpc exited code=${code} stderr=${this.stderrTail.slice(-800)}`) } catch { /* log 不可用 */ } for (const [,p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(`pi rpc 退出 code=${code}`)) } this.pending.clear() })
     this.child.on('error', (e) => { for (const [,p] of this.pending) { clearTimeout(p.timer); p.reject(e) } this.pending.clear() })
   }
 
@@ -278,13 +278,13 @@ const server = createServer(async (req, res) => {
           }
           return
         }
-        if (rec.type === 'agent_settled' || rec.type === 'agent_end') finish()
+        if (rec.type === 'agent_settled') finish()   // 只认整次 prompt 的终点；agent_end 是每轮工具循环都触发
       })
       timer = setTimeout(finish, 180000)
       req.on('close', () => { if (!finished) { finished = true; try { off() } catch { /**/ } if (timer !== null) clearTimeout(timer) } })
 
       try {
-        await rpc.command('prompt', { message: text }, 30000)
+        await rpc.command('prompt', { message: text }, 600000)   // 长工单 10 分钟；60s 会把正常长任务判成超时
       } catch (e) {
         try { res.write(JSON.stringify({ kind: 'text', text: `[发送失败] ${e && e.message ? e.message : e}` }) + '\n') } catch { /* 断开 */ }
         finish()

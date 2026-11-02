@@ -5,8 +5,9 @@
 结构化事件，不解析我的自然语言、也不靠我自觉计数。
 
 三条判据：
-  M1 同一规范命令 + 完全相同的输出连续 >= 2（不依赖退出码）
-  M2 同一文件编辑振荡 A->B->A
+  M1 同一规范命令 + 完全相同的输出连续 >= 2（不依赖退出码），
+     且「本次 vs 上一次同命令同输出」的间隔 < window（局部间隔，不以整场末尾为锚）
+  M2 同一文件编辑振荡 A->B->A（edit 用 old/new 对；write 用 content 哈希序列）
   M3 连续 N 步无状态推进（默认 4 步 / 10 分钟窗口）
 
 数据源：~/.dsh/sessions/<cwd 编码>/<session>/session.v4.jsonl.zstd
@@ -26,7 +27,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 SESSIONS_ROOT = os.path.expanduser("~/.dsh/sessions")
 SESSION_FILE = "session.v4.jsonl.zstd"
@@ -45,10 +46,14 @@ def norm_cmd(c):
 
 
 def norm_err(t):
-    """错误类归一化：去掉数字、路径、耗时这类每次都变的部分，只留错误骨架。"""
+    """错误类归一化：去掉数字、路径、耗时、内存地址这类每次都变的部分，只留错误骨架。"""
     t = EXIT_RE.sub("", str(t))
     t = re.sub(r"/[\w./-]+", "<path>", t)
-    t = re.sub(r"\b\d+(\.\d+)?\b", "<n>", t)
+    # 十六进制地址（traceback 里的 0x7f...）每次都不一样，先于十进制数字归一化
+    t = re.sub(r"\b0[xX][0-9a-fA-F]+\b", "<addr>", t)
+    # 浮点/整数归一化：负向后视保证从数字开头整体匹配（0.31s -> <n>s，而不是 <n>.31s），
+    # 同时不会把 x.31 里的 31 当成数字。
+    t = re.sub(r"(?<![\w.])\d+(?:\.\d+)?", "<n>", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t[:300]
 
@@ -111,38 +116,73 @@ def read_events(path):
     proc.wait()
 
 
+# epoch 秒的合理区间：2001-09-09 ~ 2100-01-01。区间外的值一律当坏样本丢弃。
+MIN_EPOCH_S = 1_000_000_000.0
+MAX_EPOCH_S = 4_102_444_800.0
+
+
+def _scale_epoch(v):
+    """按量级把 s / ms / µs / ns 统一成秒；离谱值返回 None（不污染 max()）。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v != v:        # 负数 / NaN
+        return None
+    if v >= 1e17:              # ns
+        v /= 1e9
+    elif v >= 1e14:            # µs
+        v /= 1e6
+    elif v >= 1e11:            # ms（本机 DSH 就是这个量级）
+        v /= 1e3
+    if not (MIN_EPOCH_S <= v <= MAX_EPOCH_S):
+        return None
+    return v
+
+
 def _event_time(ev):
-    """Return event time in seconds, accepting epoch seconds/ms or ISO strings."""
+    """Return event time in seconds, accepting epoch s/ms/µs/ns or ISO strings.
+
+    格式变化时的防御：
+      - 数字按量级分级识别（秒 / 毫秒 / 微秒 / 纳秒）；
+      - 离谱值（0、负数、非本世纪）返回 None，让调用方跳过而不是污染 max()；
+      - naive ISO 按 UTC 处理（fromisoformat 出来的 naive 会被当成本地时区）。
+    """
     for key in ("ts", "timestamp", "time", "createdAt"):
         value = ev.get(key)
         if value is None:
             value = (ev.get("data") or {}).get(key)
-        if value is None:
+        if value is None or isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
-            return float(value) / 1000 if value > 10_000_000_000 else float(value)
+            return _scale_epoch(value)
         if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                continue
             try:
-                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
             except ValueError:
-                try:
-                    n = float(value)
-                    return n / 1000 if n > 10_000_000_000 else n
-                except ValueError:
-                    pass
+                dt = None
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return _scale_epoch(dt.timestamp())
+            try:
+                return _scale_epoch(float(s))
+            except ValueError:
+                pass
     return None
 
 
 def analyze(events, steps_threshold, window_s=600):
     events = list(events)
-    times = [_event_time(ev) for ev in events]
-    known = [t for t in times if t is not None]
-    m1_cutoff = max(known) - window_s if known else None
     calls = {}          # callId -> {name, args, seq, turn, step}
-    m1_streak = {}      # current command -> [err_key, count]
+    m1_streak = {}      # command hash -> [out_sig, count, last_ts]
     last_m1_cmd = None
     m1_hits = []
     edits = {}          # file_path -> [(old_h, new_h, seq, turn)]
+    writes = {}         # file_path -> [(content_h, seq, turn)]  M2 的 write 独立路径
     m2_hits = []
     step_sig = {}       # (turn, step) -> [result_texts]
     step_wait = set()   # (turn, step) 只含等待类调用
@@ -180,8 +220,6 @@ def analyze(events, steps_threshold, window_s=600):
             name = call["name"]
             if name == "bash":
                 event_time = _event_time(ev)
-                if m1_cutoff is not None and event_time is not None and event_time < m1_cutoff:
-                    continue
                 try:
                     args = json.loads(call["args"] or "{}")
                 except ValueError:
@@ -199,19 +237,31 @@ def analyze(events, steps_threshold, window_s=600):
                     m1_streak.clear()
                 last_m1_cmd = ck
                 prev = m1_streak.get(ck)
-                if prev and prev[0] == out_sig:
+                # 局部时间窗：只比「本次」与「上一次同命令同输出」的间隔，
+                # 不再用 max(known) - window 当锚 —— 否则隔一阵才回看就只看得到末尾。
+                too_far = (
+                    prev is not None
+                    and event_time is not None
+                    and prev[2] is not None
+                    and (event_time - prev[2]) >= window_s
+                )
+                if prev and prev[0] == out_sig and not too_far:
                     prev[1] += 1
+                    gap = (event_time - prev[2]) if (event_time is not None and prev[2] is not None) else None
+                    if event_time is not None:
+                        prev[2] = event_time
                     if prev[1] >= 2:
                         m1_hits.append({
                             "cmd": cmd[:160],
                             "turn": call["turn"],
                             "step": call["step"],
                             "count": prev[1],
+                            "gap_s": None if gap is None else round(gap, 3),
                             "seq": ev.get("seq"),
                         })
-                        m1_streak[ck] = [out_sig, 0]
+                        m1_streak[ck] = [out_sig, 0, prev[2]]
                 else:
-                    m1_streak[ck] = [out_sig, 1]
+                    m1_streak[ck] = [out_sig, 1, event_time]
             elif name == "edit":
                 try:
                     args = json.loads(call["args"] or "{}")
@@ -226,11 +276,34 @@ def analyze(events, steps_threshold, window_s=600):
                     if a[0] == b[1] and a[1] == b[0]:
                         m2_hits.append({
                             "file": fp,
+                            "kind": "edit",
                             "turn": call["turn"],
                             "step": call["step"],
                             "seq": ev.get("seq"),
                         })
                         lst.pop()   # 计一次就够，避免连环重复报
+            elif name == "write":
+                # write 没有 old_string，套 ABA 会误判（新内容与旧内容无对偶关系），
+                # 所以单独按 file_path 记 content 哈希序列：A -> B -> A 才算循环。
+                try:
+                    args = json.loads(call["args"] or "{}")
+                except ValueError:
+                    args = {}
+                fp = args.get("file_path") or args.get("path") or "?"
+                ch = h(str(args.get("content", "")))
+                lst = writes.setdefault(fp, [])
+                lst.append((ch, ev.get("seq"), call["turn"]))
+                if len(lst) >= 3:
+                    a, b, c = lst[-3], lst[-2], lst[-1]
+                    if a[0] == c[0] and a[0] != b[0]:
+                        m2_hits.append({
+                            "file": fp,
+                            "kind": "write",
+                            "turn": call["turn"],
+                            "step": call["step"],
+                            "seq": ev.get("seq"),
+                        })
+                        lst.pop()   # 同上：计一次就够
 
     # M3：按 (turn, step) 顺序看结果内容是否连续不变
     m3_hits = []
@@ -283,9 +356,9 @@ def main():
         print("M1 同命令+同输出连续重复: %d 处" % len(res["m1"]))
         for x in res["m1"]:
             print("   -> turn %s step %s 连续 %d 次: %s" % (x["turn"], x["step"], x["count"], x["cmd"]))
-        print("M2 编辑振荡 A->B->A: %d 处" % len(res["m2"]))
+        print("M2 编辑/写入振荡 A->B->A: %d 处" % len(res["m2"]))
         for x in res["m2"]:
-            print("   -> %s @turn %s" % (x["file"], x["turn"]))
+            print("   -> %s @turn %s (%s)" % (x["file"], x["turn"], x.get("kind", "edit")))
         print("M3 连续无状态推进 >=%d 步: %d 处" % (a.steps, len(res["m3"])))
         for x in res["m3"]:
             print("   -> turn/step %s 起连续 %d 步无变化" % (x["from"], x["n"]))

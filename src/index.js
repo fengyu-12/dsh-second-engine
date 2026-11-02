@@ -43,7 +43,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
-import { piProbe, piAvailableModels, resolvePiProvider, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
+import { piProbe, piAvailableModels, resolvePiProvider as resolvePiProviderRaw, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
 import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl, PI_BRIDGE_PORT } from './engine/pi-bridge.js'
 import http from 'node:http'
 import { join, resolve, dirname, delimiter } from 'node:path'
@@ -54,13 +54,32 @@ import { createBridgeServer } from './bridge.js'
 import { startAppServerTurn } from './app-server-client.js'
 import { resolveCollab, collabPreset, writeCollab } from './collab.js'
 import { createHash, randomBytes } from 'node:crypto'
+import { WIRE_API, CODEX_DIR, CONFIG_PATH } from './constants.js'
+import { normalizeProvider, normalizeReviewRounds, normalizeReviewWallMs, normalizeReviewTokenLimit, normalizeIssue, normalizeReply, normalizeResponses, normalizeLedgerEntries, issueFingerprintOf,
+  REVIEW_DEFAULT_ROUNDS, REVIEW_ROUNDS_CHOICES, REVIEW_DEFAULT_WALL_MS, REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_MIN_TOKEN_LIMIT,
+  asText, ISSUE_REF_RE, REPLY_REASON_CLIP, RESPONSE_REASON_CLIP, LEDGER_ID_RE } from './normalize.js'
+import { noteErr, atomicWriteFileSync, send, readConfigRaw, ERR_LOG } from './core.js'
+import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, policyWatchErr, POLICY_WATCH_DELIVERY_COOLDOWN_MS } from './policy-watch.js'
+import { diagnoseMood, lastUserText, buildMoodMessage, MOOD_COOLDOWN_MS } from './mood-watch.js'
+import { readHintToggles, writeHintToggles } from './hint-toggles.js'
+import { REVIEWS_DIR } from './state.js'
+import { baseNameOf, prunePiBackups, cleanupSessions, pruneReviewFiles, REVIEW_KEEP_FILES, PI_BACKUP_KEEP } from './cleanup.js'
+import { gitPorcelain, gitOk } from './git.js'
+import { appendConsultBlock, appendReviewIssuesBlock, extractFirstJsonObject, extractMcpServerBlocks, extractModels, extractPreservedSections, extractPreservedTopLevelLines, issueTextFingerprint, issueTrigrams, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson, parseTokensUsed, parseVersion } from './parse.js'
+import { KEYRING_PATH, MAX_BODY_BYTES, CONFIG_BACKUP_KEEP, CONFIG_BACKUP_NAME_RE, TASK_OUTPUT_CLIP, CANCEL_RETRY_MS, CANCEL_FORCE_FINALIZE_MS, CANCEL_FORCE_FINALIZE_MESSAGE, newId, readBody, saveKeyring, backupConfig, readHeadTail, queryParam } from './io.js'
 
 // The bridge is started by ctl.sh; pass the host API address through its inherited environment.
 if (process.env.DSH_WEB_URL) process.env.BRIDGE_HOST_API_URL = process.env.DSH_WEB_URL
 
 export const name = 'second-engine'
 
-const CODEX_DIR = join(homedir(), '.codex')
+// mood-watch 冷却：每会话上次提醒时间，防刷屏（2026-11-02）
+const moodWatchLastAt = new Map()
+const moodWatchAborts = new Map() // 每会话最近的用户打断时间戳数组（单次无害，只统计频次）
+const MOOD_KEEP_LIMIT = 50 // 照抄 policy-watch 的 FIFO 淘汰：只留最近 50 个活跃会话，防 Map 无限增长
+const MOOD_ABORT_WINDOW_MS = 10 * 60 * 1000 // 频次窗口：10 分钟
+const MOOD_ABORT_TRIGGER = 2 // 窗口内被打断 ≥2 次才提示（单次多为无害的口头打断）
+
 // P4.26（2026-10-29）：AGENTS.md 的写入目标不只有 Codex。
 // Pi 同样认 AGENTS.md：全局在 agentDir（~/.pi/agent/AGENTS.md），项目级从 cwd 向上逐级查找；
 // 两引擎写同一段协作文案，各文件里的成对标记保证幂等、互不干扰。
@@ -111,8 +130,6 @@ function execMode() {
   } catch { /* 文件不存在 → 默认 */ }
   return 'exec'
 }
-const CONFIG_PATH = join(CODEX_DIR, 'config.toml')
-const KEYRING_PATH = join(CODEX_DIR, 'keyring.json')
 const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
 
 // 首次初始化写入的三家预设（apiKey 空，待设置页填写）。
@@ -125,7 +142,6 @@ const PRESET_IDS = new Set(PRESET_PROVIDERS.map((p) => p.id))
 const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
 // Codex 侧永远讲 Responses（config.toml 的 wire_api 恒为它），
 // 'completions' 提供方由本地翻译桥转接（见 ensureBridge）。
-const WIRE_API = 'responses'
 const SUPPORTED_WIRE_APIS = new Set(['responses', 'completions'])
 const ID_PATTERN = /^[a-z][a-z0-9_-]*$/
 // config.toml 顶层 web_search：Codex 原生联网搜索档位（二进制 WebSearchMode 枚举实证）。
@@ -177,11 +193,6 @@ const TASK_KEEP_LIMIT = 50
 // 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
 const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
 
-// 任务/复核/求助 ID：时间前缀可读可排序 + 8 字节强随机。
-// （旧式 4 字符随机段在并发提交时会碰撞，tasks.set 直接覆盖既有条目。）
-function newId() {
-  return `${Date.now().toString(36)}-${randomBytes(8).toString('hex')}`
-}
 
 // ── Codex 卡点求助（consult）──
 // 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
@@ -190,179 +201,40 @@ const consults = []
 const CONSULT_KEEP_LIMIT = 20
 
 
-// ── 绕圈自动提醒（policy-watch）：检测在 turn/end，投递只追加到当次 pre-step ──
-const POLICY_WATCH_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'tools', 'policy-watch.py')
-const POLICY_WATCH_PYTHON = process.env.SECOND_ENGINE_PYTHON || 'python3'
-const POLICY_WATCH_STATE_PATH = join(homedir(), '.dsh', 'policy-watch', 'last.json')
-const POLICY_WATCH_TIMEOUT_MS = 5000
-const POLICY_WATCH_DELIVERY_COOLDOWN_MS = 10 * 60 * 1000
-const POLICY_WATCH_KEEP_LIMIT = 50
-const policyWatchPending = new Map()
-const policyWatchDelivered = new Map()
-const policyWatchHitKeys = new Map()
-const policyWatchFlights = new Map()
-const policyWatchLastStart = new Map()
-const policyWatchLastStat = new Map()
-const POLICY_WATCH_MIN_INTERVAL_MS = 30_000
-let policyWatchPythonReady = false
-let policyWatchPythonUnavailable = false
-let policyWatchErrAt = 0
-function policyWatchSessionFile(sessionId) {
-  const root = join(homedir(), '.dsh', 'sessions')
-  try {
-    for (const group of readdirSync(root)) {
-      const candidate = join(root, group, String(sessionId), 'session.v4.jsonl.zstd')
-      if (existsSync(candidate)) return candidate
-    }
-  } catch {}
-  return null
-}
-function policyWatchErr(tag, err) {
-  const now = Date.now()
-  if (now - policyWatchErrAt < 60_000) return
-  policyWatchErrAt = now
-  noteErr(tag, err)
-}
-
-function loadPolicyWatchState() {
-  try {
-    const saved = JSON.parse(readFileSync(POLICY_WATCH_STATE_PATH, 'utf8'))
-    for (const [id, entry] of Object.entries(saved.pending || {})) {
-      if (entry && typeof entry.at === 'number' && typeof entry.summary === 'string') policyWatchPending.set(id, entry)
-    }
-    for (const [id, at] of Object.entries(saved.delivered || {})) if (Number.isFinite(at)) policyWatchDelivered.set(id, at)
-    for (const [id, keys] of Object.entries(saved.hitKeys || {})) if (Array.isArray(keys)) policyWatchHitKeys.set(id, new Set(keys))
-    trimPolicyWatchMaps()
-  } catch { /* absent/corrupt state is a silent cold start */ }
-}
-function trimPolicyWatchMaps() {
-  for (const map of [policyWatchPending, policyWatchDelivered, policyWatchHitKeys]) {
-    while (map.size > POLICY_WATCH_KEEP_LIMIT) map.delete(map.keys().next().value)
-  }
-}
-function persistPolicyWatchState() {
-  try {
-    const dir = dirname(POLICY_WATCH_STATE_PATH)
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-    const payload = {
-      pending: Object.fromEntries(policyWatchPending),
-      delivered: Object.fromEntries(policyWatchDelivered),
-      hitKeys: Object.fromEntries([...policyWatchHitKeys].map(([id, keys]) => [id, [...keys]])),
-    }
-    atomicWriteFileSync(POLICY_WATCH_STATE_PATH, JSON.stringify(payload), 0o600)
-  } catch (e) { policyWatchErr('policy-watch-state', e) }
-}
-function policyWatchSummary(json) {
-  const labels = []
-  if (Array.isArray(json.m1) && json.m1.length) labels.push(`M1 同命令同输出重复 ${json.m1.length} 处`)
-  if (Array.isArray(json.m2) && json.m2.length) labels.push(`M2 文件编辑 A→B→A 振荡 ${json.m2.length} 处`)
-  if (Array.isArray(json.m3) && json.m3.length) labels.push(`M3 连续无状态推进 ${json.m3.length} 处`)
-  return labels.join('；')
-}
-function runPolicyWatch(sessionId, snapshot) {
-  return new Promise((resolveResult) => {
-    let settled = false
-    const finish = (value) => { if (!settled) { settled = true; resolveResult(value) } }
-    let child
-    try {
-      child = execFile(POLICY_WATCH_PYTHON, [POLICY_WATCH_PATH, '--json', '--session', String(sessionId)], { timeout: POLICY_WATCH_TIMEOUT_MS, maxBuffer: 256 * 1024 }, (error, stdout) => {
-        const code = error ? (Number.isInteger(error.code) ? error.code : null) : 0
-        if (code !== 0 && code !== 10) return finish({ error, snapshot })
-        try { finish({ code, json: JSON.parse(stdout), snapshot }) } catch (e) { finish({ error: e, snapshot }) }
-      })
-      const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} finish(null) }, POLICY_WATCH_TIMEOUT_MS)
-      timer.unref?.()
-    } catch (e) { finish({ error: e, snapshot }) }
-  })
-}
-function startPolicyWatch(sessionId) {
-  if (policyWatchPythonUnavailable) return
-  if (policyWatchFlights.has(sessionId)) return
-  let snapshot
-  try {
-    const path = policyWatchSessionFile(sessionId)
-    if (!path) return
-    const stat = statSync(path)
-    snapshot = { path, mtimeMs: stat.mtimeMs, size: stat.size }
-  } catch { return }
-  const prior = policyWatchLastStat.get(sessionId)
-  if (prior && (prior.mtimeMs !== snapshot.mtimeMs || prior.size !== snapshot.size)) {
-    policyWatchPending.delete(sessionId)
-    policyWatchLastStat.set(sessionId, snapshot)
-  } else if (!prior) policyWatchLastStat.set(sessionId, snapshot)
-  const started = policyWatchLastStart.get(sessionId) || 0
-  if (Date.now() - started < POLICY_WATCH_MIN_INTERVAL_MS) return
-  policyWatchLastStart.set(sessionId, Date.now())
-  if (!policyWatchPythonReady) {
-    const probe = spawnSync(POLICY_WATCH_PYTHON, ['--version'], { encoding: 'utf8', timeout: 3000 })
-    if (probe.error || probe.status !== 0) {
-      policyWatchPythonUnavailable = true
-      policyWatchErr('policy-watch-python', probe.error || new Error(probe.stderr || 'python interpreter unavailable'))
-      return
-    }
-    policyWatchPythonReady = true
-  }
-  const flight = runPolicyWatch(sessionId, snapshot)
-  policyWatchFlights.set(sessionId, flight)
-  void flight.then((result) => {
-    if (result?.error) { policyWatchErr('policy-watch-scan', result.error); return }
-    if (result.code === 0) {
-      policyWatchPending.delete(sessionId)
-      persistPolicyWatchState()
-      return
-    }
-    if (result.code !== 10) return
-    const summary = policyWatchSummary(result.json)
-    if (!summary) return
-    const now = Date.now()
-    const key = createHash('sha256').update(JSON.stringify({ m1: result.json.m1 || [], m2: result.json.m2 || [], m3: result.json.m3 || [] })).digest('hex')
-    const keys = policyWatchHitKeys.get(sessionId) || new Set()
-    const previous = policyWatchPending.get(sessionId)
-    if (keys.has(key) || previous?.key === key) return
-    // Identical hit keys stay suppressed for this session; new keys replace the one-shot pending notice.
-    keys.add(key)
-    while (keys.size > POLICY_WATCH_KEEP_LIMIT) keys.delete(keys.values().next().value)
-    policyWatchHitKeys.delete(sessionId)
-    policyWatchHitKeys.set(sessionId, keys)
-    policyWatchPending.delete(sessionId)
-    policyWatchPending.set(sessionId, { summary, key, at: now })
-    trimPolicyWatchMaps()
-    persistPolicyWatchState()
-  }).catch((e) => policyWatchErr('policy-watch-scan', e)).finally(() => policyWatchFlights.delete(sessionId))
-}
 
 // ── 吞错留痕（D，2026-10-25）──
 // 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
 // 环形缓冲最近 50 条 { t, tag, msg }，/api/status 暴露最近 10 条。
 // 只存 tag 与脱敏后的短消息 —— 挂进来的调用点不碰密钥，keyring 内容不进缓冲；
 // 脱敏正则兜第二层：sk- 令牌 / Bearer 凭证 / key|token|password|secret 赋值形态 → [redacted]。
-const ERR_LOG = []
-const ERR_LOG_LIMIT = 50
 
 // progress 排障旁路（2026-10-28）：归一化事件的 meta 原文环形上限（条/字节，两者都封）。
 // 只存内存，不落盘、不进 taskView —— 引擎事件可能含模型/工具正文，不往 ERR_LOG（/status
 // 会回显最近 10 条）那种对外通道里放。
 const ENGINE_EVENTS_LIMIT = 20
 const ENGINE_EVENTS_META_BYTES = 4096
-const ERR_REDACT_RE = /(sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9._~+\/=-]{6,}|(?:(?:api[_-]?key|key|token|password|secret)["']?\s*[:=]\s*)["']?[A-Za-z0-9._~+\/=-]{6,})/gi
-function noteErr(tag, err) {
-  let msg = err instanceof Error ? String(err.message ?? err) : String(err ?? '')
-  msg = String(msg).replace(ERR_REDACT_RE, '[redacted]').slice(0, 300)
-  ERR_LOG.push({ t: Date.now(), tag: String(tag), msg })
-  while (ERR_LOG.length > ERR_LOG_LIMIT) ERR_LOG.shift()
-}
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
 const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(process.env.HOME || '/root', '.dsh'), '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
+// Provider selection is runtime/request (via preferredId) then Pi config default;
+// the keyring is consulted by the probe only to fill the selected provider's key.
+function resolvePiProvider(preferredId = '') {
+  if (preferredId !== '') return resolvePiProviderRaw(preferredId)
+  let configured = ''
+  try {
+    const settings = JSON.parse(readFileSync(join(homedir(), '.pi', 'agent', 'settings.json'), 'utf8'))
+    configured = typeof settings.defaultProvider === 'string' ? settings.defaultProvider : ''
+  } catch { /* optional */ }
+  return resolvePiProviderRaw(configured)
+}
+
 // ── 双向互审（review）──
 // 每轮以固定模板要求独立复核引擎输出 JSON；轮数默认 3、上限 5。
-const REVIEW_DEFAULT_ROUNDS = 3
 const REVIEW_MIN_ROUNDS = 1
 const REVIEW_MAX_ROUNDS = 5
 // 设置页可选轮数（GET/POST /api/config 的白名单，仅这三档）。
-const REVIEW_ROUNDS_CHOICES = [1, 3, 5]
 // ⚠️ 首轮模板就是全部纪律所在：历史 16 条复核绝大多数只跑 1 轮（reviewRounds=1），而
 // 「三态裁决 / 不许只写『我仍然认为』/ 未回应必须自行裁决」那一整套，只在带 reply 的第 2 轮起注入
 // ⇒ 首轮这行才是 90% 复核真正看到的提示词（2026-10-26 实测）。三条硬要求（对照 secondop-panel 的
@@ -388,10 +260,6 @@ const REVIEW_RAW_CLIP = 2000
 // 互审的硬预算缺省值（2026-10-03 补：此前只有轮数上限，"无新增即收敛"是**语义**条件，
 // 两个 AI 在「主张 X / 反对 X」之间振荡时没有任何刹车，会一路烧到额度见底）。
 // 两者都可在配置里覆盖（keyring 顶层 reviewWallMs / reviewTokenLimit）。
-const REVIEW_DEFAULT_WALL_MS = 30 * 60 * 1000   // 墙钟 30 分钟
-const REVIEW_DEFAULT_TOKEN_LIMIT = 400000       // 累计 40 万 token（按 codex 自报的 tokens used 累加）
-const REVIEW_MIN_WALL_MS = 60 * 1000
-const REVIEW_MIN_TOKEN_LIMIT = 1000
 // ── 独立来源数（2026-10-26，对齐 secondop-panel 的 quorum 语义）──
 // 双引擎 = 主 AI 写、Codex 复核 ⇒ 本插件实际能产出的独立复核家族恒为 1
 //（secondop-panel 规则：写代码的模型可以发言，但永不计入 quorum）。所以 converged
@@ -403,8 +271,6 @@ const QUORUM_NOTE = '1 个独立复核家族 < 建议下限 3，converged 仅代
 // ── #8-10（2026-10-25）：复核记录持久化与接力 ──
 // ~/.codex/reviews/<id>.json（0600 原子写）。双重清理从第一天接上（.live 的教训）：
 // 写入时按数量截断（pruneReviewFiles）+ 定时/手动清理按 mtime 龄汰（cleanupReviewFiles）。
-const REVIEWS_DIR = join(CODEX_DIR, 'reviews')
-const REVIEW_KEEP_FILES = 200
 // 复核 id 形如 "<base36 时间戳>-<16 hex>"（newId）；接力与读档都先过这道闸，防路径注入。
 const REVIEW_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 
@@ -460,43 +326,7 @@ function readConfig() {
 // ── node:http 小工具（同 guard 写法）──
 const errMsg = (e) => (e && e.message) ? e.message : String(e)
 
-function send(res, data, status = 200) {
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-store')
-  res.end(JSON.stringify(data))
-}
 
-// 请求体上限：设置页 API 的 payload 都很小，但 /api/review 的 content 可能承载
-// 整份交付文档，取 4MB 兼顾两者；超限直接断开按空体处理，防超大包全量缓冲进内存。
-const MAX_BODY_BYTES = 4 * 1024 * 1024
-function readBody(req) {
-  return new Promise((resolve) => {
-    const chunks = []
-    let received = 0
-    let settled = false
-    const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
-    req.on('data', (c) => {
-      received += c.length
-      if (received > MAX_BODY_BYTES) {
-        try { req.destroy() } catch { /* best effort */ }
-        finish({})
-        return
-      }
-      chunks.push(c)
-    })
-    req.on('end', () => {
-      try {
-        finish(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
-      } catch {
-        finish({})
-      }
-    })
-    req.on('error', () => finish({}))
-    // 客户端半途中断且只触发 close（无 error/end）时兜底，handler 不至于永久挂起。
-    req.on('close', () => finish({}))
-  })
-}
 
 // ── 本地状态探测 ──
 // 当前 active 提供方的 apiKey 是否已配置。
@@ -555,58 +385,13 @@ function presetProviders() {
 }
 
 // 归一化单条 provider：缺字段补默认值，调用方拿到的形状始终稳定。
-function normalizeProvider(raw) {
-  const provider = {
-    id: typeof raw?.id === 'string' ? raw.id : '',
-    name: typeof raw?.name === 'string' ? raw.name : '',
-    baseUrl: typeof raw?.baseUrl === 'string' ? raw.baseUrl : '',
-    wireApi: typeof raw?.wireApi === 'string' ? raw.wireApi : WIRE_API,
-    model: typeof raw?.model === 'string' ? raw.model : '',
-    apiKey: typeof raw?.apiKey === 'string' ? raw.apiKey : '',
-  }
-  // 可选模型元数据（预设提供方才有）：存在才带上，写入 config.toml 顶层。
-  if (Number.isFinite(raw?.contextWindow)) provider.contextWindow = Math.floor(raw.contextWindow)
-  if (Number.isFinite(raw?.maxOutput)) provider.maxOutput = Math.floor(raw.maxOutput)
-  return provider
-}
 
-// 原子落盘：同目录临时文件 + rename 顶替。直接 writeFileSync 目标路径，进程中途
-// 崩溃/断电会留下半截文件（keyring.json / config.toml 随之解析失败）；mode 在创建
-// 临时文件时即生效，0600 没有「先建后 chmod」的 world-readable 窗口。
-function atomicWriteFileSync(path, text, mode = 0o600) {
-  const tmp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
-  writeFileSync(tmp, text, { encoding: 'utf8', mode })
-  chmodSync(tmp, mode)
-  try {
-    renameSync(tmp, path)
-  } catch (e) {
-    try { unlinkSync(tmp) } catch { /* best effort */ }
-    throw e
-  }
-}
-
-function saveKeyring(doc) {
-  mkdirSync(CODEX_DIR, { recursive: true })
-  atomicWriteFileSync(KEYRING_PATH, `${JSON.stringify(doc, null, 2)}\n`)
-}
 
 // 复核轮数：只认 1/3/5，其余（含缺失、非法、字符串数字以外的垃圾值）一律回落默认 3。
-function normalizeReviewRounds(value) {
-  const n = Number(value)
-  return REVIEW_ROUNDS_CHOICES.includes(n) ? n : REVIEW_DEFAULT_ROUNDS
-}
 
 // 互审硬预算（2026-10-03）：非法/缺失/过小一律回落缺省值 ——
 // 宁可给个保守值，也不要"0 预算"把互审一进去就停。
-function normalizeReviewWallMs(value) {
-  const n = Number(value)
-  return Number.isFinite(n) && n >= REVIEW_MIN_WALL_MS ? Math.floor(n) : REVIEW_DEFAULT_WALL_MS
-}
 
-function normalizeReviewTokenLimit(value) {
-  const n = Number(value)
-  return Number.isFinite(n) && n >= REVIEW_MIN_TOKEN_LIMIT ? Math.floor(n) : REVIEW_DEFAULT_TOKEN_LIMIT
-}
 
 // ── Codex 协作协议（AGENTS.md 自动写入）──
 // 让 Codex 拥有「卡点求助本能」：连续失败/绕圈时主动调 /api/consult。
@@ -935,44 +720,10 @@ function tomlString(value) {
   return `"${String(value).replace(/[\r\n]+/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 }
 
-// 每次重写 config 前按时间戳另存一份：config.toml.bak-<YYYYMMDD-HHMMSS>，保留最近
-// CONFIG_BACKUP_KEEP 份，旧的清掉。A4（2026-10-26）：此前只在首次写前备份一次 .bak-se，
-// 恢复点永远停在史前版本，之后任何一次重写出问题都只能回滚到最初状态。
-// 只按本方案的文件名模式轮转（config.toml.bak-YYYYMMDD-HHMMSS），不碰史前 .bak-se 和其它文件。
-const CONFIG_BACKUP_KEEP = 5
-const CONFIG_BACKUP_NAME_RE = /^config\.toml\.bak-\d{8}-\d{6}$/
-function backupConfig() {
-  try {
-    if (!existsSync(CONFIG_PATH)) return
-    const t = new Date()
-    const p2 = (n) => String(n).padStart(2, '0')
-    const target = join(CODEX_DIR, `config.toml.bak-${t.getFullYear()}${p2(t.getMonth() + 1)}${p2(t.getDate())}-${p2(t.getHours())}${p2(t.getMinutes())}${p2(t.getSeconds())}`)
-    copyFileSync(CONFIG_PATH, target)
-    chmodSync(target, 0o600)
-    const rolling = readdirSync(CODEX_DIR).filter((n) => CONFIG_BACKUP_NAME_RE.test(n)).sort()
-    for (const name of rolling.slice(0, Math.max(0, rolling.length - CONFIG_BACKUP_KEEP))) {
-      try { unlinkSync(join(CODEX_DIR, name)) } catch { /* best effort */ }
-    }
-  } catch { /* 备份失败不阻断切换（best effort） */ }
-}
 
 // 提取原 config.toml 中全部 [mcp_servers.*] 段（段体直到下一个段头或文件尾）。
 // 插件模板不生成这些段；切换提供方时原样保留，避免用户经 codex mcp add 挂载的
 // 外部 MCP（如 exa）在重写中丢失。原文件不存在或读取失败时返回空数组。
-function extractMcpServerBlocks() {
-  try {
-    const raw = readFileSync(CONFIG_PATH, 'utf8')
-    const blocks = []
-    const re = /^\[mcp_servers\.[^\]\n]+\][^\n]*$/gm
-    let m
-    while ((m = re.exec(raw)) !== null) {
-      const next = raw.indexOf('\n[', m.index)
-      const end = next === -1 ? raw.length : next + 1
-      blocks.push(raw.slice(m.index, end).replace(/\n*$/, ''))
-    }
-    return blocks
-  } catch { /* 原文件不存在：无可保留 */ return [] }
-}
 
 // 插件模板自己生成的段（每次重写都会重新生成）—— 重写时只排除这一类，其余段原样保留。
 // 用黑名单而非白名单：白名单每出现一种新段就要补一次名单，漏补 = 静默丢配置。
@@ -987,21 +738,6 @@ const TEMPLATE_OWNED_SECTION = /^\[(?:model_providers\.[^\]\n]+|memories)\][^\n]
 
 // 提取原 config.toml 中「除模板自有段之外」的全部段（段体直到下一个段头或文件尾）。
 // 原文件不存在或读取失败时返回空数组。
-function extractPreservedSections() {
-  try {
-    const raw = readFileSync(CONFIG_PATH, 'utf8')
-    const blocks = []
-    const re = /^\[[^\]\n]+\][^\n]*$/gm
-    let m
-    while ((m = re.exec(raw)) !== null) {
-      if (TEMPLATE_OWNED_SECTION.test(m[0])) continue   // 模板每次自己会生成
-      const next = raw.indexOf('\n[', m.index)
-      const end = next === -1 ? raw.length : next + 1
-      blocks.push(raw.slice(m.index, end).replace(/\n*$/, ''))
-    }
-    return blocks
-  } catch { /* 原文件不存在：无可保留 */ return [] }
-}
 
 // 模板自己生成的顶层键（每次重写重新生成）；其余顶层键值行重写时原样带回。
 // 原先只显式保留 sandbox_mode/web_search，用户手写的其它顶层键（如
@@ -1012,27 +748,9 @@ const TEMPLATE_OWNED_TOP_LEVEL = new Set([
 ])
 
 // 首个段头之前的非模板顶层 key = value 行（原样保留；TOML 顶层键必须在首个 [table] 前）。
-function extractPreservedTopLevelLines() {
-  try {
-    const raw = readFileSync(CONFIG_PATH, 'utf8')
-    const lines = raw.split('\n')
-    const firstTable = lines.findIndex((l) => /^\s*\[/.test(l))
-    const head = firstTable === -1 ? lines : lines.slice(0, firstTable)
-    const kept = []
-    for (const line of head) {
-      const m = /^\s*([A-Za-z0-9_.-]+)\s*=/.exec(line)
-      if (m === null || TEMPLATE_OWNED_TOP_LEVEL.has(m[1])) continue
-      kept.push(line.trim())
-    }
-    return kept
-  } catch { /* 原文件不存在：无可保留 */ return [] }
-}
 
 // ── config.toml 读写（web_search / mcp_servers）──
 // 与 extractMcpServerBlocks 同口径：读不到就当下不存在，绝不抛错。
-function readConfigRaw() {
-  try { return readFileSync(CONFIG_PATH, 'utf8') } catch { return '' }
-}
 
 // 落盘统一走这里：目录先建、权限 0600（config.toml 里有 apiKey 引用等敏感信息）。
 // 重写前先轮转备份（与 writeCodexConfig 同规——这里也是整文件重写，出问题同样需要恢复点）。
@@ -1790,6 +1508,10 @@ async function handlePiChannelCreate(req, res) {
     // 整段已搬进锁内：基线读取、其它 provider 的保留、apiKey 沿用均以**当前最新**那份为准。
     const entry = { baseUrl, api, models }
     if (typeof body.name === 'string' && body.name.trim() !== '') entry.name = body.name.trim()
+    if (models.length === 0) {
+      send(res, { ok: false, error: 'models 不能为空：至少给一个模型 id（空 models 会让 pi 报 Unknown provider）' }, 400)
+      return
+    }
     const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
     const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
       const bag = piProvidersBag(doc)   // D1：null 原型 + 一律 hasOwnProperty 判存在
@@ -1959,6 +1681,29 @@ const PI_WIRE_OPTIONS = [
 // Codex 的 { ok, active, providers:[{id,name,baseUrl,model,apiKey:{configured,preview}}] }。
 // 这样「编辑 / 删除 / 填 Key / 拉模型 / 切当前」全部沿用既有实现 —— 不再维护第二套 UI。
 const PI_SETTINGS_PATH = join(homedir(), '.pi', 'agent', 'settings.json')
+// per-provider 模型记忆（2026-11-02）：Pi 的 settings.json 只有一对全局 defaultProvider/defaultModel，
+// 切提供方时模型不跟着换（实测：当前是 deepseek 但仍显示 glm-5.2）。按 provider 各记一份。
+// ⚠️ 不写进 models.json —— 那是 Pi 的配置且有 schema 校验，塞未知字段可能整份被拒。
+const PI_MODEL_MEMORY_PATH = join(homedir(), '.dsh', 'second-engine', 'pi-model-memory.json')
+
+function readPiModelMemory() {
+  try {
+    const parsed = JSON.parse(readFileSync(PI_MODEL_MEMORY_PATH, 'utf8'))
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch { return {} }
+}
+
+function rememberPiModel(id, model) {
+  if (id === '' || model === '') return
+  try {
+    // 目录不会自动创建：atomicWriteFileSync 只写文件，父目录缺失会 ENOENT（真实事故：
+    // ~/.dsh/second-engine/ 不存在时每次写记忆都失败，异常被 catch 吞掉，表现为"选了模型又回默认"）。
+    mkdirSync(dirname(PI_MODEL_MEMORY_PATH), { recursive: true })
+    const mem = readPiModelMemory()
+    mem[id] = model
+    atomicWriteFileSync(PI_MODEL_MEMORY_PATH, `${JSON.stringify(mem, null, 2)}\n`, 0o600)
+  } catch (e) { noteErr('pi-model-memory', e) }
+}
 
 function readPiJson(path) {
   if (!existsSync(path)) return {}
@@ -2077,6 +1822,10 @@ function piProvidersSnapshot() {
   const active = typeof settings.defaultProvider === 'string' ? settings.defaultProvider : ''
   const curModel = typeof settings.defaultModel === 'string' ? settings.defaultModel : ''
   const kr = resolvePiProvider()
+  // 每行显示「该提供方自己的当前模型」：激活的用 settings 的 current，其余优先用记忆值，
+  // 没记忆才退回默认。旧写法非激活行给空串 / models[0]，于是 DeepSeek 显示"未设模型"、
+  // 智谱显示 models.json 里的第一个（不是用户选过的那个）。
+  const mem = readPiModelMemory()
   // 内置 deepseek 可能与 models.json 里的 providers.deepseek 同时存在：
   // 后者是我们自己写 key/baseUrl 的落点（piProviderKey 就写这儿）。
   // 若不合并，面板会出现两条 DeepSeek（用户实测），必须并进内置行、且遍历时跳过。
@@ -2086,7 +1835,7 @@ function piProvidersSnapshot() {
     id: 'deepseek',
     name: 'DeepSeek',
     baseUrl: typeof builtin.baseUrl === 'string' && builtin.baseUrl !== '' ? builtin.baseUrl : 'https://api.deepseek.com',
-    model: active === 'deepseek' ? curModel : '',
+    model: active === 'deepseek' ? curModel : (typeof mem.deepseek === 'string' && mem.deepseek !== '' ? mem.deepseek : 'deepseek-flash'),
     apiKey: {
       configured: (kr !== null && kr.id === 'deepseek') || builtinKey !== '' || Boolean(process.env.DEEPSEEK_API_KEY),
       preview: builtinKey !== '' ? '已配置' : '',
@@ -2102,9 +1851,11 @@ function piProvidersSnapshot() {
       baseUrl: typeof one.baseUrl === 'string' ? one.baseUrl : '',
       // 非激活渠道显示它自己的第一个模型（不是空）：编辑表单用它预填，
       // 预填空会让「随手点保存」把清单清掉（P4.19 真实事故）。
-      model: active === cid ? curModel : (Array.isArray(one.models) && one.models.length > 0
-        ? String((typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id)) || '')
-        : ''),
+      model: active === cid ? curModel : (typeof mem[cid] === 'string' && mem[cid] !== ''
+        ? mem[cid]
+        : (Array.isArray(one.models) && one.models.length > 0
+          ? String((typeof one.models[0] === 'string' ? one.models[0] : (one.models[0] && one.models[0].id)) || '')
+          : '')),
       apiKey: { configured: key !== '', preview: key === '' ? '' : '已配置' },
     })
   }
@@ -2176,21 +1927,6 @@ async function piProviderAdd(req, res) {
 // 这里复用同一个保留数，以及同一套「只按自己的文件名模式轮转」的纪律：
 // 只匹配 ^<本文件名>\.bak- ，别的一律不碰（用户手放的备份、别的文件都安全）。
 // 备份名是 <文件>.bak-<毫秒>-<pid>-<8hex>，时间戳定长在最前 → 字典序即时间序，sort() 就够。
-function baseNameOf(p) { const i = String(p).lastIndexOf('/'); return i === -1 ? String(p) : String(p).slice(i + 1) }
-const PI_BACKUP_KEEP = Number(process.env.DSH_PI_BACKUP_KEEP || CONFIG_BACKUP_KEEP)
-function prunePiBackups(path, keep = PI_BACKUP_KEEP) {
-  const dir = dirname(path)
-  const base = baseNameOf(path)
-  let names = []
-  try { names = readdirSync(dir) } catch { return [] }
-  const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.bak-')
-  const rolling = names.filter((n) => re.test(n)).sort()
-  const removed = []
-  for (const name of rolling.slice(0, Math.max(0, rolling.length - keep))) {
-    try { unlinkSync(join(dir, name)); removed.push(name) } catch { /* best effort */ }
-  }
-  return removed
-}
 
 // ── Pi 提供方/渠道 id 白名单（D1，2026-10-29）──────────────────────────
 // 原来只有 piProviderAdd / handlePiChannelCreate 各写了一份同样的字面量正则，
@@ -2271,9 +2007,14 @@ async function piProviderActive(req, res) {
     // 直接写回会把用户 settings.json 里其它键（不止 defaultProvider/Model）全丢掉（P0-3）。
     const out = await piWriteJson(PI_SETTINGS_PATH, (settings) => {
       settings.defaultProvider = id
-      // 切提供方时把 defaultModel 也落到该提供方的第一个模型，否则 Pi 会拿旧 model 配新 provider。
-      if (id === 'deepseek') {
-        if (typeof settings.defaultModel !== 'string' || settings.defaultModel === '') settings.defaultModel = 'deepseek-flash'
+      // 切提供方时把 defaultModel 落到「该提供方上次选的模型」；没记忆才用默认。
+      // 旧写法在 deepseek 分支只在 defaultModel 为空时才设，导致切回 deepseek 仍留着上一个厂商的模型。
+      const mem = readPiModelMemory()
+      const remembered = typeof mem[id] === 'string' ? mem[id].trim() : ''
+      if (remembered !== '') {
+        settings.defaultModel = remembered
+      } else if (id === 'deepseek') {
+        settings.defaultModel = 'deepseek-flash'
       } else {
         const one = Object.prototype.hasOwnProperty.call(snap.channels, id) && snap.channels[id] !== null && typeof snap.channels[id] === 'object' ? snap.channels[id] : {}
         const first = Array.isArray(one.models) && one.models.length > 0
@@ -2526,6 +2267,7 @@ async function piProviderModel(req, res) {
       settings.defaultModel = model
       return settings
     })
+    rememberPiModel(id, model)
     send(res, { ok: true, id, model })
   } catch (e) { sendPiWriteError(res, e) }
 }
@@ -2767,22 +2509,6 @@ function bigmodelAuxModelsUrl(baseUrl) {
 //   OpenAI（DeepSeek）：{ object:'list', data:[{ id, ... }] }
 //   Z.ai（智谱）：      { models:[{ id, display_name, ... }] }
 // 取 id；无 id 时回落 display_name；顺带容忍纯字符串条目与重复项。
-function extractModels(json) {
-  const list = Array.isArray(json?.data)
-    ? json.data
-    : (Array.isArray(json?.models) ? json.models : [])
-  const models = []
-  for (const item of list) {
-    let id = ''
-    if (typeof item === 'string') id = item.trim()
-    else if (item !== null && typeof item === 'object') {
-      if (typeof item.id === 'string' && item.id !== '') id = item.id
-      else if (typeof item.display_name === 'string') id = item.display_name
-    }
-    if (id !== '' && !models.includes(id)) models.push(id)
-  }
-  return models
-}
 
 // POST /models：body { id }（缺省 = active）。带 Bearer 拉取该提供方模型清单。
 async function handleModels(req, res) {
@@ -2877,29 +2603,6 @@ async function handleProviderModel(req, res) {
 }
 
 // 递归删除 sessions 下 mtime 早于 keepDays 天的 *.jsonl，统计数量与释放字节
-function cleanupSessions(dir, cutoff, stats) {
-  let entries
-  try {
-    entries = readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      cleanupSessions(full, cutoff, stats)
-      continue
-    }
-    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
-    try {
-      const info = statSync(full)
-      if (info.mtimeMs >= cutoff) continue
-      unlinkSync(full)
-      stats.removed += 1
-      stats.freedBytes += info.size
-    } catch { /* 跳过无法删除的条目 */ }
-  }
-}
 
 // C 项（2026-10-17 用户定）：过程流 `task-*.out.live` 落在 CODEX_DIR 根下、**不在 sessions/ 内**，
 // 所以 cleanupSessions 的递归永远扫不到它 —— 这里单独按 mtime 清。
@@ -3162,6 +2865,7 @@ function taskView(task) {
   if (typeof snap.error === 'string' && snap.error !== '') view.error = snap.error
   // appserver 模式的失败原因记在 appError（原先不外发，外部无从诊断）。
   if (view.error === undefined && typeof snap.appError === 'string' && snap.appError !== '') view.error = snap.appError
+  if (task.notifyUndelivered === true) view.notifyUndelivered = true
   return view
 }
 
@@ -3211,35 +2915,6 @@ function stopWatchdog(task) { rtOf(task).stopWatchdog() }
 // spawn 后启动：每 30s 看一次活性（心跳 ∨ -o 文件 mtime 兜底），超 300s 无变化 → stuckSuspect + 通知一次。
 function startWatchdog(task) { rtOf(task).startWatchdog() }
 
-// 超长 -o 输出只留头尾（各半）：output 会整段进内存并随 GET /task 全量外发，
-// 不设限时长任务的输出可达数百 MB（OOM + 响应体爆炸）。
-const TASK_OUTPUT_CLIP = 2 * 1024 * 1024
-const CANCEL_RETRY_MS = 1000
-const CANCEL_FORCE_FINALIZE_MS = 5000
-const CANCEL_FORCE_FINALIZE_MESSAGE = 'agent 未响应取消，已强制收尾（5 秒超时）'
-function readHeadTail(path, maxBytes) {
-  const fd = openSync(path, 'r')
-  try {
-    const size = fstatSync(fd).size
-    const readChunk = (buf, position) => {
-      let off = 0
-      while (off < buf.length) {
-        const n = readSync(fd, buf, off, buf.length - off, position + off)
-        if (n <= 0) break
-        off += n
-      }
-      return buf.toString('utf8')
-    }
-    if (size <= maxBytes) return readChunk(Buffer.alloc(size), 0)
-    const half = Math.floor(maxBytes / 2)
-    const head = readChunk(Buffer.alloc(half), 0)
-    const tailLen = Math.min(half, size)
-    const tail = readChunk(Buffer.alloc(tailLen), size - tailLen)
-    return `${head}\n…[second-engine 截断：全文 ${size} 字节，仅保留头尾各 ${half} 字节]…\n${tail}`
-  } finally {
-    try { closeSync(fd) } catch { /* best effort */ }
-  }
-}
 
 // ── A（2026-10-25）：唯一收尾路径 ──
 // finalizeTask 与 finalizeReview 原是两套平行实现且行为漂移（复核不读 output、不删
@@ -3256,16 +2931,6 @@ function consultsForTask(task) {
     || ((c.taskId === undefined || c.taskId === null || c.taskId === '') && typeof c.at === 'number' && c.at >= started))
 }
 
-function appendConsultBlock(task) {
-  const fresh = consultsForTask(task)
-  if (fresh.length === 0) return
-  const block = fresh.map(c =>
-    `- ${new Date(c.at).toISOString()} ｜ ${c.task}${c.stuckContext ? ` ｜ 上下文：${c.stuckContext}` : ''}`,
-  ).join('\n')
-  const base = typeof task.output === 'string' ? task.output : ''
-  task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
-    + `[SECOND_ENGINE_CONSULT] 本任务期间收到 ${fresh.length} 条卡点求助：\n${block}\n`
-}
 
 // P2.3（2026-10-28）：finalizeJob 的 extra 是历史旁路 —— 若允许任意字段，等于给
 // 「终态唯一落定」开一个后门（任何调用方都能绕过 status/exitCode 直接改 task）。
@@ -3297,7 +2962,7 @@ function finalizeJob(task, exitCode, status, extra) {
   try { unlinkSync(`${jobOutPath}.live.1`) } catch { /* 轮转备份同一收尾时机删除 */ }
   // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
   // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
-  try { appendConsultBlock(task) } catch (e) { noteErr('consult', e) }
+  try { appendConsultBlock(task, consultsForTask) } catch (e) { noteErr('consult', e) }
   task.endedAt = Date.now()
   finishSpawnAudit(rtOf(task).child(), exitCode, rtOf(task).child()?.signalCode, new Date(task.endedAt).toISOString())
   accountJob(task)
@@ -3322,17 +2987,27 @@ function clearCancelTimers(task) {
 
 // 完成/停滞通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
 function notify(text, title = '第二引擎') {
-  try {
+  return new Promise((resolve) => { try {
     let token = ''
-    try { token = readFileSync(NOTIFY_TOKEN_PATH, 'utf8').trim() } catch { return }
-    if (token === '') return
+    try { token = readFileSync(NOTIFY_TOKEN_PATH, 'utf8').trim() } catch { resolve(false); return }
+    if (token === '') { resolve(false); return }
     const url = `${NOTIFY_URL}?token=${encodeURIComponent(token)}`
       + `&title=${encodeURIComponent(title)}`
       + `&text=${encodeURIComponent(text)}`
-    const req = http.get(url, (resp) => { resp.on('error', () => { /* 响应中途断开：静默 */ }); resp.resume() })
+    const req = http.get(url, (resp) => {
+      let body = ''
+      resp.setEncoding('utf8')
+      resp.on('data', (chunk) => { body += chunk })
+      resp.on('end', () => { try { const parsed = JSON.parse(body); const result = typeof parsed.result === 'string' ? parsed.result : ''; if (/UNAUTHORIZED/i.test(result)) resolve(false); else if (/FOREGROUND_SKIP/i.test(result)) resolve(true); else resolve(/ok/i.test(result)) } catch { resolve(false) } })
+      resp.on('error', () => resolve(false))
+    })
     req.setTimeout(NOTIFY_TIMEOUT_MS, () => { try { req.destroy() } catch { /* best effort */ } })
-    req.on('error', () => { /* 桥没开或拒绝连接：静默 */ })
-  } catch { /* best effort */ }
+    req.on('error', () => resolve(false))
+  } catch { resolve(false) } })
+}
+
+function auditNotifyFailure(task, reason) {
+  try { const dir = boardDir(); mkdirSync(join(dir, 'audit'), { recursive: true }); appendFileSync(join(dir, 'audit', 'notify.jsonl'), JSON.stringify({ at: new Date().toISOString(), id: task?.id, reason }) + '\n') } catch (e) { noteErr('notify-audit', e) }
 }
 
 function notifyTask(task) {
@@ -3348,7 +3023,7 @@ function notifyTask(task) {
   if (task.kind === 'review' && task.reviewDirty !== null && task.reviewDirty !== undefined) {
     text += `｜⚠️ 复核窗口内工作区新增 ${task.reviewDirty.total} 处改动`
   }
-  notify(text)
+  void notify(text).then((ok) => { if (!ok) { task.notifyUndelivered = true; auditNotifyFailure(task, 'app notify rejected or unavailable') } })
 }
 
 // 复核任务收尾：同样统一走 finalizeJob（A，2026-10-25：原先不读 output、不删 outPath，
@@ -3361,40 +3036,12 @@ function finalizeReview(task, status, verdict, error) {
   })
   // 首次落定才做的复核专属动作（#8-10）：摘要进 output（主 AI 必经通道）+ 落盘留档。
   if (first) {
-    try { appendReviewIssuesBlock(task) } catch (e) { noteErr('review-issues-block', e) }
+    try { appendReviewIssuesBlock(task, { clipText }) } catch (e) { noteErr('review-issues-block', e) }
     try { persistReviewRecord(task) } catch (e) { noteErr('review-persist', e) }
   }
   return first
 }
 
-// ── #6（2026-10-25）：复核窗口的工作区证据 ──
-// 能力边界（如实）：两次 git status 快照的差集只能证明「复核窗口内新变脏的路径」，
-// 归因不了写入者（主 AI 并行写、review 进程写、git 自身残留都会计入）；起点已脏的
-// 路径天然被排除，不会把复核前就存在的未提交改动记到复核头上。所以字段叫
-// reviewDirty（证据），不叫 scopeViolation（裁决），也不参与任何状态判定。
-function gitPorcelain(workdir) {
-  return new Promise((resolve) => {
-    try {
-      execFile('git', ['status', '--porcelain'], { cwd: workdir, timeout: 20000 }, (err, stdout) => {
-        if (err !== null) { resolve(null); return }
-        const out = []
-        for (const line of String(stdout).split('\n')) {
-          const row = line.trimEnd()
-          if (row === '') continue
-          let pathPart = row.slice(3).trim()
-          if (pathPart.startsWith('"') && pathPart.endsWith('"')) pathPart = pathPart.slice(1, -1)
-          const arrow = pathPart.indexOf(' -> ')
-          if (arrow !== -1) {
-            out.push(pathPart.slice(0, arrow), pathPart.slice(arrow + 4))
-          } else {
-            out.push(pathPart)
-          }
-        }
-        resolve(out)
-      })
-    } catch { resolve(null) }
-  })
-}
 
 async function captureReviewDirty(task) {
   try {
@@ -3419,32 +3066,6 @@ async function finishReview(task, status, verdict, error, notifyDone = true) {
 // ③ 摘要进 output：主 AI 收单必读 output（与 appendConsultBlock 同通道同先例），
 // 它即使不知道 /api/reviews，下一次 GET /task?id= 也能看到未决问题与接力入口。
 // （dual-board 收件箱被否决：inbox-append --sender 只允许 {lead,codex}，插件写入=冒充协议方。）
-function appendReviewIssuesBlock(task) {
-  const rounds = Array.isArray(task.rounds) ? task.rounds : []
-  const last = rounds.length > 0 ? rounds[rounds.length - 1] : null
-  const issues = last !== null && Array.isArray(last.issues) ? last.issues : []
-  const stopReason = typeof task.stopReason === 'string' ? task.stopReason : ''
-  // 阻断硬档（2026-10-26）：blocked 时首行换成醒目档头（对齐 secondop-panel 的 BLOCK
-  // 语义：不可上线）。且 issues 为空也照发——「verdict=blocked 但没列条目」必须仍可见，
-  // 不能被空列表的提前 return 静默吞掉；其余行（接力入口、问题清单）照旧。
-  const blocked = stopReason === 'blocked'
-  if (issues.length === 0 && !blocked) return
-  const lines = issues.slice(0, 20).map((i) => {
-    // 稳定 id（2026-10-26）：主 AI 就凭这里看到的 id 组织 reply，无需再查别的接口。
-    const id = typeof i?.id === 'string' && i.id !== '' ? `<${i.id}> ` : ''
-    const sev = clipText(String(i?.severity ?? ''), 40)
-    const point = clipText(String(i?.point ?? ''), 200)
-    const sugg = clipText(String(i?.suggestion ?? ''), 200)
-    return `- ${id}[${sev}] ${point}${sugg !== '' ? ` → ${sugg}` : ''}${i?.verified === true ? '（verified）' : ''}`
-  })
-  const base = typeof task.output === 'string' ? task.output : ''
-  task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
-    + (blocked
-      ? `[REVIEW_BLOCKED] 存在阻断级问题，禁止上线：末轮问题 ${issues.length} 条（stopReason=${stopReason}）。\n`
-      : `[REVIEW_ISSUES] 末轮未决问题 ${issues.length} 条（stopReason=${stopReason}）。\n`)
-    + `接力复核：POST /second-engine/api/review {"content":"…","prev":"${task.id}","reply":[{"issueId":"<上方 i<N>>","decision":"accepted|partial|rejected","reason":"…"}]}（reply 任意轮可用，issueId 用上方 i<N>（旧哈希 id 亦可）；不回辩可省略）；历史：GET /second-engine/api/reviews\n`
-    + `${lines.join('\n')}\n`
-}
 
 // ② 落盘记录：单文件单 JSON（0600 原子写）。不含 output 全文（那是头尾截断的 2MB 展示块）。
 function reviewRecord(task) {
@@ -3485,21 +3106,6 @@ function persistReviewRecord(task) {
 }
 
 // 数量截断：目录超 REVIEW_KEEP_FILES 个按 mtime 删最旧。
-function pruneReviewFiles() {
-  let names
-  try { names = readdirSync(REVIEWS_DIR) } catch { return }
-  const files = []
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue
-    const full = join(REVIEWS_DIR, name)
-    try { files.push({ full, mtime: statSync(full).mtimeMs }) } catch { /* 跳过瞬时错误 */ }
-  }
-  if (files.length <= REVIEW_KEEP_FILES) return
-  files.sort((a, b) => a.mtime - b.mtime)
-  for (let i = 0; i < files.length - REVIEW_KEEP_FILES; i += 1) {
-    try { unlinkSync(files[i].full) } catch { /* best effort */ }
-  }
-}
 
 // 年龄清理：挂进 runAutoCleanup 与 handleCleanup 两条既有路径；跳过还在跑的复核。
 function cleanupReviewFiles(cutoff, stats) {
@@ -3552,25 +3158,7 @@ async function handleReviewsList(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-function queryParam(url, key) {
-  try {
-    return new URL(url, 'http://127.0.0.1').searchParams.get(key) || ''
-  } catch { return '' }
-}
 
-// spawn 前给没有版本控制的 workdir 打一个基线提交：Codex 在无 .git 的目录里
-// diff / 回滚都无从下手。幂等（已有 .git 直接跳过）、静默（git 缺失或提交失败都不阻断工单）。
-// 提交身份：本机实证 root 无 ~/.gitconfig（`git commit` 报 Author identity unknown），
-// 那样基线只剩 .git + 暂存区、等于没打成，所以缺身份时用 env 兜底（不覆盖宿主已配的身份）。
-// git 全部走异步 execFile（带超时）：execSync 在大目录下可把整个 Web 宿主卡住
-// 数秒到分钟级（期间全部 HTTP 请求、看门狗、对账 tick 停摆）。退出码 0 → true。
-function gitOk(args, opts = {}) {
-  return new Promise((resolve) => {
-    try {
-      execFile('git', args, { timeout: 60000, ...opts }, (err) => { resolve(err === null) })
-    } catch { resolve(false) }
-  })
-}
 
 async function gitCommitEnv(workdir) {
   const hasEmail = await gitOk(['config', '--get', 'user.email'], { cwd: workdir, timeout: 15000 })
@@ -4063,46 +3651,6 @@ const clipText = (text, limit = REVIEW_RAW_CLIP) => {
 }
 
 // 宽松解析：从自由文本里截取「首个配平的 {...} 块」（跳过字符串内的花括号与转义）。
-function extractFirstJsonObject(text) {
-  const s = String(text === undefined || text === null ? '' : text)
-  const start = s.indexOf('{')
-  if (start < 0) return null
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < s.length; i += 1) {
-    const ch = s[i]
-    if (inString) {
-      if (escaped) escaped = false
-      else if (ch === '\\') escaped = true
-      else if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') { inString = true; continue }
-    if (ch === '{') depth += 1
-    else if (ch === '}') {
-      depth -= 1
-      if (depth === 0) return s.slice(start, i + 1)
-    }
-  }
-  return null
-}
-
-const asText = (value) => {
-  if (typeof value === 'string') return value
-  if (value === undefined || value === null) return ''
-  try { return String(value) } catch { return '' }
-}
-
-// ── issue 身份 v2（2026-10-26）：账本序号 i<N> + 相似度归并 ──
-// v1 用内容哈希当 id（sha256(severity+规范化 point)），实测矛盾：Codex 换个说法重提
-// 同一问题 → 文本变 → 哈希变 → 旧 id 本轮「缺席」被判 resolved、新表述拿新 id——
-// 身份随措辞漂移，账本永远对不上。v2 把身份与内容解耦：
-//   id = 账本内单调递增的 i<N>（首现分配、终身沿用，见 mergeRoundIntoLedger）；
-//   fingerprint = v1 内容哈希降级（仅判「是否原样重列」与谱系留痕）；
-//   跨轮对齐靠归并：显式 continuesIssueId/replacesIssueId 优先，否则相似度判定。
-// id 恒由服务端分配：Codex 回显的 id 字段一律忽略（防漂移/防伪造），它只能通过
-// continuesIssueId **引用** 既有条目（reworded 继承），不能定义 id。
 const ISSUE_PUNCT_TABLE = { '，': ',', '、': ',', '。': '.', '！': '!', '？': '?', '：': ':', '；': ';', '（': '(', '）': ')', '【': '[', '】': ']', '「': '"', '」': '"', '『': '"', '』': '"', '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '－': '-', '～': '~', '《': '<', '》': '>' }
 const ISSUE_PUNCT_RE = /[，、。！？：；（）【】「」『』“”‘’—－～《》]/g
 // 归一化：NFC → 去全部空白 → 全角/中文标点统一为 ASCII → 小写。
@@ -4115,12 +3663,6 @@ function canonicalIssueText(text) {
 }
 // fingerprint：sha256(severity + '\0' + 规范化 point) 前 12 位 hex（v1 的 id 算法原样保留，
 // 只是不再当身份）。仅用于同一条目「文本是否原样重列」的判断与 mergedFrom 谱系留痕。
-function issueFingerprintOf(issue) {
-  return createHash('sha256')
-    .update(`${canonicalIssueText(issue?.severity)}\u0000${canonicalIssueText(issue?.point)}`)
-    .digest('hex')
-    .slice(0, 12)
-}
 
 // ── 相似度归并阈值（提成常量，调参只动这里）──
 // 归并须同时满足：severity 相同、point 3-gram Jaccard ≥ ISSUE_MERGE_THRESHOLD、
@@ -4129,18 +3671,10 @@ function issueFingerprintOf(issue) {
 const ISSUE_MERGE_THRESHOLD = 0.8
 const ISSUE_MERGE_SUGGESTION_THRESHOLD = 0.5
 // 字符 3-gram 集合（规范化后切）；不足 3 字符按整串单 gram 计。
-function issueTrigrams(text) {
-  const s = canonicalIssueText(text)
-  if (s === '') return new Set()
-  if (s.length < 3) return new Set([s])
-  const out = new Set()
-  for (let i = 0; i + 3 <= s.length; i += 1) out.add(s.slice(i, i + 3))
-  return out
-}
 // 字符 3-gram Jaccard：|A∩B| / |A∪B|。两侧皆空（同为空文本）按 1 计、单侧空按 0 计。
 function pointJaccard(a, b) {
-  const ga = issueTrigrams(a)
-  const gb = issueTrigrams(b)
+  const ga = issueTrigrams(a, canonicalIssueText)
+  const gb = issueTrigrams(b, canonicalIssueText)
   if (ga.size === 0 && gb.size === 0) return 1
   if (ga.size === 0 || gb.size === 0) return 0
   let inter = 0
@@ -4149,7 +3683,6 @@ function pointJaccard(a, b) {
 }
 
 // 引用形态：i<N>（v2 账本 id）或 4..64 位 hex（v1 内容哈希——经 ledger aliases 仍可命中）。
-const ISSUE_REF_RE = /^(?:i\d+|[0-9a-f]{4,64})$/
 
 // 旧记录/旧种子里的 issues 可能带 v1 哈希 id：归一化后把旧 id 留在 legacyId 上，
 // 开账（handleReviewCreate 接力）时收进条目 aliases——用旧哈希 ID 回辩仍命中。
@@ -4167,23 +3700,6 @@ function ensureIssueIds(issues) {
 // 沿用/分配（i<N>），措辞改写不再换号。continuesIssueId 是 Codex 声明的继承引用
 //（reworded 前身；replacesIssueId 为等价旧名），只认 i<N>/hex 形态才保留
 //（防把自由文本塞进 ledger 继承链）。
-function normalizeIssue(raw) {
-  const item = raw !== null && typeof raw === 'object' ? raw : {}
-  const issue = {
-    fingerprint: issueFingerprintOf(item),
-    severity: asText(item.severity).trim(),
-    point: asText(item.point).trim(),
-    suggestion: asText(item.suggestion).trim(),
-    // 信息字段（2026-10-25）：区分"跑过"与"目测猜的"。
-    // 刻意不参与收敛判定与 issuesHash —— 自报字段不可信，且状态迁移会被误判为振荡。
-    verified: item.verified === true,
-  }
-  const continues = asText(item.continuesIssueId).trim()
-  const replaces = asText(item.replacesIssueId).trim()
-  const ref = (continues !== '' ? continues : replaces).toLowerCase()
-  if (ref !== '' && ISSUE_REF_RE.test(ref)) issue.continuesIssueId = ref
-  return issue
-}
 
 // ── 复核回辩通道（B 方案，2026-10-26）：主 AI 与 Codex 的真讨论 ──
 // 旧链路是单向批判：prev 只装 Codex 自己上一轮的 issues，主 AI 的立场不在输入里，
@@ -4196,51 +3712,11 @@ function normalizeIssue(raw) {
 // 与 Codex 的裁决轴（withdrawn|upheld|reworded）不互译——主 AI accepted 的一条，Codex
 // 仍可因「问题在当前内容里还在」而 upheld。非法 decision 原样保留（留痕），不参与任何判定。
 // id → ledger 条目的最终解析在 handleReviewCreate（那里才知道可用的 id 池）。
-const REPLY_REASON_CLIP = 2000
-function normalizeReply(raw) {
-  if (!Array.isArray(raw)) return []
-  const out = []
-  raw.forEach((entry, position) => {
-    if (entry === null || typeof entry !== 'object') return
-    const n = Math.trunc(Number(entry.issueIndex ?? position))
-    const indexOk = Number.isFinite(n) && n >= 0
-    const id = asText(entry.issueId).trim().toLowerCase()
-    const idOk = ISSUE_REF_RE.test(id)
-    if (!indexOk && !idOk) return
-    out.push({
-      ...(idOk ? { issueId: id } : {}),
-      ...(indexOk ? { issueIndex: n } : {}),
-      decision: asText(entry.decision).trim().toLowerCase().slice(0, 100),
-      reason: asText(entry.reason).trim().slice(0, REPLY_REASON_CLIP),
-    })
-  })
-  return out
-}
 
 // 清洗 Codex 的逐条裁决 [{issueId?, issueIndex?, verdict, reason}]：verdict 收敛小写；
 // 不在 {withdrawn, upheld, reworded} 里的取值原样保留（落盘可查），但只有严格
 // 等于 'upheld' 才参与终止判定。issueId 优先、issueIndex 兼容（旧式只有 index 的
 // 输出照常收）；同 id（或同 index）重复后者胜。
-const RESPONSE_REASON_CLIP = 2000
-function normalizeResponses(raw) {
-  if (!Array.isArray(raw)) return []
-  const byKey = new Map()
-  for (const entry of raw) {
-    if (entry === null || typeof entry !== 'object') continue
-    const n = Math.trunc(Number(entry.issueIndex))
-    const indexOk = Number.isFinite(n) && n >= 0
-    const id = asText(entry.issueId).trim().toLowerCase()
-    const idOk = ISSUE_REF_RE.test(id)
-    if (!indexOk && !idOk) continue
-    byKey.set(idOk ? `id:${id}` : `#${n}`, {
-      ...(idOk ? { issueId: id } : {}),
-      ...(indexOk ? { issueIndex: n } : {}),
-      verdict: asText(entry.verdict).trim().toLowerCase().slice(0, 100),
-      reason: asText(entry.reason).trim().slice(0, RESPONSE_REASON_CLIP),
-    })
-  }
-  return [...byKey.values()]
-}
 
 // responses 的 issueIndex 兼容解析：下标指上一轮（首轮即接力种子）的意见，能对上就
 // 就地补稳定 id（补齐后再进 ledger 与落盘，按 id 可追）。已带 issueId 的原样通过；
@@ -4256,13 +3732,6 @@ function resolveResponseIds(responses, prevIssues) {
 
 // 三字段文本指纹（severity/point/suggestion 原文拼接）：textHistory 变化检测用——
 // 归并进同一账本条目但措辞/建议微调时追记一条历史，而不是无感覆盖。
-function issueTextFingerprint(issue) {
-  return [
-    String(issue?.severity ?? '').trim(),
-    String(issue?.point ?? '').trim(),
-    String(issue?.suggestion ?? '').trim(),
-  ].join('\u0000')
-}
 
 // ── 跨轮 issue ledger（2026-10-26 v2）：i<N> 序号账本 + 相似度归并 ──
 // 条目：{id:'i<N>', fingerprint, severity, point, suggestion, firstRound, lastRound,
@@ -4275,64 +3744,9 @@ function issueTextFingerprint(issue) {
 // 接续上一调用 ledger 的最大 lastRound，跨调用单调递增，讨论谱系一条线可追。
 // v1 记录迁移（normalizeLedgerEntries）：无 i<N> id 的条目按首现顺序分配 i1..iN，
 // 原哈希 id 进 aliases——用旧哈希 ID 回辩/引用仍命中（查 aliases）。
-const LEDGER_ID_RE = /^i\d+$/
-function normalizeLedgerEntries(raw) {
-  const ledger = (Array.isArray(raw) ? raw : []).filter((e) => e !== null && typeof e === 'object')
-  let seq = 0
-  for (const e of ledger) {
-    if (typeof e.id === 'string' && LEDGER_ID_RE.test(e.id)) {
-      seq = Math.max(seq, Number(e.id.slice(1)) || 0)
-      continue
-    }
-    // v1 条目（哈希 id 或缺 id）：按首现顺序分配新号；原哈希收进 aliases 供旧引用命中。
-    const legacy = typeof e.id === 'string' ? e.id.trim().toLowerCase() : ''
-    seq += 1
-    e.id = `i${seq}`
-    if (/^[0-9a-f]{4,64}$/.test(legacy)) {
-      if (!Array.isArray(e.aliases)) e.aliases = []
-      if (!e.aliases.includes(legacy)) e.aliases.push(legacy)
-    }
-  }
-  for (const e of ledger) {
-    if (typeof e.fingerprint !== 'string' || !/^[0-9a-f]{12}$/.test(e.fingerprint)) e.fingerprint = issueFingerprintOf(e)
-    if (!Array.isArray(e.aliases)) e.aliases = []
-    if (!Array.isArray(e.mergedFrom)) e.mergedFrom = []
-    if (!Array.isArray(e.textHistory) || e.textHistory.length === 0) {
-      e.textHistory = [{ round: Number.isFinite(e.firstRound) ? e.firstRound : 0, severity: asText(e.severity), point: asText(e.point), suggestion: asText(e.suggestion) }]
-    }
-    if (e.status !== 'open' && e.status !== 'resolved' && e.status !== 'disputed') e.status = 'open'
-    if (!Number.isFinite(e.firstRound)) e.firstRound = 0
-    if (!Number.isFinite(e.lastRound)) e.lastRound = e.firstRound
-  }
-  return ledger
-}
 
 // id/alias → 条目 的索引（回辩与 responses 解析共用：旧哈希引用经 aliases 命中）。
-function ledgerIndex(ledger) {
-  const byRef = new Map()
-  for (const e of Array.isArray(ledger) ? ledger : []) {
-    byRef.set(e.id, e)
-    for (const a of e.aliases) if (!byRef.has(a)) byRef.set(a, e)
-  }
-  return byRef
-}
 
-function ledgerEntryOf(id, issue, chainRound, inheritedFrom) {
-  return {
-    id,
-    fingerprint: issue.fingerprint,
-    severity: issue.severity,
-    point: issue.point,
-    suggestion: issue.suggestion,
-    firstRound: chainRound,
-    lastRound: chainRound,
-    status: 'open',
-    aliases: [],
-    mergedFrom: [],
-    textHistory: [{ round: chainRound, severity: issue.severity, point: issue.point, suggestion: issue.suggestion }],
-    ...(inheritedFrom !== undefined ? { inheritedFrom } : {}),
-  }
-}
 
 // 每轮 parse 之后、状态判定之前：把本轮 issues 归并进 ledger（就地给 issue.id 赋值）。
 // 归并规则（按序）：
@@ -4460,11 +3874,6 @@ function mergeRoundIntoLedger(task, round, issues, responses) {
 // ledger 终止判据（纯函数）：open/disputed 清零 且 本轮 responses 无 upheld → converged。
 // 取代旧的下标版 dialogueConverged（「issues 无新增且无 upheld」）：旧判据下「原样重列
 // 但不坚持」也算收敛；账本口径更严——问题还挂在 issues 里就是未了结。
-function ledgerConverged(ledger, responses) {
-  const open = (Array.isArray(ledger) ? ledger : []).some((e) => e?.status === 'open' || e?.status === 'disputed')
-  const upheld = (Array.isArray(responses) ? responses : []).some((r) => r?.verdict === 'upheld')
-  return !open && !upheld
-}
 
 // ── 阻断硬档（2026-10-26，对齐 secondop-panel 的 BLOCK 档）──
 // 语义：不可上线（涉及钱 / 数据丢失 / 安全漏洞）⇒ 必须停手，不是「再来一轮看看」。
@@ -4484,41 +3893,6 @@ function isBlockedVerdict(verdictText, issues) {
 // issues 必须是数组（缺键视为解析失败：宁可报错也不误判「已收敛」）。
 // responses 可缺省：旧格式（无该键）照常解析，缺失 = 未回应，恒为 []。
 // blocked 时返回值另带 blocked:true，verdict 恒为归一化后的 'blocked'。
-function parseReviewJson(text) {
-  const block = extractFirstJsonObject(text)
-  if (block === null) return { ok: false, raw: clipText(text) }
-  let obj
-  try { obj = JSON.parse(block) } catch { return { ok: false, raw: clipText(block) } }
-  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return { ok: false, raw: clipText(block) }
-  if (!Array.isArray(obj.issues)) {
-    // 容错（2026-10-26 实测）：第 2 轮 prompt 带上一轮 issues 时，模型可能直接输出
-    // 单条 issue 对象 {"severity":..,"point":..} 而不是 {issues:[..],verdict} 容器。
-    // 这是合法 JSON、信息也完整，只是缺外壳 —— 判 unparsed 会让整轮复核白跑。
-    if (obj !== null && typeof obj === 'object' && obj.point !== undefined) {
-      const issues = [normalizeIssue(obj)]
-      const blocked = isBlockedVerdict(obj.verdict, issues)
-      return { ok: true, issues, verdict: blocked ? 'blocked' : 'issues-found', ...(blocked ? { blocked: true } : {}) }
-    }
-    if (obj !== null && typeof obj === 'object' && obj.issues !== null && typeof obj.issues === 'object') {
-      const issues = [normalizeIssue(obj.issues)]
-      const blocked = isBlockedVerdict(obj.verdict, issues)
-      return { ok: true, issues, verdict: blocked ? 'blocked' : 'issues-found', ...(blocked ? { blocked: true } : {}) }
-    }
-    return { ok: false, raw: clipText(block) }
-  }
-  const issues = obj.issues.map(normalizeIssue)
-  const verdict = asText(obj.verdict).trim()
-  const blocked = isBlockedVerdict(verdict, issues)
-  // 回辩通道：responses 缺失 = 未回应；旧格式（无该键）照常解析，恒为 []。
-  const responses = normalizeResponses(obj.responses)
-  return {
-    ok: true,
-    issues,
-    verdict: blocked ? 'blocked' : (verdict !== '' ? verdict : (issues.length === 0 ? 'converged' : 'issues-found')),
-    ...(blocked ? { blocked: true } : {}),
-    responses,
-  }
-}
 
 // 处境注入（2026-10-25）：review 进程拿 danger-full-access + approval never，
 // 但此前的 prompt 只有"审查以下产出"——cwd、轮次、无记忆、输出会被 JSON 解析全都没有。
@@ -4647,25 +4021,9 @@ function readReviewOut(outPath) {
 
 // 从 codex exec 输出尾部抽 "tokens used\nN"（codex 自报的累计用量）。
 // 抽不到返回 0 —— 宁可少算也不误停（硬预算语义是"到量才停"，不是"猜一个"）。
-function parseTokensUsed(text) {
-  if (typeof text !== 'string' || text === '') return 0
-  const m = /tokens used\s*\n?\s*([\d,]+)/i.exec(text)
-  if (m === null) return 0
-  const n = Number(m[1].replace(/,/g, ''))
-  return Number.isFinite(n) && n > 0 ? n : 0
-}
 
 // 振荡检测用的稳定指纹：只取 issues 的三个语义字段，排序后哈希（顺序无关）。
 // 两个 AI 在「主张 X / 反对 X」之间来回时，同一批 issues 会原样回来 → 命中即判循环。
-function issuesHash(issues) {
-  const norm = (Array.isArray(issues) ? issues : []).map((i) => [
-    String(i?.severity ?? '').trim(),
-    String(i?.point ?? '').trim(),
-    String(i?.suggestion ?? '').trim(),
-  ])
-  norm.sort((a, b) => (a.join('\u0000') < b.join('\u0000') ? -1 : 1))
-  return createHash('sha256').update(JSON.stringify(norm)).digest('hex').slice(0, 16)
-}
 
 // 服务层自动循环：每轮 spawn → 解析 → 按 issues/轮数推进，cancelled 即熔断。
 async function runReview(task, active) {
@@ -4752,7 +4110,7 @@ async function runReview(task, active) {
         return
       }
       if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
-      const parsed = parseReviewJson(raw)
+      const parsed = parseReviewJson(raw, { isBlockedVerdict, clipText })
       if (!parsed.ok) {
         task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: parsed.raw })
         await finishReview(task, 'error', 'unparsed', code === 0 ? '未能从复核输出解析出 JSON' : `codex 退出码 ${code}`)
@@ -5205,6 +4563,26 @@ async function handleConfigRoot(req, res) {
   return send(res, { ok: false, error: 'method not allowed' }, 405)
 }
 
+async function handleHintToggles(req, res) {
+  if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') {
+    return send(res, { ok: true, toggles: readHintToggles() })
+  }
+  if (req.method !== 'POST') return send(res, { ok: false, error: 'method not allowed' }, 405)
+  try {
+    const body = await readBody(req)
+    const fields = ['vocabulary', 'interruption', 'mechanical']
+    if (!fields.some((field) => body[field] !== undefined)) {
+      return send(res, { ok: false, error: '至少提供一个提示开关字段' }, 400)
+    }
+    for (const field of fields) {
+      if (body[field] !== undefined && typeof body[field] !== 'boolean') {
+        return send(res, { ok: false, error: `${field} 必须是布尔值` }, 400)
+      }
+    }
+    return send(res, { ok: true, toggles: writeHintToggles({ ...readHintToggles(), ...body }) })
+  } catch (e) { return send(res, { ok: false, error: errMsg(e) }) }
+}
+
 // ── /consult、/consults：Codex 卡点求助信道 ──
 // 供第二引擎（Codex）在卡住时把上下文交给主 AI；内存队列，不落盘。
 async function handleConsultCreate(req, res) {
@@ -5484,10 +4862,6 @@ const VERSION_CACHE_TTL_MS = 60 * 60 * 1000
 let latestVersionCache = { at: 0, version: '' }
 
 // 取首个 x.y.z：'codex-cli 0.155.1'、'OpenAI Codex v0.155.1'、'v0.156.0' 都能吃。
-function parseVersion(text) {
-  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(text === undefined || text === null ? '' : text))
-  return m === null ? null : `${m[1]}.${m[2]}.${m[3]}`
-}
 
 // 三段数字比较：a>b → 1，a<b → -1，相等或任一侧不可解析 → 0。
 function compareVersions(a, b) {
@@ -5665,7 +5039,27 @@ export function apply(ctx) {
   ctx.on('session/event', async (session, event) => {
     if (event?.type !== 'turn/end') return
     const sessionId = session?.id
-    if (typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
+    const hintToggles = readHintToggles()
+    if (hintToggles.mechanical && typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
+    // 用户打断的机械标记（2026-11-02 实测）：turn/end.reason = {kind:'aborted', reason:{kind:'user'}}。
+    // 本会话 196 个 turn 里 15 次，比任何文本匹配可靠 —— 记下来供下一轮 mood-watch 用。
+    try {
+      const rs = event?.data?.reason
+      // 必须同时校验内层：真实结构是 {kind:'aborted', reason:{kind:'user'}}。
+      // 只查外层会把超时/插件取消/进程退出也当用户打断（Codex 评估 2026-11-02 指出）。
+      const byUser = rs !== null && typeof rs === 'object' && rs.kind === 'aborted'
+        && rs.reason !== null && typeof rs.reason === 'object' && rs.reason.kind === 'user'
+      if (hintToggles.interruption && byUser && typeof sessionId === 'string' && sessionId) {
+        // 只留窗口内的，避免数组无限增长；单次打断不提示，靠频次判断「方向是否持续偏」
+        const nowAb = Date.now()
+        const kept = (moodWatchAborts.get(sessionId) || []).filter((t) => nowAb - t < MOOD_ABORT_WINDOW_MS)
+        kept.push(nowAb)
+        moodWatchAborts.set(sessionId, kept)
+        // 淘汰最早的 key（Map 迭代顺序 = 插入顺序），与 policy-watch.trimPolicyWatchMaps 同款
+        while (moodWatchAborts.size > MOOD_KEEP_LIMIT) moodWatchAborts.delete(moodWatchAborts.keys().next().value)
+        while (moodWatchLastAt.size > MOOD_KEEP_LIMIT) moodWatchLastAt.delete(moodWatchLastAt.keys().next().value)
+      }
+    } catch (e) { noteErr('mood-watch-abort', e) }
   }, { global: true })
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     // 检测挂这里而不是 session/event：后者在 dsh-session/lib/index.js:1585 有
@@ -5673,10 +5067,33 @@ export function apply(ctx) {
     // 就永远收不到。agent/pre-step 是每次请求必经，且广播到**所有会话**（2026-10-31
     // 实测 2 个会话均触发）。agent.id 就是 session id（同次探针实测，两者同值）。
     const sessionId = agent?.id
-    const pending = typeof sessionId === 'string' ? policyWatchPending.get(sessionId) : null
-    if (typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
-    const decision = await next()
+    const hintToggles = readHintToggles()
+    const pending = hintToggles.mechanical && typeof sessionId === 'string' ? policyWatchPending.get(sessionId) : null
+    if (!hintToggles.mechanical && typeof sessionId === 'string') policyWatchPending.delete(sessionId)
+    if (hintToggles.mechanical && typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
+    let decision = await next()
     if (decision.kind === 'reject') return decision
+    // mood-watch（2026-11-02）：用户纠错/打断的机械信号 → 注入一条模拟用户消息。
+    // 与 policy-watch 并列、独立触发；不改变判定，只让「可能在纠正」每轮可见一次。
+    if ((hintToggles.vocabulary || hintToggles.interruption) && typeof sessionId === 'string' && sessionId) {
+      try {
+        const nowAb2 = Date.now()
+        const recentAborts = (moodWatchAborts.get(sessionId) || []).filter((t) => nowAb2 - t < MOOD_ABORT_WINDOW_MS)
+        // 顺序：词表命中优先（更具体），abort 频次只在词表无命中时兜底。
+        // 否则「停一下」会被 abort 分支吃掉，换成"连续被打断"的文案（Codex 评估指出）。
+        const textHit = hintToggles.vocabulary ? diagnoseMood(lastUserText(decision.messages)) : null
+        const abortHit = hintToggles.interruption && recentAborts.length >= MOOD_ABORT_TRIGGER
+          ? { kind: 'interrupt', reason: `最近 ${Math.round(MOOD_ABORT_WINDOW_MS / 60000)} 分钟内被你打断 ${recentAborts.length} 次（单次不算，连续才算方向偏）` }
+          : null
+        const hit = textHit !== null ? textHit : abortHit
+        const nowMs = Date.now()
+        // stop 是明确叫停，必须立刻生效，不受冷却压制（Codex 评估指出）。
+        if (hit !== null && (hit.kind === 'stop' || nowMs - (moodWatchLastAt.get(sessionId) || 0) >= MOOD_COOLDOWN_MS)) {
+          moodWatchLastAt.set(sessionId, nowMs)
+          decision = { ...decision, messages: [...decision.messages, buildMoodMessage(hit, `mood-watch-${sessionId}`)] }
+        }
+      } catch (e) { noteErr('mood-watch', e) }
+    }
     if (!pending) return decision
     const now = Date.now()
     const lastDelivered = policyWatchDelivered.get(sessionId) || 0
@@ -5766,6 +5183,7 @@ export function apply(ctx) {
       // #8-10：复核历史（落盘记录倒序；内存 tasks Map 重启即失，这里是持久真值）。
       { kind: 'exact', method: 'GET', path: '/second-engine/api/reviews', desc: '复核历史（~/.codex/reviews 持久化记录，倒序；?limit=）', handler: handleReviewsList },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/config', desc: '读/写插件配置 { reviewRounds: 1|3|5 }', handler: handleConfigRoot },
+      { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/hint-toggles', desc: '读/写提示开关 { vocabulary, interruption, mechanical }', handler: handleHintToggles },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/consult', desc: 'Codex 卡点求助入队（内存 20 条 + 弹 App 通知）', handler: handleConsultCreate },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/consults', desc: '求助列表（不脱敏，给主 AI 收卷）', handler: handleConsultsList },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/version', desc: '本机 codex 版本 vs GitHub 最新 release（updateAvailable）', handler: handleVersion },

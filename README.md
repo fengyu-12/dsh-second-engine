@@ -159,6 +159,18 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
   <br>右：<b>Pi 引擎</b> —— 同一个聊天桥换个引擎，模型与思考档位同样可切。</sub>
 </p>
 
+### 提示开关（默认全关）
+
+设置页「浏览器聊天桥」和「会话清理」之间有一张**提示开关**卡，三个独立开关：
+
+| 开关 | 什么时候会提示 |
+|---|---|
+| 纠正检测 | 用户指出问题时（同一轮最多一次，90 秒冷却） |
+| 打断检测 | 10 分钟内被用户打断 ≥2 次（单次不算） |
+| 停滞检测 | 同命令同输出 2 次，或连续 4 步无推进 |
+
+提示以 `[MOOD_WATCH]` / `[POLICY_WATCH]` 标记追加到下一轮，**只报机械信号、不下结论**，是否派单仍由模型自己判断。三个开关**默认全部关闭**，只影响是否注入提示，不影响派单、互审、看板等任何功能。
+
 ## 装之前要准备什么
 
 - DeepSeek Harness（新版 App + Web）
@@ -352,53 +364,19 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.5）
+## 支持能力一览（v3.8.6）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **3.8.5 编排与安全增强** | ✅ 3.8.5 | ① **人审证据门**：`complete --reviewed-by human` 的 `--result` 必须含 `$ 命令` 行 + `exit=<非负整数>` 行（不兼容变更；`--keep` 路径不变）② **看板**：`pending_review`（`--keep` 留板待审、人审后出板，顺带解决 `--keep` 无合法出板路径）、`createdAt` 写后不可改、`failure` 派单失败原因、`child_pid/child_start` 跨重启落盘 + 独立 60s 死持有清扫（ESRCH+starttime，mtime 只告警）③ **安全底座**：spawn 收窄 workdir + `ulimit -f/-u/-t`（`exec` 保 pid）+ 访问审计 JSONL（0600、argv 脱敏）④ **成本**：跨工单 token 账本 + `SECOND_ENGINE_TOKEN_BUDGET` 派单门禁（超预算 429，unknown 单独计数）⑤ **Executor 端口预埋**：`src/engine/task-port.js`（normalize/Report/capabilities），不绑定官方版本 ⑥ **修复**：appserver 下 `/api/task` 的 `model` 生效、progress 文本去重、桥「点太快中断失效」重试、config 校验前移（P2-1） |
-| **3.8.2 修复批** | ✅ 3.8.2 | 看板 `set` 不能再直接写终态（补完人审门禁的另一半，此前可从 pending 直达 completed 且不写审计）；`policy-watch` 把 `norm_err()` 接进 M1 判据、清掉死参数/死变量、zstd 缺失走干净退出而非抛 traceback；Web 桥接通宿主模型清单（`BRIDGE_HOST_API_URL` 未注入时 models 恒为空，此前下拉只有一个）并恢复会话内切模型/切思考（`initialize` 补 `experimentalApi` 能力，此前被 app-server 拒绝）；绕圈提醒两处（pending 读取顺序 + 去掉「文件一长就丢弃结果」的快照校验，此前提醒 8 小时发不出一次），现已实测能注入且同命中不重复；切引擎前检查运行中工单（409 + `force:true`） |
-| **协作信号检测的运行时加固** | ✅ 3.8.1 | 三条修正一并落地：① 脚本路径改为按模块自身位置定位，不再写死安装目录（换路径安装即失效的老问题）；② 启动前探测解释器可用性，缺 Python 只关掉检测、不影响正常对话，且错误留痕而非静默；③ 每会话 30s 最小间隔 + 会话文件 mtime/size 快照去重（同一状态不重复扫），状态落盘改原子写。注入的消息 role 固定为 `user`、来源标 `policy-watch` |
-| **桥配置写入加固** | ✅ 3.8.1 | 原实现有两个坑：并发写互相踩、失败分支还会把半截临时文件 `rename` 成正式配置。现改为按配置路径串行化 + TOML 写前写后双校验（python `tomllib`，fail-closed）+ 临时文件 `pid.时间戳.随机串` + 失败只删临时文件。已验故障注入下正式文件 MD5 逐字节不变、10 并发最终文件完整可解析 |
-| **看板正确性修复** | ✅ 3.8.1 | 两条状态机漏洞：① 依赖项完成后被 `--keep`/人审移出板，下游仍被判 `blocked`（现从 `audit/completed-<月>.jsonl` 补齐已终结集合）；② 只有 `complete` 有终态检查，`set`/`abandon` 能把 `completed` 改回 `pending`（现终态一律不可离开） |
-| **多引擎协作策略 + 无效重试信号检测** | ✅ 3.8.0 | `tools/policy-watch.py` 从会话事件流算三条信号（同一命令+同一错误类连续失败 ≥2 / 同一文件编辑振荡 A→B→A / 连续 4 步无状态推进，跳过等待类调用），退出码 **10 = 命中**；已验正向 3/3 命中、负向 4 类反例不报。配「二分自答」判据决定要不要把活外置给第二引擎 |
-| **skill 分层（正文 400 行 + `references/` 4 个按需文件 + 读取闸门表）** | ✅ 3.8.0 | 手册正文只留判据与入口，细节按需要时才读，避免手册本身吃掉上下文 |
-| **出板人审门禁 + 审计留痕** | ✅ 3.8.0 | `complete` 须 `--reviewed-by human`（Agent 自报不算），自动化用 `--keep` 免审留在板且**不伪造** human 标记；出板记录落 `audit/completed-<月>.jsonl` |
-| **board `steps` 字段** | ✅ 3.8.0 | 长任务拆 ≤20 步（每项 ≤200 字符 / 总长 ≤4000），可中断可续跑，不参与状态机 |
-| **board N 角色泛化** | ✅ 3.8.0 | 角色清单进 `board.json.roles`、`inbox-<role>` 动态生成、`dispatch.sh --to ROLE`、`claim --owner` 从 roles 取合法值 |
-| **唤醒层（实验端点）** | ⚠️ 3.8.0 | `POST /api/_exp/wake` 用 `session.append` + `agents.resume` 把消息递进指定会话；需 `session-<uuid>` 前缀、provider 只能用 DSH 侧（Codex keyring 的 id 会 `NO_ADAPTER`）；转正留后续版本 |
-| **UTF-8 跨 chunk 分帧修复** | ✅ 3.8.0 | app-server 与 Pi 桥改用 `node:string_decoder` 的 `StringDecoder`，中文正文不再在 chunk 边界被切成 U+FFFD |
-| **Pi 模型下发前校验** | ✅ 3.8.0 | 请求的 `model` 不在可用集合时返回 400 并列出可选值；探测失败时放行（不因探测抖动拦住正常下发） |
-| **协作模式三档**（collab） | ✅ 3.5.0 | 普通复核 / 协作提议 / 长任务配合 + 自定义第四组合。两位各自独立：`voice`（允许它主动提议）/ `longtask`（分阶段任务直接开长会话）；优先级 环境变量 > `~/.dsh/second-engine-collab.txt` > 默认。切 `voice=on` 立即写 `~/.codex/AGENTS.md` 的 voice 段、切回即删（文件 0600）。悬浮球面板与设置页都能切 |
-| **双引擎能力契约 + Pi 运行时接入** | ✅ 3.7.0 | 面板按引擎能力渲染，前端零改动 |
-| 插件自身版本提示 | ✅ 3.1.2 | `/api/plugin-version` 读自身 `package.json` 与 GitHub releases 比对（成功缓存 1h / 失败 10min）；**无更新时界面完全不出现**，有更新才在设置卡徽标与浮动球红点提示，只提示不自动装 |
-| **首 token 看门狗（180s）** | ✅ 3.0.0 | app-server 模式迟迟不回第一个事件时不再无限挂起——超时即判失败并报错，工单不会静默卡死 |
-| **终态方法集合** | ✅ 3.0.0 | 过滤迟到的旧 turn 事件，避免上一轮结果覆盖当前工单 |
-| **上下文占用率多版本兜底** | ✅ 3.0.0 | `contextUsageRatio` 在多种 app-server 版本上都能算出（取不到时降级，不报错） |
-| **会话内切模型** | ✅ 3.0.0 | `thread/settings/update`：不重启即可在会话里换模型 |
-| 配置保留段（切提供方不丢） | ✅ v1.2.1 修复 | 重写 `config.toml` 时改用**黑名单**：只排除模板自有的 `[model_providers.*]` 与 `[memories]`，其余段一律原样保留；此前白名单式重写会把 `[features]` / `[tui]` / `[projects.*]` 静默抹掉且不报错 |
-| 浮动球交互 | ✅ v1.2 | 指针拖动（鼠标 / 触屏 / 触控笔通用）+ 松手吸附最近左右边缘 + 纵向位置记忆；面板内显示 Codex 版本与新版本提示 |
-| scope-check 脏工作区 | ✅ v1.2 修复 | 交活时记 `write_scopes` 的 sha256 快照，交付后比对——「交活前就脏、之后又被改」不再漏报；无 git 时降级为哈希校验 |
-| Codex 功能表 | ✅ v1.2 | `skills/second-engine/Codex功能表.md` 随包分发 |
-| 提供方切换 / 工单 / 双向互审 | ✅ | DeepSeek / 智谱直连，chat 协议上游经翻译桥自动挂接；切换不丢用户配置（sandbox、MCP） |
-| AGENTS.md 联网搜索三档降级 | ✅ v2 | 原生 web_search 优先 → Exa MCP 备胎 → 全无则凭已有知识完成任务并标注「未经联网核实」；v1 用户自动原位升级 |
-| tools/t-tool.sh | ✅ 实测 | tmux 交互窗口：屏幕快照、哨兵式等待、`run` 退出码回传、owner 防串台；**依赖 tmux**（`apt install tmux`） |
-| tools/wait-task.sh | ✅ 实测 | 工单完成阻塞等待，退出码语义完整；配后台 job 使用，完成通知自动唤醒等待者 |
-| Exa MCP（可选外挂） | ⚠️ 限额 | `https://mcp.exa.ai/mcp` 匿名可用但有隐性限额（偶发 rate limit，重试即可）；正式用去 exa.ai 注册免费 key |
-| 面板「联网搜索与 MCP」分区 | ✅ v0.3.4 | web_search 开关（live↔disabled）与 MCP 增删直接落 config.toml；八项验收 + 切提供方持久性 + 智谱端到端原生搜索实测通过 |
-| 工单审批策略 | ✅ v0.3.4 修复 | `approval_policy="never"` 固定写入 config；此前字段丢失曾致写工作副本外目录的工单无限挂起 |
-| 面板交互 | ✅ v1.0 | 分区折叠（右上角「展开/收回」带框文字按钮 + 标题行整行可点）、抽屉限高 78vh 内滚、**工单列表固定最近 5 条**（面板高度恒定，头部 × 不被挤掉）——手机实测确认 |
-| **本地翻译桥**（实验性） | ⚠️ 实验性 | `responses → chat completions` 协议转换，让仅有 chat 协议的提供方（部分中转 / 自建网关）也能接入 Codex |
+| **3.8.6 模块拆分 + 提示开关** | ✅ 3.8.6 | ① `src/index.js` **5860 → 5225 行**，拆出 11 个模块（core / io / state / cleanup / normalize / parse / git / policy-watch / mood-watch / constants / hint-toggles），冒烟从 39 项扩到 **57 项**（新增 `index-boot` / `apply-boot`：模块可导入、35 条路由注册、引擎契约在位）② **设置页「提示开关」卡**：纠正 / 打断 / 停滞三项，默认全关，每项标明触发阈值，Pi 与 Codex 两个面板都有 ③ **`mood-watch`**：用户纠错或打断时注入 `[MOOD_WATCH]` 机械量，只报事实不下结论 ④ **Pi 模型记忆**：按 provider 记住上次选的模型，切提供方时自动恢复 ⑤ 修 `piProvidersSnapshot` 非激活行模型显示（不再空 / 取第一个）⑥ 新增 `tools/dep-graph.mjs`（acorn AST 依赖图）与 `tools/split-verify.py`（拆分保真校验） |
+
+> 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## Codex 升到 0.166.0 之后
 
 Codex 升到 **0.166.0**，命令面新增 `review` / `mcp` / `plugin` / `update` / `migrate-nfs-db` 等子命令。
 
 ⚠️ 版本号、feature 开关、逐版实测结论**不写在 README**——这类结论会随版本腐化。要看现值查随包分发的 `skills/second-engine/Codex功能表.md`；升级后的破坏性检验判据见 `references/ref-codex-upgrade.md`。
-
-## 版本记录（择要）
-
-最新版本 **3.8.5** —— 编排与安全增强版（跳过 3.8.3/3.8.4，改动跨度大）：人审证据门、看板待审/创建时间/失败原因/死持有清扫、spawn 限额与访问审计、跨工单 token 账本与派单门禁、Executor 端口预埋；另修 appserver `model` 参数、progress 文本重复、桥快速中断、config 部分成功报失败。上一版 3.8.2 是修复批：看板人审门禁补完之后被绕过的另一半、`policy-watch` 三处（归一化/死码/退出码）、Web 桥两处（模型清单通道、会话内切模型与切思考的能力声明）、绕圈提醒的读取顺序、切引擎前的运行中工单检查。完整版本历史见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## 有哪些坑要提前知道（已知限制）
 

@@ -19,7 +19,7 @@ Pi 不是 Codex，**下面每个路径都不同**：
 ## 2. 装法与工作区（这三件决定"它到底在哪工作"）
 
 - 装：`npm i -g @earendil-works/pi-coding-agent`（v1.4.0，约 22 MB，Node 直跑）。凭据按 `<PROVIDER>_API_KEY` 取，模型直接复用已有 key，不必再装第二个重型 CLI。
-- **桥默认工作区 `~/pi-workspace`**，`PI_BRIDGE_CWD` 可覆盖；刻意不与 Codex 的工程目录混用（会话、AGENTS.md 都跟着走）——**不要复用 Codex 的 `~/proj`**。
+- **桥默认工作区 `~/pi-workspace`**，`PI_BRIDGE_CWD` 可覆盖；刻意不与 Codex 的工程目录混用（会话、AGENTS.md 都跟着走）——**不要复用 Codex 的 `/root/proj`**。
 - 因此 **Pi 会话落在 `~/.pi/agent/sessions/<该 cwd>/`** —— 找某次 Pi 会话要先确认当时桥的 cwd，不是全局一个目录。同理 AGENTS.md 按 cwd 逐级向上找，全局那份在 `~/.pi/agent/AGENTS.md`。
 - **会话落盘**：桥原来带 `--no-session`（网页对话不落盘）。去掉了，桥会话与 CLI 同源落 `~/.pi/agent/sessions/<cwd>/`。**桥的 cwd = 工作区**（`PI_BRIDGE_CWD`，默认 `~/pi-workspace`），它同时决定会话分区与项目级 AGENTS.md 的向上查找起点。
 
@@ -71,3 +71,13 @@ Pi = runtime `get_state`（Pi 桥 `/api/runtime-settings`）→ 配置默认（`
 ## 10. UI 缺陷修复记录（别再按旧现象推断引擎能力）
 
 > 判据：**引擎能力看 CLI/配置文件，不看 Web 控件列几个**。⚠️ **2026-10-30 更新**：那个「下拉只显示当前值」的 UI 缺陷**已修复**（`bridge/web/server.mjs` 的 `/api/runtime-settings` 现返回 `models`，实测宿主 `/api/models` 返 15 个）。
+
+## 11. 新建 / 切换会话：怎么用（2026-11-02 实测）
+
+**不用改插件**，三条路按需选：
+
+| 想要 | 怎么做 |
+|---|---|
+| 命令行新建会话 | `pi -p --session-id <id> "首条消息"` —— 缺失即建（实测回 `Warning: No project session found with id '...'; creating a new session with that id.`，落盘 `<UTC时间戳>_<id>.jsonl`）。同族参数：`--fork <id>` 分叉、`--session <id>` 指定、`--no-session` 不落盘、`--name <名>` 命名 |
+| Web 界面开新会话 | 点「新会话」→ 发首条消息即可。按钮本身只清屏（`newThread()` 置 `threadId=null`、不发请求），**新会话由首条消息触发创建**——实测：点按钮无新文件，发完才出现新 jsonl |
+| 桥内切换已有会话 | RPC `new_session`（可带 `parentSession` 做 fork，完成即 `rebindSession()`）/ `switch_session`，见 `modes/rpc/rpc-mode.js:334/474`。桥目前**没有暴露这两个端点**，所以从 Web 端点走不到；只有需要「点按钮立刻建会话」时才要加 `POST /api/new-session` → `rpc.command('new_session', {})`，日常不必改 |

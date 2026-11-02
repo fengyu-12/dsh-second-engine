@@ -153,7 +153,7 @@ bash tools/dual-board/board.sh complete t2 --result "…" --keep
 ```
 人审（`--reviewed-by human`）的 `--result` 必须包含独立的 `$ <命令>` 与 `exit=<非负整数>` 行，否则退出码 2；未带人审的 `--keep` 保持原有文本兼容，此结构校验不证明命令真实执行。
 
-区别：`--keep` 是**留板待审**（面板显示待审），`--reviewed-by human` 是**人确认**（写审计并出板）。二者不可混用；`--keep` 的任务出板目前只能走 `archive`（N4 待修）。
+区别：`--keep` 是**留板待审**，`--reviewed-by human` 是**人确认**（写审计并出板）。待审任务可再用 `complete --reviewed-by human` 完成人审并出板；已完成任务仍拒绝再次 `--keep`。
 
 **3. 退出码即语义**（脚本与 CI 可判）：
 ```
@@ -205,7 +205,10 @@ board.sh scope-check <task id> --workdir <dir>
 
 ### 12.2 人确认才算完（2026-10-30）
 
-- `board.sh complete` 必须带 `--reviewed-by human`；缺省或其它任何值（含 `codex`/`lead`）一律退出码 5 —— **Agent 自报不算人确认**。
+- `board.sh complete` 的 `--reviewed-by` 只接受两个值：`human` / `auto`；缺省或其它任何值（含 `codex`/`lead`）一律退出码 5 —— **Agent 自报不算人确认**。
+  - `human` = 用户确认过。`--result` 除 `$ <命令>` 与 `exit=N` 证据行外，**必须含用户授权原话**；只剩证据行时退出码 2（防止拿命令当签字）。
+  - `auto` = 低风险自签（工作区内、可回滚、能一句话写出验收命令且 `exit=0`）。**`auto` 不得替人完成待审任务**：`review.pending` 只能由 `human` 清除。
+- 审计记录照实写 `reviewed_by` 取值（`human` / `auto`），不得归一，便于统计自动签比例。
 - 通过后默认出板（行为不变），但**出板前**先追加一条审计记录到 `audit/completed-YYYY-MM.jsonl`：含完整任务 + `reviewed_by` / `reviewed_at` / `recorded_at`（毫秒前为 UTC）。
 - `--keep`（自动化交付 / 留板待审）**不要求** `--reviewed-by`：任务置 `completed` 但**不写** `reviewed_by`，面板据此显示"待审"；带 `--reviewed-by human` 时才写 `reviewed_by` / `reviewed_at`，仍不写 audit。
 - **硬规则**：`completed` 只表示"工作完成"，`reviewed_by=human` 才表示"人已审核"。两者不得混同。
@@ -257,3 +260,16 @@ board.sh scope-check <task id> --workdir <dir>
 3. **排除自己**：检索本任务过程时用 `--exclude-session <自己会话 id>`，避免把自己的过程当成他人的证据（对应 ARTEX「自动排除自己这条意图」）。
 4. **凭证纪律（codex 2026-10-14 异议补充）**：**不得用本工具检索、输出或转述凭证类内容**（key / token / 密码 / 私钥 / cookie）。命中项若疑似凭证，只报「命中位置」，不复述内容 —— 与既有密钥红线一致。
 5. **坏行可见**：坏 JSON / 超长行**跳过但不隐藏**（`list` 的 `bad` 列、`get` 的降级提示）—— 否则后来者会把「没命中」误读成「没发生」。
+
+### 2026-11-01 字段补充
+
+- `new` 写入 `createdAt`（UTC ISO 8601）；后续命令保持不变，`set` 不允许修改；旧任务不回填。
+- `complete --keep` 写入 `review: {pending: true, at: <UTC ISO>}`，表示工作完成但留板待审，不写 `reviewed_by`。待审任务可用 `complete --reviewed-by human` 完成人审：写入 `reviewed_by` / `reviewed_at`，并将 `review.pending` 清为 false，再按普通人审完成流程出板、写审计。其它 completed 任务仍不可复改。
+- `show` / `ls`（含 `--json`）读回待审标记及 `failure`。`dispatch.sh --board-id ID` 请求失败时经 `board.sh failure ID --reason ...` 写入 `{reason, at}`，成功时经 `failure ID --clear` 清除旧原因；该命令仅更新诊断元数据，不改变状态。原因只记录 HTTP 状态或错误类别，不保存服务端原始响应。
+
+### 12.6 基线与验收前校验（v1.5）
+
+- 首次 `claim` 记录 `base`：优先为任务 `workdir` 的 git 短 commit；非 git 时为 `md5:<文件数>:<sha256前12>`，按 `write_scopes` 快照；无 scope 不记录并警告。`base`、`attempts` 与 `createdAt` 均不可由 `set` 修改。
+- 新任务 `attempts=0`；`block` 与重新 `claim` 同一 id 各加 1。达到 2 后 `complete` 拒绝，退出码 3，提示拆小任务或交主 AI；返工上限为两轮。
+- 合并前运行 `accept.sh <id> [--test "命令"]`，按序校验：任务存在且非终态（失败 4）；存在基线（缺失 2）；变更均在 scope（越界 2）；至少有一处变更（空交付 1）；必须提供成功测试命令（缺失/失败 1，失败回显末 30 行）。
+- 全部通过打印 `ACCEPT OK <id> files=N` 并退出 0；验收脚本不调用 `complete`，验收与落板分离。
