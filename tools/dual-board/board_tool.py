@@ -470,6 +470,38 @@ def cmd_abandon(a) -> None:
         save_board(data)
 
 
+def cmd_roles(a) -> None:
+    """角色管理（N 角色泛化的配置入口 · 2026-11-03 补）。
+
+    S3/S4 当时只做了 roles 模型 + validate_roles + --to ROLE，没留配置入口，
+    实际跑起来只有 DEFAULT_ROLES 里的 codex 一个执行方角色 ⇒ Pi 被唤醒后
+    读到的仍是 inbox-codex.md。这里补 show / set 两个动作。
+    """
+    if a.action == "show":
+        with _Lock():
+            data = load_board()
+        print(json.dumps(load_roles(data), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if a.action != "set":
+        die(2, "roles 需要 show 或 set")
+    role = a.role
+    if not role:
+        die(2, "roles set 需要角色名：roles set <role> --engine <dsh|codex|pi> [--inbox <file>]")
+    if a.engine not in ("dsh", "codex", "pi"):
+        die(5, f"engine 非法：{a.engine}（只允许 dsh / codex / pi）")
+    with _Lock():
+        data = load_board()
+        roles = dict(load_roles(data))
+        spec = dict(roles.get(role) or {})
+        spec["engine"] = a.engine
+        spec["inbox"] = a.inbox or spec.get("inbox") or f"inbox-{role}.md"
+        roles[role] = spec
+        validate_roles(roles)
+        data["roles"] = roles
+        commit(data, f"角色 {role} → engine={spec['engine']} inbox={spec['inbox']}")
+        save_board(data)
+
+
 def cmd_set(a) -> None:
     allow = {"owner", "session", "engine", "result", "acceptance", "subject", "context", "status",
              "write_scopes", "blocked_by", "steps", "child_pid", "child_start"}
@@ -1029,6 +1061,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set", help="更新字段 key=value")
     sp.add_argument("id"); sp.add_argument("pairs", nargs="+"); add_cas(sp)
     sp.set_defaults(func=cmd_set)
+    sp = sub.add_parser("roles", help="角色管理：show / set <role> --engine <dsh|codex|pi> [--inbox <file>]")
+    sp.add_argument("action", choices=["show", "set"])
+    sp.add_argument("role", nargs="?", default=None)
+    sp.add_argument("--engine", default=None)
+    sp.add_argument("--inbox", default=None)
+    sp.set_defaults(func=cmd_roles)
 
     sp = sub.add_parser("failure", help="记录或清除派单失败原因")
     sp.add_argument("id")

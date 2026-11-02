@@ -364,11 +364,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.6）
+## 支持能力一览（v3.8.7）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **3.8.6 模块拆分 + 提示开关** | ✅ 3.8.6 | ① `src/index.js` **5860 → 5225 行**，拆出 11 个模块（core / io / state / cleanup / normalize / parse / git / policy-watch / mood-watch / constants / hint-toggles），冒烟从 39 项扩到 **57 项**（新增 `index-boot` / `apply-boot`：模块可导入、35 条路由注册、引擎契约在位）② **设置页「提示开关」卡**：纠正 / 打断 / 停滞三项，默认全关，每项标明触发阈值，Pi 与 Codex 两个面板都有 ③ **`mood-watch`**：用户纠错或打断时注入 `[MOOD_WATCH]` 机械量，只报事实不下结论 ④ **Pi 模型记忆**：按 provider 记住上次选的模型，切提供方时自动恢复 ⑤ 修 `piProvidersSnapshot` 非激活行模型显示（不再空 / 取第一个）⑥ 新增 `tools/dep-graph.mjs`（acorn AST 依赖图）与 `tools/split-verify.py`（拆分保真校验） |
+| **3.8.7 提醒系统改版 + 送达修复** | ✅ 3.8.7 | ① `mood-watch` 三种 kind 文案分开：`stop` 只停手+确认范围 / `interrupt` 判「话没说完 vs 方向错」 / `correction` 走三分类，各保留「第二引擎可配合」但限定边界（stop 明确写本次叫停不触发派单）② 四类注入文案统一以 `[SECOND_ENGINE:...] 本条由 second-engine 插件生成，不是用户发言。` 开头，模型可判别来源、审计可 grep；`buildMoodMessage` 与 policy-watch 注入处加安全红线注释（禁止回填用户输入/外部内容）③ 文案删掉写死端点，统一改「可路由」表述 ④ 修 `policy-watch` 送达失效：文件变化不再删 `pending`、补 `code===0` 竞态防护、`pending` 带 `hitSeq`、送达前 120s 时效校验 ⑤ skill 542 → **462 行**，六节外置进 `references/`（`ref-dispatch-drill.md` / `ref-engine-pick.md`）⑥ `board_tool.py` 新增 `roles show/set` 子命令（N 角色泛化此前缺配置入口，Pi 一直读到 codex 的收件箱）⑦ 注入段「收件箱」改为按角色查 ⑧ 密钥与凭证红线纳入受管注入段，两台引擎 home 由插件统一写入 |
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 

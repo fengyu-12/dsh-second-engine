@@ -11,6 +11,8 @@ const POLICY_WATCH_PYTHON = process.env.SECOND_ENGINE_PYTHON || 'python3'
 const POLICY_WATCH_STATE_PATH = join(homedir(), '.dsh', 'policy-watch', 'last.json')
 const POLICY_WATCH_TIMEOUT_MS = 5000
 export const POLICY_WATCH_DELIVERY_COOLDOWN_MS = 10 * 60 * 1000
+// 送达时效：pending 从算出到送达最多等这么久，超过就作废重扫（2×扫描间隔 + 一轮延迟余量）。
+export const POLICY_WATCH_FRESH_MS = 120_000
 const POLICY_WATCH_KEEP_LIMIT = 50
 export const policyWatchPending = new Map()
 export const policyWatchDelivered = new Map()
@@ -102,7 +104,9 @@ export function startPolicyWatch(sessionId) {
   } catch { return }
   const prior = policyWatchLastStat.get(sessionId)
   if (prior && (prior.mtimeMs !== snapshot.mtimeMs || prior.size !== snapshot.size)) {
-    policyWatchPending.delete(sessionId)
+    // 2026-11-03 修：文件变化只更新快照，**不删 pending**。
+    // 原逻辑每轮都把上一轮算好的 pending 清掉，导致活跃会话永远收不到提醒——
+    // 而「会话还在动」恰恰是停滞检测要抓的场景。过期改由送达侧按时间校验（见 POLICY_WATCH_FRESH_MS）。
     policyWatchLastStat.set(sessionId, snapshot)
   } else if (!prior) policyWatchLastStat.set(sessionId, snapshot)
   const started = policyWatchLastStart.get(sessionId) || 0
@@ -122,8 +126,13 @@ export function startPolicyWatch(sessionId) {
   void flight.then((result) => {
     if (result?.error) { policyWatchErr('policy-watch-scan', result.error); return }
     if (result.code === 0) {
-      policyWatchPending.delete(sessionId)
-      persistPolicyWatchState()
+      // 竞态防护：只有「扫描所用快照仍是当前快照」才认为问题真的消失并清 pending。
+      // 否则一次慢扫描（基于旧快照、返回 0）会清掉另一状态下刚生成的 pending。
+      const latest = policyWatchLastStat.get(sessionId)
+      if (!latest || (latest.mtimeMs === snapshot.mtimeMs && latest.size === snapshot.size)) {
+        policyWatchPending.delete(sessionId)
+        persistPolicyWatchState()
+      }
       return
     }
     if (result.code !== 10) return
@@ -140,7 +149,8 @@ export function startPolicyWatch(sessionId) {
     policyWatchHitKeys.delete(sessionId)
     policyWatchHitKeys.set(sessionId, keys)
     policyWatchPending.delete(sessionId)
-    policyWatchPending.set(sessionId, { summary, key, at: now })
+    const hitSeq = (result.json.m1 || []).reduce((mx, x) => Math.max(mx, Number(x.seq) || 0), 0)
+    policyWatchPending.set(sessionId, { summary, key, at: now, hitSeq })
     trimPolicyWatchMaps()
     persistPolicyWatchState()
   }).catch((e) => policyWatchErr('policy-watch-scan', e)).finally(() => policyWatchFlights.delete(sessionId))

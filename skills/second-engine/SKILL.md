@@ -11,7 +11,7 @@ description: 操作第二引擎（Codex/Pi，设置页切换）：模型管理�
 
 - **0 入口**：0.1 读取闸门 · 0.2 走哪条通道 · 0.3 三条道并行 · 0.4 API 入口
 - **1 判据**（该不该派）：1.1 什么时候该派它（A/B 两分法）
-- **2 规划**（整条路值不值得走 / 派给谁 / 怎么分工）：2.1 三方评估漏斗 · 2.2 被用户否定时 · 2.3 选引擎 · 2.4 各方边界 · 2.5 多 agent 分工 · 2.6 编排决策六问（开编排时才用）
+- **2 规划**（整条路值不值得走 / 派给谁 / 怎么分工）：2.1 三方评估漏斗 · 2.2 被用户否定时 · 2.3 选引擎 · 2.4 各方边界 · 2.5 多 agent 分工 · 2.6 编排决策六问（开编排时才用） · **2.7 编排硬规则 16 条 · 2.8 提醒偏好 · 2.9 桥+工单+board 三件套**
 - **3 操作**：3.1 查档位 → 3.2 交接单 → 3.3 核对纪律 → 3.4 工单怎么写 → 3.5 复核 → 3.6 标准流程 → 3.7 执行模式 → 3.8 命令行降级 → 3.9 唤醒层 → 3.10 求助归属 → 3.11 看痕迹 → 3.12 异常速查 → 3.13 降级路径
 - **4 档案**：4.1 真身位置 · 4.2 dual-board · 4.3 references 索引
 
@@ -23,7 +23,9 @@ description: 操作第二引擎（Codex/Pi，设置页切换）：模型管理�
 | 要查 Codex 现场：keyring / wireApi / CODEX_HOME / CLI / 凭证 / 中转站 | `<DSH 技能目录>/second-engine/references/ref-codex-facts.md` | config.toml 由 keyring 生成（别手改）、wireApi 判据、key 不进 argv |
 | 要升级 Codex，或升级后判断插件要不要动 | `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md` | npm 平台包是正选、三条检验的通过判据、只有执行链判不过才动插件 |
 | 要写看板 / 派长任务链 / 查 board 子命令 | `<DSH 技能目录>/second-engine/references/ref-dual-board.md` | `board.sh` 是唯一写入口、出板必须 `--reviewed-by human`、`--workdir` 必须绝对路径 |
-| 要决定派给谁 / 写执行方边界 / 评估编排安全 / 查同类项目 | `<DSH 技能目录>/second-engine/references/ref-dispatch-routing.md` | 路由二分法（我 / 第二引擎；其他执行方看各自 skill）、每单边界写死、隔离实测 4 条 ⇒ 只能「限额+留痕+可回滚」、同类项目调研已停 |
+| 要决定派给谁 / 写执行方边界 / 评估编排安全 / 查同类项目 | `<DSH 技能目录>/second-engine/references/ref-dispatch-routing.md` |
+| 派单核对 / 执行模式切换 / 命令行降级 / 唤醒端点 / 提醒通道 | `<DSH 技能目录>/second-engine/references/ref-dispatch-drill.md` | 能被一条命令验证的描述落笔前先跑过它、复核恒走 exec、`VAR=key cmd` 会进 argv 被 ps 看到、wake 要 `session-<uuid>` 前缀 |
+| 选 Pi 还是 Codex | `<DSH 技能目录>/second-engine/references/ref-engine-pick.md` | 要「审」/流式进度/web_search 走 Codex、多 provider 并存走 Pi、切完旧单不迁移 | 路由二分法（我 / 第二引擎；其他执行方看各自 skill）、每单边界写死、隔离实测 4 条 ⇒ 只能「限额+留痕+可回滚」 |
 
 ---
 
@@ -169,26 +171,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 
 ## 2.3 选哪个引擎：Pi vs Codex（按能力，不按偏好）
 
-判据按**你要什么能力**，不按哪个"更好"：
-
-| 你要的 | 选 | 依据（不是偏好） |
-|---|---|---|
-| **多轮批判复核**（`/review`、协作提议） | **Codex** | Pi 无复核链路，面板会隐藏该卡（点了必失败） |
-| **流式进度 + 真打断**（长任务看过程、要能取消） | **Codex** | app-server 模式；Pi 走 exec，取消只能靠 SIGTERM |
-| **`web_search`** | **Codex** | Pi 内置工具无联网（read/bash/edit/grep/find/ls），联网得自己配 MCP |
-| **多 provider 并存、随时切** | **Pi** | `models.json` 可存多个 provider 各自模型，切换只改 `defaultProvider/defaultModel` |
-| **省体积** | **Pi** | 22 MB vs 223 MB CLI（Codex 是 223 MB + 70 MB sidecar）|
-| 只要一个**独立第二意见** | 都行 | 用当前 active 的，别为选型来回切 |
-
-一句话：**要"审"走 Codex；要"几个厂商的模型并存、随时横向比"走 Pi。**
-
-⚠️ **别把"能换模型"当成 Pi 的卖点** —— **Codex 同样能换**（改 `config.toml` 的 `model_provider` + `model`，本机现为 zhipu/glm-5.3-flash）。真实差别是：Codex 一次一个 active provider，Pi 可并存多个。
-
-> 判据：**引擎能力看 CLI/配置文件，不看 Web 控件列几个**。别再按「下拉只显示当前值」的旧现象推断引擎能力（该 UI 缺陷 2026-10-30 已修，细节见 `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md`）。
-
-两条容易踩的：
-- 切换即时生效（`~/.dsh/second-engine-engine.txt`），但**会话不迁移** —— 已开的工单留在原引擎，切完看不到旧单。
-- Pi 下复核/工单/版本这类卡片会被隐藏，**不是故障**（面板按引擎渲染）。
+**要「审」（多轮批判复核 `/review`）或要流式进度/真打断/web_search ⇒ Codex；要多 provider 并存随时横向比 ⇒ Pi。** 别把「能换模型」当 Pi 的卖点（Codex 同样能换，差别是能否并存）。完整判据矩阵、切换后会话不迁移、Pi 下卡片隐藏不是故障 → `references/ref-engine-pick.md`
 
 ## 2.4 各方边界（2026-11-01 维护 · 去名化）
 
@@ -198,6 +181,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 - **用户**：最终裁决。
 
 共同点：三方都不是最终决策者；产出只是「可验证的第二个信号」。具体角色与能力判据见下节「多 agent 怎么分工」——本节只讲边界，不替代角色表。
+
 ## 2.5 多 agent 怎么分工（2026-10-30 立 · 目标＝多 agent 互审，不押注单一引擎）
 
 > **分工按「能力边界」划，不按价格划。** 能不能读本机、能不能跑命令、行号准不准 —— 这三条决定它该干什么。
@@ -229,7 +213,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 
 ## 2.7 多 agent 编排硬规则（2026-11-01 · 判据清单）
 
-> 来源：2026-11-01 双 agent 施工实战 + 两轮外部评估（`mvxwjp29` / `mvxxv2i0`）。**这 16 条是判据不是建议**；与 2.6 六问互补——六问回答「要不要编排」，本节回答「编排时不许漏什么」。
+> 来源：2026-11-01 双 agent 施工实战 + 两轮外部评估。**这 16 条是判据不是建议**；与 2.6 六问互补——六问回答「要不要编排」，本节回答「编排时不许漏什么」。
 
 1. **派单前定五件**：`write_scopes`、通道、观测点、完成测试、失败回退。
 2. **写域白名单**：共享输入/输出的任务串行；**独占文件**（`src/index.js`、`lib/client.js`、`package.json`、`tools/dual-board/PROTOCOL.md`、`bridge/*/server.mjs`）一次只给一个执行体，哪怕只改一个函数。
@@ -240,59 +224,22 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 7. 只凭 `.done`、`/api/send` 的 `end`、或 agent 自报 **不得收工**；自报**不能单独**作证据，必须补一份独立证据。
 8. **Codex 在干活**：`status=running` 且 `liveBytes` 增长；`exitCode` 有值才落定。
 9. **Pi 在干活**：会话 jsonl 事件数在涨；末条 `stopReason` = `stop` 成功 / `error` 跑挂 / `aborted` 取消。**一律不看 `ps`**。
+   ⚠️ **只对桥/CLI 成立**：`/api/task` 派单走 `--mode rpc --no-session`（`pi-rpc-runtime.js:536`），**不写会话文件**——`~/.pi/agent/sessions` 下实测零文件。派单通道别去找 jsonl（也没有 `liveBytes`），只看 `status` 与 `output` 有无内容。
 10. 合并到**最终树**后再跑同一组测试（验收对象是合入后的树，不是 agent 副本）。
 11. 失败最多**返工两轮**；第三轮改拆单 / `block` / 主 AI 接手。
 12. 验收后清标记与临时目录；下一单开工前拒绝残留。
 13. 测 `board_tool` 用临时 `DUAL_BOARD_DIR`，结束即删，绝不写真实看板。
 14. 凭证只经环境变量 / 插件接口读取；禁止读取、输出或提交密钥文件。
 15. 失败副本**不得整文件覆盖**目标树；只合并经过范围检查的变更。
-16. **完成信号走 board，不用标记文件**：执行体 `board.sh complete --result "..."`，主 AI 轮询 `board.json` mtime 去看板（board 无推送能力，这是唯一可靠路径）。
+16. **完成信号按通道分**：有 task 对象的（`POST /api/task`）读 `task.output`；**无 task 对象的（桥 `/api/send`）必须走 board**（`board.sh complete --result ...`，主 AI 轮询 `board.json` mtime——board 无推送能力，这是唯一可靠路径）。
 
 ## 2.8 编排开始前：先问提醒偏好（2026-11-02 立）
 
-**编排一旦开始，主 AI 会长时间在后台跑，用户不会一直盯着屏幕。开编排前先问一句、并按回答配好通道**，否则任务做完了人不知道。
-
-### 问什么（一次问清，别每轮问）
-
-> 「需要我在关键节点提醒你吗？你一般怎么挂着 App——全屏、画中画，还是小窗？」
-
-按回答决定用哪条通道（**实测矩阵，2026-11-02 本机验证**）：
-
-| 用户挂法 | 能收到文字 | 依赖 |
-|---|---|---|
-| 全屏 | ✅ App 内横幅 | 无 |
-| **画中画** | ✅ 系统通知 | 无（通知权限关着也能收到） |
-| 普通小窗 / 真后台 | ❌ 只有振动 | **需开系统通知权限** |
-
-三条结论都来自实测：小窗时 `app_foreground=false`、`/app/notify` 返回 `ok`（走系统通知）；全屏时返回 `FOREGROUND_SKIP`，但 App 自己画应用内横幅。**不要只看返回值判断成败**。
-
-### 怎么用
-
-```bash
-# 本机有脚本（三通道全发：Toast → 振动 → 通知）
-bash ~/.dsh/scripts/notify-user.sh "标题" "正文"
-
-# 没有脚本的环境直接打 App 桥（token 在 ~/.dsh/.bridge_token）
-curl -H "X-Token: <token>" "http://127.0.0.1:3090/app/notify?title=...&text=..."
-curl -H "X-Token: <token>" "http://127.0.0.1:3090/app/vibrate?ms=600"
-```
-
-### 什么时候用（**关键：只在需要用户介入时**）
-
-✅ 该提醒：验收完需要他拍板 / 需要他重启或确认 / 要动发布·凭据·删数据前 / 卡住且两轮不通需要他定方向
-❌ 不该提醒：**每个任务落定就提醒**——任务完成时用户通常就在等，提醒等于吵
-
-### 怎么打开（用户环境的一次性设置）
-
-- 通知权限：设置 → 应用管理 → DSH App → 通知 → 允许
-- 悬浮窗（只有用 `/app/overlay` 顶部浮条才需要）：特殊权限 → 显示在其他应用上层
-- 两者都可缺省：**画中画挂机最省事，不需要任何权限**
-
-> 记录口令：用户若说「不必提醒」，就只在**必须他决策**时才叫；说「要提醒」就按上面的矩阵配通道，并在开工前确认一次。
+开编排前问一句「需要我在关键节点提醒你吗？你一般怎么挂着 App——全屏、画中画，还是小窗？」并配好通道。**只在需要用户介入时提醒（验收拍板 / 要重启或确认 / 动发布·凭据·删数据前 / 卡住两轮不通），任务落定别提醒。** 通道矩阵与设置 → `references/ref-dispatch-drill.md §提醒通道`
 
 ## 2.9 编排实操：桥 + 工单 + board 三件套（2026-11-02 立）
 
-**一条铁律：只要起了桥（或派了工单），那个执行体就必须在 board 里记账。** 桥派出去的任务**没有 task 对象**（`/api/send` 不产 `task.output`），board 就是它唯一的账本 —— 不记账，主 AI 只能靠轮询会话文件猜，夜里又回到"它到底做完没"。
+**一条铁律：桥派出去的任务必须在 board 记账。** 桥的任务**没有 task 对象**（`/api/send` 不产 `task.output`），board 是唯一账本——不记账，主 AI 只能靠轮询会话文件猜。**走 `POST /api/task` 的工单有 `task.output`，不必额外记账**（两者别混）。
 
 ### 一轮的标准动作（照抄即可）
 
@@ -328,7 +275,7 @@ bash tools/dual-board/accept.sh T1 --test "python3 -m unittest discover -s tests
 
 - active 引擎只决定 `/api/task` 派给谁；桥是独立进程（Pi 8788 / Codex 3095），互不挤占
 - 所以「桥跑长任务 + 工单跑短任务」是合法的并行姿势
-- 但**同一 agent 同一会话只跑一单**；换主题要重启桥换会话
+- 但**同一 agent 同一会话只跑一单**；**桥未接 `new_session`，换主题要重启桥**。若自己起 `pi --mode rpc` 或走 CLI，可直接 `new_session` / `--session-id` 切会话，不必重启进程。
 - 两条通道各自记账：`board.sh new` 两个任务，各自 `claim --owner`
 
 ## 3.1 派单前：查档位与发法（2026-10-25 定 · 责任在主 AI 不在 Codex）
@@ -380,16 +327,7 @@ NEXT:    <对方从哪接手；验收判据是什么>
 
 ## 3.3 派单与核对纪律（从多次误判提炼，只记判据不记过程）
 
-- **派单前逐条复核自己的缺陷描述**。任务单里每条缺陷 = **一条断言**（`文件:行号` + 当前行为），派单前用 `grep` / `sed -n` 实测一遍，与描述不符就**改描述**，不许凭印象写。2026-10-29 两连击实证：① 把活的 `createPiCards`/`PiCleanupCard` 写成死代码（只 `grep -c` 数出现次数、没查调用点），对方核实后才没把 Pi 面板搞崩；② 写「引擎未知时放行」，实际 `activeEngineId()` 读不到就 `return 'codex'`（`registry.js:82-88`）、**永不返回空串**——半句既错又是死代码。**同一类错误两天犯两次，说明缺的是检查点不是态度**。判据：单子里凡是能被一条命令验证的描述，落笔前必须已经跑过那条命令。
-- **workdir 里不能放同名过期副本**。模型会诚实去读 workdir 里能找到的那份，给出「对那份完全正确、对真身全错」的答案。派单前 `find <workdir> -name index.js` 查一遍；发现副本就挪走或改名。
-- **核对它给的行号，先确认为它读的是哪份文件**。拿 A 的行号去比 B，会得出「它在编」的错误结论——实际它读的是旧快照且 6/6 命中。**先问"你读的哪个路径"，再判对错。**
-- **要它精确改代码，路径写到文件级**：`<插件目录>/src/index.js`，别只给 workdir。
-- **采纳它提出的新名词前先 `grep -c`**。合同里塞进 `queued`/`finalizing` 两个状态，代码里 0 命中——凭空放大改造面。**新名词先验证存在性**。
-- **改「取消 / 终局」这类语义，先把所有写点找齐**。exec 走 `child.on('exit')`、appserver 走 `handle.done` reject；只改一条路径等于没改，且要等真实取消才暴露。
-- **删一个副作用前，查它还兼管什么**。`utimesSync(outPath)` 同时喂看门狗和污染 `cleanupLiveFiles` 的 mtime 判据——删掉解耦了两件事，也顺带改了清理行为（这是好事，但要知道）。
-- **同一块 UI 可能有两套判据**。面板标题走 `taskStateText()`（认 `cancelled`），同卡片的 `status` 变量白名单只有 `done|error` → 出现「已取消 + 运行中」并存。改状态语义时扫全部判据，不只看一处。
-- **可执行产物：验输出不验跑通，有偏差就修不补偿**。① 它交的脚本 `ok:true` + 自检通过 ≠ 可用 —— 先问「自检覆盖了我依赖的那个量吗」；② 判据三选一：给行号就 `grep -n` 核 3 个、给计数就 `grep -c`/`wc -l` 核总数、给边界就用极值用例戳；③ **出现任何「调用侧补偿」＝ 工具坏了**：修掉它或标「不可用于不可逆场景」，不许靠用法上的 `-1` 顶过去。
-- **`grep task\.<字段>` 这类归零判据看不见对象字面量里的裸字段**（`const task = { ..., child, ... }`）。改字段归属时必须对着**每条创建路径**逐个确认（本项目三条：appserver / exec / review）；否则会出现「grep 已归零、运行时却拿不到值」——2026-10-28 就这么漏了 exec 的 child，导致取消杀不死进程、`endedAt` 永不落定，而冒烟 32 项全绿。
+**单子里凡是能被一条命令验证的描述（`文件:行号` + 当前行为），落笔前必须已经跑过那条命令**，与描述不符就改描述、不许凭印象写。其余 7 条（workdir 同名副本、确认它读的哪份文件、路径写到文件级、新名词先 `grep -c`、取消/终局写点找齐、副作用兼管什么、一套 UI 两套判据、可执行产物验输出不验跑通）→ `references/ref-dispatch-drill.md`
 
 ## 3.4 工单怎么写：四要素、五要点、推理预算、停手点
 
@@ -428,34 +366,28 @@ CHECKPOINTS:
 
 1. **下发**：`POST "$DSH_WEB_URL/second-engine/api/task"`，工单自包含、小粒度（Codex 零记忆）；workdir 默认 `~/proj`（**绝不进主工作区**）；默认 `--ephemeral` 不落盘（审计靠 git diff）。返回 `{id}` 即异步开跑。
 2. **等待**：`bash <插件目录>/tools/wait-task.sh <id> [间隔=5] [超时=600]` 放**后台 job**，完成由 App 通知自动唤醒（0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时）——**禁止自写 `sleep`+`curl` 轮询**（既多余又占着会话不放）。
+   ⚠️ **"放后台 job"的具体做法**：调 `bash` 时就带 `run_in_background:true`，**不要前台跑着等**——前台跑满超时会被动转后台，白占一个等待周期且期间什么都收不到。job 结束时运行时会通知主 AI，**这是唯一非轮询的获知途径**：插件完成只弹 App 通知给用户，主 AI 没有被动通道；`GET /api/task?id=` 的 `liveBytes/tokens` 是判进度、不是判完成的依据。
 3. **验收**：`GET /api/task?id=` 读 output + 工作目录 `git diff` 审查 → apply / 打回（新工单指出问题）/ 升级用户裁决。
 4. **互审**：把主 AI 产出（结论/方案/diff）`POST /api/review`，Codex 批判复核（上限内自动多轮，零新增即收敛，**最终结论一次上交用户裁决**）；单轮需求改走工单，判据见「三条道并行」。
 5. **求助响应**：`GET /api/consults` 看 Codex 卡点（手机通知会提示）→ 针对性下工单解围。HTTP 不通时它在输出末尾写 `[CONSULT-NEEDED] <卡点描述>`；**触发阈值＝同一路径/命令失败 2 次**（插件 `AGENTS_SECTION` / `~/.codex/AGENTS.md` / `~/proj/AGENTS.md` 三处对齐）。
 
+### 3.6.1 长任务补充
+
+**循环**：job 完成通知本身就是驱动力——验收完立刻派下一单 + 挂新 job，无需用户触发（goal 不管子任务跑没跑完都会叫你，反而更差）。
+**三条通用做法**：① 工单给固定 `sed -n 'A,Bp'` 区间、禁止通读；② 工具只做拼装，import 头与长字面量由主控原样下发（它会按理解重建，长串易丢）；③ 开工即起心跳（`nohup while sleep 30 >> PROGRESS.md`）+ 出错写 `FAILED.md`，那是唯一能判活/判死的痕迹。
+**验收三道**：`node --check` → 逐字比对原著 → `tools/smoke.sh`；删除前校验行首含目标符号名（AST 行号会因先前删除偏移）。
+
 ## 3.7 执行模式：exec / appserver（运行时切换、不需要重启）
 
-- **exec**（默认）：`codex exec` 一次性子进程，行为与旧版一致。
-- **appserver**：`codex app-server` JSON-RPC 长连接——`GET /api/task?id=` 多 `progress` 字段（最近 20 条归一化事件，可看流式进度）；`POST /api/task/cancel` 先发 `turn/interrupt`（65ms 级结束）。输出仍落 `-o` 文件，看门狗判据不变，任何事件都刷新输出 mtime。
-- **复核恒走 exec，不支持 appserver**（2026-10-25 定）。
-
-```sh
-echo appserver > ~/.dsh/second-engine-mode.txt   # 切 app-server（2026-10-26 查：当前值为 exec）
-echo exec      > ~/.dsh/second-engine-mode.txt   # 切回
-```
-优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。appserver 协议映射见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`。
+`echo appserver > ~/.dsh/second-engine-mode.txt` 切 app-server（多 `progress` 流式事件、`/api/task/cancel` 走 `turn/interrupt`），`echo exec` 切回；优先级 env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 exec。**复核恒走 exec，不支持 appserver。** 验收脚本与协议映射 → `references/ref-dispatch-drill.md`
 
 ## 3.8 命令行降级（无插件环境 / 需要交互时）
 
-```bash
-codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI（Ctrl+D 或 /quit 退出）
-# 手动（⚠️ 别写成 VAR=key cmd，会进 argv 被 ps 看到）：
-KEY=$(head -1 "<你的 API key 文件>"); cd ~/proj && env PROVIDER_API_KEY="$KEY" codex exec --skip-git-repo-check -o /tmp/out.txt "工单"
-```
-- 长线程需 resume 时不加 `--ephemeral`（完整 36 位 UUID）；结构化收结果用 `-o <文件>` 或 `--json`。
+`codex-env` 进 TUI；手动起时 ⚠️ 别写成 `VAR=key cmd`（会进 argv 被 `ps` 看到）。命令与 resume 姿势 → `references/ref-dispatch-drill.md`
 
-## 3.9 唤醒层：把消息递进 DSH 会话（实验端点，2026-10-30 实测通过）
+## 3.9 唤醒层：把消息递进 DSH 会话（实验端点，`POST /api/_exp/wake`，2026-10-30 实测通过）
 
-`POST /second-engine/api/_exp/wake` `{sessionId, text?, provider?, model?}` —— 拿 DSH 会话对象后 `session.append()` + `agents.resume()` 把消息递进去。**三条实测约束**：① `sessionId` 必须 `session-<uuid>` **带前缀**，裸 uuid 报 `session not found`；② `agentOptions` 只能用 **DSH 侧** provider（如 `deepseek-account`），Codex keyring 的 `ziluo` 会 `NO_ADAPTER`（跨引擎 provider id 不通用）；③ 对**正在跑的会话**发 followup 会**打断它当前回合**（我自己被测试打断过一次）。
+三条约束（`sessionId` 必须 `session-<uuid>` 带前缀 / 只能用 DSH 侧 provider / 对正在跑的会话发 followup 会打断当前回合）→ `references/ref-dispatch-drill.md`
 
 ## 3.10 它喊我，我不查就看不到（consult 归属判据，2026-10-14 实测）
 
@@ -472,22 +404,21 @@ curl -s "$DSH_WEB_URL/second-engine/api/consults"   # count 超出 BASE 的部�
 ## 3.11 判断它到底动手没：看痕迹，不看结论
 
 - **看痕迹三处**：文件 mtime / 字节数变化（派单前后 `ls -la` 对比）｜过程流 `.live` 出现补丁回显（`Success. Updated the following files: M xxx`）｜工作副本 `git status`。
-- exec 看 `GET /api/task?id=` 的 `liveBytes`（过程流字节数，持续增长即在动）；appserver 另有 `progress` 数组（reasoning / 文本增量 / 工具调用 / 用量）。⚠️ **`liveBytes` 增长 ≠ 在干活**（可能只是 `Reconnecting` 重连日志），必须看 `.live` 内容。
+- exec 看 `GET /api/task?id=` 的 `liveBytes`（过程流字节数，持续增长即在动）；appserver 另有 `progress` 数组（reasoning / 文本增量 / 工具调用 / 用量）。⚠️ **`liveBytes` 增长 ≠ 在干活**，必须看 `.live` 内容。
 - 反面教训：连写两单「只设计评审、不要改文件」，它就只交两份长篇方案——**进入实施阶段必须换「直接改代码」的工单**，编排者的派单方式决定它是帮手还是顾问。
 
 ## 3.12 异常速查（先分类，再动手）
 
 | 症状 | 处置 |
 |---|---|
-| 派单后长时间零输出（>10 分钟） | **先分清「错」「慢」「并发」**：有 `Reconnecting/stream disconnected` = 流断，切 provider；只有沉默无错误 = 可能在生成（relay 桥是"非流式请求上游、整段生成完再流式回放"，长任务首包延迟≈整段生成时间，此时**不要熔断，先等**）；**失败多为多个 codex 进程并发叠加**（实测智谱单发长输出 25.3 万字节/21s 完全正常）——先 `ps` 确认没叠跑再重试，仍不通切 active 提供方。**别并发派单** |
-| 任务**秒退**且过程流尾部 `exceeded retry limit, last status: 429` | **先分清「本地限速」还是「上游侧拒绝」——两者都报 429**。⚠️ 别用小请求探活当判据（几个 token 的探针 200，而 40K+ 上下文被直接拒；10-03 误判多灌 55 个请求）；**判据 = 看面板**；确属限速才冷却重派，否则换 provider |
+| 派单后长时间零输出（>10 分钟） | **先分清「错」「慢」「并发」**：沉默无错误 = 可能在生成，**先等、别熔断**；疑似并发叠加先 `ps` 看有没有叠跑再重试。**同一执行通道不许叠加**（不同通道可并行，见 2.9） |
+| 任务**秒退**且报 429 | **先分清「本地限速」还是「上游拒绝」**。⚠️ 别用小请求探活当判据（小探针通 ≠ 大上下文能过）；判据看面板；确属限速才冷却重派，否则换通道 |
 | 工单 exit 0 但工作目录没有新文件 | **假完成**，第一件事查它是不是走了翻译桥（wireApi 判据见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`） |
 | `wire_api` 报错 / bwrap、sandbox 报错 | config 被手改（应 responses / danger-full-access）→ 面板重新「启用」即由生成器重写 |
 | 工具全灭 approval never | 同上（config 被改坏，切 active 重写） |
 | `Missing <X>_API_KEY` | 激活提供方换了但 env 没跟上：用 `codex-env` 或手动 export 对应变量 |
 | 任务「运行中」长期无输出 | 看门狗会标 `stuckSuspect`（曾因 stdin EOF 假死，已修复）；直接取消重发 |
 | 取消后仍有 codex 进程残留 | 已加 3s 兜底 SIGKILL（`task.forcedKill` 可查）；手工清理只用**精确 PID**（`kill <pid>`），绝不用模式匹配 |
-| 智谱模型的疑问 | 端点与密钥事实见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md` |
 
 ## 3.13 降级路径（环境不全时怎么办）
 
