@@ -103,3 +103,10 @@ curl -H "X-Token: <token>" "http://127.0.0.1:3090/app/vibrate?ms=600"
 - 两者都可缺省：**画中画挂机最省事，不需要任何权限**
 
 > 记录口令：用户若说「不必提醒」，就只在**必须他决策**时才叫；说「要提醒」就按上面的矩阵配通道，并在开工前确认一次。
+
+---
+
+## 工单传递的机械坑（2026-11-03 实测）
+
+- **工单 JSON 里的反斜杠会丢**（`\w`→`w`、`\r\n`→真换行）→ 用 write 工具直写 `.json` 文件再 `curl -d @file`，不要在内联 shell 引号里拼。
+- 其余进程/工具类坑各有归属，别往本 skill 堆：`pgrep`/`pkill` 自杀见 skill **`safe-process-ops`**；`wait-task.sh` 必须带 `run_in_background:true` 见正文 3.6；`dep-graph` 行号会过期见 `tools/dep-graph.mjs` 头注释。
