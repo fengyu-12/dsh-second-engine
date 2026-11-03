@@ -364,11 +364,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.8）
+## 支持能力一览（v3.8.9）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **3.8.8 拆分遗留修复 + 编排流程进 skill** | ✅ 3.8.8 | ① **修 Pi 设置页 HTTP 400**：拆分时 `pi-providers` / `pi-panel` / `normalize` 三个模块共缺 **20 处导入**（`PI_*` 常量、`send`/`readBody`/`errMsg`、fs/crypto、`extractModels` 等），函数一调用就 `not defined`，面板拿到空 body；补 import 后全量 `no-undef` 归零 ② **no-undef 覆盖面 2 → 22 个模块**（此前只查 `client.js` + `index.js`，拆分模块零覆盖，正是漏因；`client.js` 里 `get` 类误报已排除）③ **skill 新增编排决策**：先判「是否编排」（跨阶段交接 / 持续跟踪 / 高风险兜底），再建项目根 `PLAN.md`；字段 `触发依据/阶段/前置/谁做/通道/产出/验收证据/失败处置`；每轮只启动前置已满足项 ④ **多桥实测**：每个 Codex 桥 = 2 个常驻进程、Pi 桥 = 1 个，`BRIDGE_STATE_DIR` 隔离即可多开，桥必须各自 board 记账 ⑤ **提醒通道实测修正**：Toast 不依赖通知权限且后台可见（首选）→ 振动 → 通知；旧「画中画无权限也能收通知」未复现，已标待复核 ⑥ Pi 面板三处 Codex 文案中性化 + Pi 会话清理卡改为可折叠 |
+| **3.8.9 Pi 失联检测 + 工作区分流 + 角色补齐** | ✅ 3.8.9 | ① **修 Pi 任务失联检测失效**：`probeTaskLost` 在 `pid` 非整数时直接 `return null`，而 `startPiTask` 的 `childPid` 初始值正是 `null` ⇒ 失联分支成死代码，Pi 进程静默消失后任务永挂 `running`（实测卡过 385 秒）。改为 pid 无效时看 `task.activityAt`，超 `WATCHDOG_STALL_MS`(300s) 返回 `activity-stale` ② **board 内置 `pi` 角色**：`DEFAULT_ROLES` 此前只有 `lead`(dsh) / `codex`(codex)，而 `new --engine` 早就支持 `pi` ⇒ `claim --owner pi` 报「角色不存在」`exit=5`；补齐后 `inbox-pi.md` 开箱可用 ③ **任务工作区按引擎分流**：`DEFAULT_TASK_WORKDIR` 原为常量、不分引擎，Pi 工单被丢进 Codex 的 `/root/proj`；新增 `taskWorkdirForEngine()`（`SECOND_ENGINE_WORKDIR` 优先 → `pi` 用 `~/pi-workspace` → 其余 `~/proj`）。**复核处固定传 `codex`** 而非当前引擎——复核恒走 `codex exec`（`pi.review=false`），跟 activeEngine 走会让工作区与执行者错位 ④ **skill §2.9 示例修正**：`board.sh new` 缺必填 `--task`（与 `--subject` 是两个独立字段）、`claim --owner pi` 在角色补齐前不可用，照抄旧示例必失败 ⑤ **skill 新增 §2.7.1 签字分级**：低风险（可回滚 + 一句话验收）直接做并事后汇报，高风险（发布 / 凭据 / 删数据 / 改运行中机制）停手等确认；并写明「人签无法认证主体，控制点是动作前停」⑥ **AGENTS.md board 段**：Pi 角色已内置，删掉过时的 `roles set pi` 指引 |
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 

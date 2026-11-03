@@ -43,7 +43,8 @@ STALE_SEC = 600
 LOCK_TRIES = 50          # 50 × 0.1s = 5s
 LOCK_SLEEP = 0.1
 DEFAULT_ROLES = {"lead": {"inbox": "inbox-lead.md", "engine": "dsh"},
-                 "codex": {"inbox": "inbox-codex.md", "engine": "codex"}}
+                 "codex": {"inbox": "inbox-codex.md", "engine": "codex"},
+                 "pi": {"inbox": "inbox-pi.md", "engine": "pi"}}
 
 _INBOX_LOCKS = {}
 _INBOX_LOCKS_GUARD = threading.Lock()

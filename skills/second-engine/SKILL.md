@@ -245,6 +245,12 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 15. 失败副本**不得整文件覆盖**目标树；只合并经过范围检查的变更。
 16. **完成信号按通道分**：有 task 对象的（`POST /api/task`）读 `task.output`；**无 task 对象的（桥 `/api/send`）必须走 board**（`board.sh complete --result ...`，主 AI 轮询 `board.json` mtime——board 无推送能力，这是唯一可靠路径）。
 
+## 2.7.1 谁签字：控制点是「动作前停」，不是「谁签名」（2026-11-04 立）
+
+- **低风险**（workspace 内、可回滚、能一句话写出验收命令且 `exit=0`）→ 直接做完、事后汇报，`--reviewed-by auto`。
+- **高风险**（发布 / 凭据 / 删数据 / 改运行中机制 / 结论不确定）→ **停手等用户说「可以」**，`--reviewed-by human`，`--result` 里写用户授权原话。
+- **认清前提**：单机单 agent 架构下「人签」**无法认证主体**（命令是主 AI 执行的）；真正起作用的是「动作前停」，不是签名本身。
+
 ## 2.8 编排开始前：先问提醒偏好（2026-11-02 立）
 
 开编排前问一句「需要我在关键节点提醒你吗？你一般怎么挂着 App——全屏、画中画，还是小窗？」并配好通道（**优先级：Toast → 振动 → 通知**；Toast 不依赖通知权限、后台也可见，通知需系统权限，顶部浮条本机未启用——实测见该 ref）。**只在需要用户介入时提醒（验收拍板 / 要重启或确认 / 动发布·凭据·删数据前 / 卡住两轮不通），任务落定别提醒。** 通道矩阵与设置 → `references/ref-dispatch-drill.md §提醒通道`
@@ -257,9 +263,12 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 
 ```bash
 # ① 建账（派单前，写域 + 验收标准写死）
+#    ⚠️ --subject 与 --task 是两个独立必填字段：subject=标题，task=任务正文
 bash tools/dual-board/board.sh new T1 --subject "policy-watch 五条" \
+  --task "修 policy-watch 五条漏报，改完跑自测" \
   --scope "tools/policy-watch.py" --acceptance "构造样本四判据全过 + py_compile"
-bash tools/dual-board/board.sh claim T1 --owner pi      # claim 时自动记 base 基线
+#    ⚠️ --owner 是团队角色不是引擎；默认角色只有 lead(dsh) / codex(codex)，pi 未登记
+bash tools/dual-board/board.sh claim T1 --owner lead    # claim 时自动记 base 基线
 
 # ② 派单（二选一，按需）
 #   a) 短工单 → POST /second-engine/api/task（面板可见、拿 task.output）

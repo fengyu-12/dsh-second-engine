@@ -75,6 +75,7 @@ import { baseNameOf, prunePiBackups, cleanupSessions, pruneReviewFiles, REVIEW_K
 import { gitPorcelain, gitOk } from './git.js'
 import { appendConsultBlock, appendReviewIssuesBlock, extractFirstJsonObject, extractMcpServerBlocks, extractModels, extractPreservedSections, extractPreservedTopLevelLines, issueTextFingerprint, issueTrigrams, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson, parseTokensUsed, parseVersion } from './parse.js'
 import { KEYRING_PATH, MAX_BODY_BYTES, CONFIG_BACKUP_KEEP, CONFIG_BACKUP_NAME_RE, TASK_OUTPUT_CLIP, CANCEL_RETRY_MS, CANCEL_FORCE_FINALIZE_MS, CANCEL_FORCE_FINALIZE_MESSAGE, newId, readBody, saveKeyring, backupConfig, readHeadTail, queryParam } from './io.js'
+import { WATCHDOG_STALL_MS } from './engine/runtime.js'
 
 // The bridge is started by ctl.sh; pass the host API address through its inherited environment.
 if (process.env.DSH_WEB_URL) process.env.BRIDGE_HOST_API_URL = process.env.DSH_WEB_URL
@@ -152,6 +153,10 @@ function accountJob(task) {
   catch (e) { tokenLedgerError = errMsg(e); noteErr('token-ledger', e) }
 }
 export const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(process.env.HOME || '/root', 'proj')
+export function taskWorkdirForEngine(engine) {
+  if (process.env.SECOND_ENGINE_WORKDIR) return process.env.SECOND_ENGINE_WORKDIR
+  return engine === 'pi' ? join(homedir(), 'pi-workspace') : join(homedir(), 'proj')
+}
 export const TASK_LIST_LIMIT = 10
 // 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
 const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
@@ -495,7 +500,7 @@ const BOARD_SECTION = `${BOARD_MARK}
 - **协议全文**：本插件包内 \`tools/dual-board/PROTOCOL.md\`。派单 prompt 提到 dual-board、或数据目录里 \`board.json\` 还有未完成任务时，**先读协议再动工**。
 - **写板唯一入口**：本插件包内 \`tools/dual-board/board.sh\`（\`new\` / \`claim\` / \`complete\` / \`block\` / \`abandon\` / \`show\` / \`ready\` / \`inbox-append|unread|read|archive\` / \`scope-check\` / \`doctor\`）—— **不要手写 \`board.json\`**。
 - **脚本与协议在哪**：\`ls -d ~/.dsh/profiles/*/node_modules/dsh-second-engine/tools/dual-board/\`（以 \`link:\` 方式安装时该路径是软链，用 \`readlink -f\` 看实体）。
-- **收件箱**：\`board.sh roles show\` 里**你那个角色**对应的 \`inbox\`（默认 lead → \`inbox-lead.md\`、codex → \`inbox-codex.md\`；Pi 需先 \`board.sh roles set pi --engine pi\` 建角色，之后读 \`inbox-pi.md\`）—— **每次被唤醒的第一动作必读**。
+- **收件箱**：\`board.sh roles show\` 里**你那个角色**对应的 \`inbox\`（内置三角色，无需手动建：\`lead\` → \`inbox-lead.md\`、\`codex\` → \`inbox-codex.md\`、\`pi\` → \`inbox-pi.md\`）—— **每次被唤醒的第一动作必读**。
 - **交付必含四段**：交付 / 异议位 / 下一步建议 / 自验（并注明遵守的协议版本）。异议位不许沉默——列前提、标未验证项。
 - **终态不可复改**：\`completed\` / \`abandoned\`；出问题开新任务，并在 \`context\` / \`blocked_by\` 引用旧任务。
 - **数据目录**：默认 \`~/proj/dual-board\`，用环境变量 \`DUAL_BOARD_DIR\` 覆盖。
@@ -963,7 +968,11 @@ function configPointsTo(baseUrl) {
 function probeTaskLost(task) {
   const rt = rtOf(task)
   const pid = rt.getChildPid()
-  if (!Number.isInteger(pid) || pid <= 0) return null
+  if (!Number.isInteger(pid) || pid <= 0) {
+    const activityAt = Number.isFinite(task.activityAt) ? task.activityAt : 0
+    if (activityAt > 0 && Date.now() - activityAt >= WATCHDOG_STALL_MS) return 'activity-stale'
+    return null
+  }
   try {
     process.kill(pid, 0)
   } catch (e) {
@@ -1933,7 +1942,8 @@ export async function handleTaskCreate(req, res) {
     if (!checkTokenBudget(res)) return
     const body = await readBody(req)
     const boardId = requestedBoardId(body)
-    const request = normalizeTaskRequest(body, { workdir: DEFAULT_TASK_WORKDIR, engine: activeEngineId() })
+    const engine = activeEngineId()
+    const request = normalizeTaskRequest(body, { workdir: taskWorkdirForEngine(engine), engine })
     const { prompt, workdir } = request
     if (prompt === '') return send(res, { ok: false, error: 'prompt 不能为空' }, 400)
     if (!existsSync(workdir)) {

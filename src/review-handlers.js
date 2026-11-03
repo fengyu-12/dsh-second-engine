@@ -9,7 +9,7 @@ import { pruneReviewFiles } from './cleanup.js'
 import { appendReviewIssuesBlock, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson } from './parse.js'
 import { REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_DEFAULT_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, normalizeLedgerEntries, normalizeReply } from './normalize.js'
 import { buildReviewContext, buildReviewPrompt, clipText, mergeRoundIntoLedger, readReviewOut, spawnReviewRound } from './review-core.js'
-import { DEFAULT_TASK_WORKDIR, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS, checkTokenBudget, ensureGitBaseline, ensureIssueIds, errMsg, finalizeJob, isBlockedVerdict, loadKeyring, notify, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, taskView, viewStatus } from './index.js'
+import { taskWorkdirForEngine, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS, checkTokenBudget, ensureGitBaseline, ensureIssueIds, errMsg, finalizeJob, isBlockedVerdict, loadKeyring, notify, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, taskView, viewStatus } from './index.js'
 
 export function finalizeReview(task, status, verdict, error) {
   const first = finalizeJob(task, undefined, status, {
@@ -305,9 +305,12 @@ export async function handleReviewCreate(req, res) {
     // 复核与 task 对齐（2026-10-25 修复）：接受 body.workdir，缺目录直接 400。
     // 旧版缺目录时静默退回 ~/.codex —— 那里是 keyring.json / sessions / *.sqlite，
     // 评审进程的 cwd 会落进密钥目录：语境错位，且"不读凭据"只能靠提示词去防。
+    // 固定 'codex'（2026-11-04）：复核恒走 codex exec（registry.js:50 review:true，
+    // pi 侧 review:false），不能跟 activeEngineId() —— 否则 activeEngine=pi 时
+    // 工作区指向 ~/pi-workspace，但真正执行复核的仍是 Codex，二者错位。
     const workdir = typeof body.workdir === 'string' && body.workdir.trim() !== ''
       ? body.workdir.trim()
-      : DEFAULT_TASK_WORKDIR
+      : taskWorkdirForEngine('codex')
     if (!existsSync(workdir)) {
       return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
     }
