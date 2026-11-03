@@ -1,5 +1,6 @@
 // src/pi-panel.js —— Pi 面板 / 渠道 / 桥 / 清理路由（2026-11-03 拆出）
 // import 头由主控预置，Pi 只负责追加函数体。
+import { errMsg, loadKeyring, piHasProvider, piProvidersBag, readPiJson, resolvePiProvider, sendPiWriteError, PI_PROVIDER_ID_RE, PI_CHANNEL_APIS, MCP_NAME_PATTERN } from './index.js'
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'

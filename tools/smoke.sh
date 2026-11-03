@@ -106,7 +106,6 @@ process.exit(failed);
 JS
 if SE_ROOT="$ROOT" node "$TMP/toml.test.mjs"; then ok "引号感知 / 无空格尾注 / 单引号字符串"; else bad "注释保留单测失败（见上）"; fi
 
-printf '\n结果：%d 通过 / %d 失败 / %d 跳过\n' "$PASS" "$FAIL" "$SKIP"
 printf '\n== 8/8 三处落点对齐 ==\n'
 PUB_DIR="${SE_PUBLISH_DIR:-/root/Documents/deepseek-harness/default-workspace/共同工作区/second-engine-publish}"
 LOAD_DIR="${SE_LOAD_DIR:-$HOME/.dsh/plugin-src/dsh-second-engine}"
@@ -189,8 +188,8 @@ printf '\n== 9/9 未定义变量（no-undef）==\n'
 # 为什么加这段：`node --check` 只查语法。2026-10-28 设置页引用了浮球面板的 busy，
 # 语法完全合法，运行时 ReferenceError 把整块设置页渲染搞白。eslint 的 no-undef 能抓。
 if command -v eslint >/dev/null 2>&1 && [ -f "$ROOT/tools/lint-undef.config.mjs" ]; then
-  if eslint --config "$ROOT/tools/lint-undef.config.mjs" "$ROOT/lib/client.js" "$ROOT/src/index.js" >/tmp/se-lint.$$ 2>&1; then
-    ok "no-undef 干净（client.js + index.js）"
+  if eslint --config "$ROOT/tools/lint-undef.config.mjs" "$ROOT/lib/client.js" "$ROOT"/src/*.js "$ROOT"/src/engine/*.js >/tmp/se-lint.$$ 2>&1; then
+    ok "no-undef 干净（client.js + src 全量 22 个模块）"
   else
     bad "no-undef 报错："; grep -E "error" /tmp/se-lint.$$ | head -5
   fi
@@ -198,5 +197,26 @@ if command -v eslint >/dev/null 2>&1 && [ -f "$ROOT/tools/lint-undef.config.mjs"
 else
   skip "eslint 未安装（npm i -g eslint）"
 fi
+
+printf '\n== 10/10 模块启动检查（拆分前置，2026-11-02）==\n'
+# 为什么加：拆 src/index.js 之前，得先能证明「模块能加载、导出还在、引擎契约没断」。
+# 判据：tests/index-boot.mjs 全绿（import 成功 + 13 个 src 子模块可加载 + ENGINES 契约在位）。
+if [ ! -f "$ROOT/tests/index-boot.mjs" ]; then
+  skip "无 tests/（发布包 files 不含 tests；开发件自检只在实体跑）"
+else
+if node "$ROOT/tests/index-boot.mjs" >"$TMP/boot.log" 2>&1; then
+  ok "index.js 可导入 + src 子模块全可加载 + 引擎契约在位"
+else
+  bad "模块启动检查失败："; tail -3 "$TMP/boot.log"
+fi
+
+if node "$ROOT/tests/apply-boot.mjs" >"$TMP/apply.log" 2>&1; then
+  ok "apply(ctx) 可执行 + 35 条路由注册 + 2 个钩子"
+else
+  bad "apply 启动检查失败："; tail -3 "$TMP/apply.log"
+fi
+fi
+
+printf '\n结果：%d 通过 / %d 失败 / %d 跳过\n' "$PASS" "$FAIL" "$SKIP"
 
 [ "$FAIL" -eq 0 ]

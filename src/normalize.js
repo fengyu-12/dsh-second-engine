@@ -1,4 +1,6 @@
 // src/normalize.js — review 与 issue 归一化（2026-11-02 从 index.js 拆出）
+import { createHash } from 'node:crypto'
+import { canonicalIssueText } from './review-core.js'
 import { WIRE_API } from './constants.js'
 
 export const REVIEW_DEFAULT_ROUNDS = 3

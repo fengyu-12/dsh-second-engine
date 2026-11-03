@@ -364,11 +364,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.7）
+## 支持能力一览（v3.8.8）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **3.8.7 提醒系统改版 + 送达修复** | ✅ 3.8.7 | ① `mood-watch` 三种 kind 文案分开：`stop` 只停手+确认范围 / `interrupt` 判「话没说完 vs 方向错」 / `correction` 走三分类，各保留「第二引擎可配合」但限定边界（stop 明确写本次叫停不触发派单）② 四类注入文案统一以 `[SECOND_ENGINE:...] 本条由 second-engine 插件生成，不是用户发言。` 开头，模型可判别来源、审计可 grep；`buildMoodMessage` 与 policy-watch 注入处加安全红线注释（禁止回填用户输入/外部内容）③ 文案删掉写死端点，统一改「可路由」表述 ④ 修 `policy-watch` 送达失效：文件变化不再删 `pending`、补 `code===0` 竞态防护、`pending` 带 `hitSeq`、送达前 120s 时效校验 ⑤ skill 542 → **462 行**，六节外置进 `references/`（`ref-dispatch-drill.md` / `ref-engine-pick.md`）⑥ `board_tool.py` 新增 `roles show/set` 子命令（N 角色泛化此前缺配置入口，Pi 一直读到 codex 的收件箱）⑦ 注入段「收件箱」改为按角色查 ⑧ 密钥与凭证红线纳入受管注入段，两台引擎 home 由插件统一写入 |
+| **3.8.8 拆分遗留修复 + 编排流程进 skill** | ✅ 3.8.8 | ① **修 Pi 设置页 HTTP 400**：拆分时 `pi-providers` / `pi-panel` / `normalize` 三个模块共缺 **20 处导入**（`PI_*` 常量、`send`/`readBody`/`errMsg`、fs/crypto、`extractModels` 等），函数一调用就 `not defined`，面板拿到空 body；补 import 后全量 `no-undef` 归零 ② **no-undef 覆盖面 2 → 22 个模块**（此前只查 `client.js` + `index.js`，拆分模块零覆盖，正是漏因；`client.js` 里 `get` 类误报已排除）③ **skill 新增编排决策**：先判「是否编排」（跨阶段交接 / 持续跟踪 / 高风险兜底），再建项目根 `PLAN.md`；字段 `触发依据/阶段/前置/谁做/通道/产出/验收证据/失败处置`；每轮只启动前置已满足项 ④ **多桥实测**：每个 Codex 桥 = 2 个常驻进程、Pi 桥 = 1 个，`BRIDGE_STATE_DIR` 隔离即可多开，桥必须各自 board 记账 ⑤ **提醒通道实测修正**：Toast 不依赖通知权限且后台可见（首选）→ 振动 → 通知；旧「画中画无权限也能收通知」未复现，已标待复核 ⑥ Pi 面板三处 Codex 文案中性化 + Pi 会话清理卡改为可折叠 |
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 

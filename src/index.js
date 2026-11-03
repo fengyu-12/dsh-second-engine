@@ -1195,7 +1195,7 @@ export function countPiJsonl(dir) {
 // 格式依据 Pi docs/models.md:45「Configure a compatible endpoint」：
 //   { providers: { <id>: { baseUrl, api, apiKey, models: [{ id }] } } }
 // apiKey 支持 $ENV 插值；本接口不回显明文、不写日志，文件权限 0600，改动前留 .bak。
-const PI_CHANNEL_APIS = new Set([
+export const PI_CHANNEL_APIS = new Set([
   'openai-completions', 'openai-responses', 'anthropic-messages',
   'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream',
 ])
@@ -1226,7 +1226,7 @@ export const CODEX_WIRE_OPTIONS = [
   { value: 'responses', label: 'responses（直连）', bridged: false },
   { value: 'completions', label: 'chat（经本地桥）', bridged: true },
 ]
-const PI_WIRE_OPTIONS = [
+export const PI_WIRE_OPTIONS = [
   { value: 'openai-completions', label: 'OpenAI 兼容（chat completions）', bridged: false },
   { value: 'openai-responses', label: 'OpenAI Responses', bridged: false },
   { value: 'anthropic-messages', label: 'Anthropic Messages', bridged: false },
@@ -1239,7 +1239,7 @@ const PI_WIRE_OPTIONS = [
 // 目的：前端 ProviderCard 一行都不改。把 Pi 的 models.json + settings.json 映射成
 // Codex 的 { ok, active, providers:[{id,name,baseUrl,model,apiKey:{configured,preview}}] }。
 // 这样「编辑 / 删除 / 填 Key / 拉模型 / 切当前」全部沿用既有实现 —— 不再维护第二套 UI。
-const PI_SETTINGS_PATH = join(homedir(), '.pi', 'agent', 'settings.json')
+export const PI_SETTINGS_PATH = join(homedir(), '.pi', 'agent', 'settings.json')
 // per-provider 模型记忆（2026-11-02）：Pi 的 settings.json 只有一对全局 defaultProvider/defaultModel，
 // 切提供方时模型不跟着换（实测：当前是 deepseek 但仍显示 glm-5.2）。按 provider 各记一份。
 // ⚠️ 不写进 models.json —— 那是 Pi 的配置且有 schema 校验，塞未知字段可能整份被拒。
@@ -1280,7 +1280,7 @@ export function readPiJson(path) {
 // rename 之后 tmp 已被顶走 → ENOENT 半途失败；`.bak-<ts>` 同毫秒也互相覆盖。
 // 做法：per-path  promise 链（进程内串行队列）。只在本进程内串行，不是跨进程文件锁
 // （那需要新依赖，本轮禁止）；跨进程仍靠原子 rename 保证「不出现半截文件」。
-const PI_WRITE_QUEUES = new Map()
+export const PI_WRITE_QUEUES = new Map()
 
 // 严格读（写基线专用）：坏 JSON / 读不到 → 抛 PiWriteAborted，**绝不**拿 {} 当基线。
 // 与旧 readPiJsonForWrite 同一口径（紫东审查 P0-2/P0-3），只是把「已发响应」改成抛错，
@@ -1307,7 +1307,7 @@ export function readPiJsonStrict(path) {
 
 // wireApi（Codex 术语）↔ api（Pi 术语）
 // 接受三种输入：Codex 的 responses/completions，或 Pi 自己的 api 值（原样直通）。
-const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream'])
+export const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream'])
 
 
 /** Pi 快照 → Codex 形状。内置只预设 deepseek（用户要求），其余全在 models.json 里。 */
@@ -1334,8 +1334,8 @@ const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic
 // 注意：`__proto__` 本来就被首字符 [A-Za-z0-9] 挡掉，真正能穿过去的是
 // constructor / prototype / toString 这类**首字符合法**的 Object.prototype 键名，
 // 所以正则之外还要显式列出要拒绝的键。
-const PI_PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/
-const PI_PROVIDER_ID_BLOCKED = ['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']
+export const PI_PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/
+export const PI_PROVIDER_ID_BLOCKED = ['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']
 // providers 容器的安全取法：一律 hasOwnProperty 判存在，读到的是对象自己的键才算数，
 // 继承链上的 constructor/toString 不会被当成「已存在的提供方」。
 // 另外把已存在的普通对象换成原型为 null 的副本（原对象属性逐个 own-key 拷过来，

@@ -1,9 +1,19 @@
 // src/pi-providers.js —— Pi 自定义渠道的读写与快照（2026-11-03 拆出）
-// 只放函数体；import 头由主控预置，Pi 只负责追加函数。
+// 只放函数体；import 头由主控预置，Pi 只负责追加函数体。
+import { chmodSync, copyFileSync, existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { extractModels } from './parse.js'
+import { invalidatePiModelsCache, piAvailableModels } from './engine/pi-probe.js'
+import { prunePiBackups } from './cleanup.js'
 import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { piHasProvider, piProvidersBag, readPiJson, readPiJsonStrict, readPiModelMemory, resolvePiProvider, sendPiWriteError, readPiMcp, modelsUrl, bigmodelAuxModelsUrl, rememberPiModel } from './index.js'
+import { PI_API_SET, PI_SETTINGS_PATH, PI_WIRE_OPTIONS, PI_WRITE_QUEUES, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, errMsg } from './index.js'
+import { PI_MODELS_PATH, PI_PROVIDERS } from './engine/pi-probe.js'
+import { PI_BRIDGE_PORT } from './engine/pi-bridge.js'
+import { send } from './core.js'
+import { readBody } from './io.js'
 
 
 // ===== 以下 12 个函数自 src/index.js 拆出（按原行号顺序），供 pi 渠道读写复用 =====
