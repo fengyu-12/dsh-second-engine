@@ -191,11 +191,9 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 </p>
 
 <p align="center">
-  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/settings-model.jpg" width="46%" alt="界面风格与模型思考">
-  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/pi-chat.jpg" width="46%" alt="Pi 引擎对话">
+  <img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/settings-model.jpg" width="92%" alt="界面风格、字号、模型与思考等级">
   <br>
-  <sub>左：<b>界面风格</b>（Codex 蓝 / Claude 陶土色）· 字号 · 模型与思考等级。
-  <br>右：<b>Pi 引擎</b> —— 同一个聊天桥换个引擎，模型与思考档位同样可切。</sub>
+  <sub><b>界面风格</b>（Codex 蓝 / Claude 陶土色 / Pi 青紫）· 字号 · 模型与思考等级，三引擎同一套面板。</sub>
 </p>
 
 ### 提示开关（默认全关）
