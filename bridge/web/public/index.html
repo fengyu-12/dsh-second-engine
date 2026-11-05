@@ -7,7 +7,7 @@
 <script>
 try {
   var s = localStorage.getItem('bridge_skin');
-  document.documentElement.setAttribute('data-skin', s === 'claude' ? 'claude' : 'codex');
+  document.documentElement.setAttribute('data-skin', s === 'claude' || s === 'pi' ? s : 'codex');
   var t = localStorage.getItem('bridge_theme');
   document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
   var f = localStorage.getItem('bridge_font');
@@ -75,6 +75,40 @@ try {
     --bubble-me: #2f2a24; --code-bg: #242220;
     --input-bg: #211f1c; --btn-fg: #1a1917;
     --sel: #2c2925; --hover: rgba(255,255,255,.05);
+    --mask: rgba(0,0,0,.6);
+    --shadow-1: 0 1px 2px rgba(0,0,0,.3);
+    --shadow-2: 0 8px 28px rgba(0,0,0,.45);
+  }
+  /* Pi 皮肤（2026-11-06 改色）：用户反馈珊瑚橙与 Codex 的蓝、Claude 的橙都难分，改为「浅=青色，深=紫」。
+     浅色主题 accent #0f766e：对白 #fff 5.47:1、对 --bg 5.14:1、对 --bubble-me 4.75:1，均 ≥4.5。
+     深色主题 accent #9a74f5：对 --panel 4.85:1、对 --bg 5.22:1（作文字/链接可读）；按钮前景 #15191a 对其 5.22:1。
+     注意：建议区间 #5b21b6~#6d28d9 在深底上仅 1.8~2.5:1，当文字色看不清，故深色档取同色相的亮档紫。
+     底色保持冷灰，与 Claude 的暖米底拉开。 */
+  html[data-skin="pi"][data-theme="light"] {
+    --bg: #f7f8f8; --panel: #ffffff; --panel2: #eef1f1;
+    --line: #e4e8e8; --line2: #d3dad9;
+    --fg: #1b2120; --dim: #566260; --muted: #8a9391;
+    --accent: #0f766e; --err: #b23c30; --warn: #8a5a00; --ok: #2f7d4f;
+    --acc-weak: rgba(15,118,110,.13); --err-weak: rgba(178,60,48,.10);
+    --warn-weak: rgba(138,90,0,.12); --ok-weak: rgba(47,125,79,.13);
+    --bubble-me: #e3f2f1; --code-bg: #f3f8f7;
+    --input-bg: #ffffff; --btn-fg: #ffffff;
+    --sel: #edf0f0; --hover: rgba(18,30,28,.05);
+    --mask: rgba(18,21,26,.38);
+    --shadow-1: 0 1px 2px rgba(20,24,31,.05);
+    --shadow-2: 0 8px 28px rgba(20,24,31,.14);
+  }
+  html[data-skin="pi"][data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #15191a; --panel: #1b2021; --panel2: #232829;
+    --line: #2c3231; --line2: #3a4140;
+    --fg: #e8ebea; --dim: #a0a8a6; --muted: #7e8785;
+    --accent: #9a74f5; --err: #f4796b; --warn: #e3b341; --ok: #57ab5a;
+    --acc-weak: rgba(154,116,245,.20); --err-weak: rgba(244,121,107,.15);
+    --warn-weak: rgba(227,179,65,.14); --ok-weak: rgba(87,171,90,.17);
+    --bubble-me: #2a2538; --code-bg: #1a1d22;
+    --input-bg: #1b2021; --btn-fg: #15191a;
+    --sel: #242a29; --hover: rgba(255,255,255,.05);
     --mask: rgba(0,0,0,.6);
     --shadow-1: 0 1px 2px rgba(0,0,0,.3);
     --shadow-2: 0 8px 28px rgba(0,0,0,.45);
@@ -283,6 +317,13 @@ try {
     font-size: 12px; color: var(--muted); line-height: 1.7;
     padding: 1px 0 1px 12px; border-left: 2px solid var(--line2); margin: 1px 0 1px 2px;
   }
+  /* 可折叠活动行（思考等长内容）：点击切换预览 / 全文，配色全部复用现有变量 */
+  .act-fold { cursor: pointer; }
+  .act-fold:hover { color: var(--dim); border-left-color: var(--muted); }
+  .act-fold:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  .act-fold::after { content: ' ▸ 展开'; color: var(--accent); white-space: nowrap; }
+  .act-fold.act-open { color: var(--dim); border-left-color: var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .act-fold.act-open::after { content: '\A▾ 收起'; white-space: pre; }
   .note {
     display: flex; gap: 8px; align-items: baseline;
     font-size: 12.5px; line-height: 1.6; color: var(--dim);
@@ -667,6 +708,7 @@ try {
           <span class="seg" id="seg-skin">
             <button data-v="codex" aria-pressed="true">Codex</button>
             <button data-v="claude" aria-pressed="false">Claude</button>
+            <button data-v="pi" aria-pressed="false">Pi</button>
           </span>
         </div>
         <div class="srow">
@@ -728,7 +770,7 @@ const TOKEN = localStorage.getItem('bridge_token') || '';
 // ⚠️ 这里的 'codex' 是**引擎标识**，与 data-skin=codex/claude 那套配色皮肤名无关（红线：皮肤名不改）。
 let engineId = '';
 let engineName = 'Codex';
-const ENGINE_LABELS = { codex: 'Codex', pi: 'Pi' };
+const ENGINE_LABELS = { codex: 'Codex', pi: 'Pi', claude: 'Claude' };
 const engineHeaders = () => ({ 'x-bridge-token': TOKEN });
 
 function applyEngineIdentity() {
@@ -738,7 +780,7 @@ function applyEngineIdentity() {
 // 只认服务端明说的 engine 字段；两个端点都没给 → 保持 Codex 兜底。
 function noteEngineIdentity(raw) {
   const id = String((raw && raw.engine) || '').toLowerCase();
-  if (id !== 'pi' && id !== 'codex') return;
+  if (id !== 'pi' && id !== 'codex' && id !== 'claude') return;
   if (id === engineId) return;
   engineId = id;
   engineName = ENGINE_LABELS[id] || 'Codex';
@@ -922,7 +964,7 @@ function replay() {
   lastBubble = null;
   for (const entry of entries) {
     if (entry.t === 'me' || entry.t === 'ai') addMessage(entry.t, entry.text, true);
-    else if (entry.t === 'act') addActivity(entry.name, entry.detail, true);
+    else if (entry.t === 'act') addActivity(entry.name, entry.detail, true, entry.full);
     else if (entry.t === 'note') addNote(entry.text, entry.level, true);
   }
   if (entries.length) scroll(true);
@@ -978,6 +1020,7 @@ function newThread() {
   stamp = '';
   renderConvoList();
   setStatus('新会话');
+  loadRuntimeSettings();
   $('#input').focus();
 }
 
@@ -1022,10 +1065,20 @@ document.addEventListener('click', () => closeEffortMenu());
 async function loadRuntimeSettings() {
   const id = threadId;
   runtimeModel.disabled = !id || !!controller;
-  runtimeEffortBtn.disabled = !id || !!controller;
-  if (!id || !TOKEN) { renderEffortLevels([], ''); return; }
+  // 档位可预设：新会话（无 threadId）也允许点开；只有回复进行中才禁用（后端无会话时把 effort 存内存、下次启动生效）
+  runtimeEffortBtn.disabled = !!controller;
+  if (!TOKEN) {
+    // 无 token（本地直连的桥）不发请求，但模型下拉不能停在「（读取中…）」
+    renderEffortLevels([], '');
+    runtimeModel.replaceChildren();
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = '（先开始会话）';
+    runtimeModel.appendChild(o);
+    runtimeModel.disabled = true;
+    return;
+  }
   try {
-    const r = await fetch(`/api/runtime-settings?threadId=${encodeURIComponent(id)}`, { headers: { 'x-bridge-token': TOKEN } });
+    const r = await fetch(`/api/runtime-settings${id ? `?threadId=${encodeURIComponent(id)}` : ''}`, { headers: { 'x-bridge-token': TOKEN } });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
     if (id !== threadId) return;
@@ -1045,16 +1098,32 @@ async function loadRuntimeSettings() {
         runtimeModel.appendChild(o);
       }
       runtimeModel.value = data.model && models.includes(data.model) ? data.model : models[0];
-      runtimeModel.disabled = !!controller;
+      runtimeModel.disabled = !id || !!controller; // 模型选择仍需会话；只有思考档允许预设
     }
     renderEffortLevels(data.levels || [], data.effort || '');
     runtimeEffortBtn.disabled = !(data.levels || []).length || !!controller;
   } catch (err) {
-    if (id === threadId) setStatus(`设置读取失败：${err.message}`);
+    // 三家桥共用这份前端，后端契约不同：Claude 桥无 threadId 也返回设置，
+    // Codex/Pi 桥要求必须带 threadId（回「缺少 threadId」）。无会话时静默降级，
+    // 别把契约差异挂成红色故障（2026-11-06 回归：Codex 桥新会话报「设置读取失败」）。
+    // 注意 threadId 的「无会话」值是 null 不是 ''（:805 `|| null`）——用 id && 判空，
+    // 写成 id !== '' 会让 null 也走进报错分支（2026-11-06 二次回归）。
+    if (id && id === threadId) setStatus(`设置读取失败：${err.message}`);
+    else {
+      renderEffortLevels([], '');
+      runtimeEffortBtn.disabled = true;
+      // 模型下拉别卡在「（读取中…）」：无会话时明确说先开会话
+      runtimeModel.replaceChildren();
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '（先开始会话）';
+      runtimeModel.appendChild(o);
+      runtimeModel.disabled = true;
+    }
   }
 }
 async function updateRuntimeSettings(patch) {
-  if (!threadId || runtimeSettingsBusy) return;
+  if (runtimeSettingsBusy) return;
+  if (!threadId && patch.effort === undefined) return; // 无会话时只允许预设思考档
   const id = threadId;
   runtimeSettingsBusy = true;
   runtimeModel.disabled = true;
@@ -1068,7 +1137,7 @@ async function updateRuntimeSettings(patch) {
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
-    setStatus('当前会话设置已切换');
+    setStatus(id ? '当前会话设置已切换' : '思考档已预设，下次启动生效');
     await loadRuntimeSettings();
   } catch (err) {
     setStatus(`切换失败：${err.message}`);
@@ -1180,11 +1249,31 @@ function addAgentChunk(text) {
   scroll(false);
 }
 
-function addActivity(name, detail, restore) {
-  const line = el('div', 'act', '· ' + name + (detail ? '：' + detail : ''));
+function addActivity(name, detail, restore, full) {
+  const preview = detail || '';
+  const line = el('div', 'act', '· ' + name + (preview ? '：' + preview : ''));
+  // 折叠（2026-11-06）：思考这类长内容只显示预览，点一下展开全文。
+  // 数据全量进会话（pushEntry 带 full），收起只是显示层的选择，不是截断。
+  const hasFull = typeof full === 'string' && full.length > preview.length;
+  if (hasFull) {
+    line.classList.add('act-fold');
+    line.title = '点击展开全文';
+    line.tabIndex = 0;
+    line.setAttribute('role', 'button');
+    line.setAttribute('aria-expanded', 'false');
+    const toggle = () => {
+      const open = line.classList.toggle('act-open');
+      line.setAttribute('aria-expanded', String(open));
+      line.textContent = '· ' + name + '：' + (open ? full : preview);
+    };
+    line.addEventListener('click', toggle);
+    line.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  }
   log.appendChild(line);
   lastBubble = null;
-  if (!restore) pushEntry({ t: 'act', name, detail });
+  if (!restore) pushEntry(hasFull ? { t: 'act', name, detail: preview, full } : { t: 'act', name, detail: preview });
   scroll(false);
 }
 
@@ -1294,7 +1383,7 @@ async function send() {
         } else if (ev.kind === 'text') {
           addAgentChunk(ev.text);
         } else if (ev.kind === 'activity') {
-          addActivity(ev.name, ev.detail);
+          addActivity(ev.name, ev.detail, false, ev.full);
         } else if (ev.kind === 'note') {
           // 「模型元数据缺失」是已知的无害告警，降级成黄色，别当成错误
           const known = ev.text.startsWith('Model metadata for');
@@ -1355,11 +1444,12 @@ $('#stop').addEventListener('click', stop);
 const SKIN_KEY = 'bridge_skin';
 const THEME_KEY = 'bridge_theme';
 function applySkin(s) {
-  const claude = s === 'claude';
-  document.documentElement.setAttribute('data-skin', claude ? 'claude' : 'codex');
+  const skinName = s === 'claude' || s === 'pi' ? s : 'codex';
+  document.documentElement.setAttribute('data-skin', skinName);
   const btn = $('#skin');
-  btn.textContent = claude ? 'CL' : 'CX';
-  btn.title = claude ? '当前：Claude 风（点一下换 Codex 风）' : '当前：Codex 风（点一下换 Claude 风）';
+  btn.textContent = { codex: 'CX', claude: 'CL', pi: 'PI' }[skinName];
+  // 顶栏按钮按 codex → claude → pi 循环
+  btn.title = { codex: '当前：Codex 风（点一下换 Claude 风）', claude: '当前：Claude 风（点一下换 Pi 风）', pi: '当前：Pi 风（点一下换 Codex 风）' }[skinName];
 }
 // 主题：浅色默认，点一下切深色，选择记在 localStorage（重开还是你选的那个）
 // 图标（月亮/太阳）由 CSS 按 html[data-theme] 切换，这里不再写 emoji（无 emoji 字体的环境会变豆腐块）
@@ -1370,12 +1460,12 @@ function applyTheme(t) {
   btn.title = dark ? '切到浅色' : '切到深色';
   btn.setAttribute('aria-label', btn.title);
 }
-let skin = localStorage.getItem(SKIN_KEY) === 'claude' ? 'claude' : 'codex';
+let skin = localStorage.getItem(SKIN_KEY) === 'claude' || localStorage.getItem(SKIN_KEY) === 'pi' ? localStorage.getItem(SKIN_KEY) : 'codex';
 let theme = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
 applySkin(skin);
 applyTheme(theme);
 $('#skin').addEventListener('click', () => {
-  skin = skin === 'claude' ? 'codex' : 'claude';
+  skin = skin === 'codex' ? 'claude' : skin === 'claude' ? 'pi' : 'codex';
   try { localStorage.setItem(SKIN_KEY, skin); } catch {}
   applySkin(skin);
 });

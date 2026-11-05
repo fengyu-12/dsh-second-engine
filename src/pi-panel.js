@@ -159,7 +159,7 @@ export async function handlePiChannelCreate(req, res) {
       return
     }
     const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
-    const out = await piWriteJson(PI_MODELS_PATH, (doc) => {
+    await piWriteJson(PI_MODELS_PATH, (doc) => {
       const bag = piProvidersBag(doc)   // D1：null 原型 + 一律 hasOwnProperty 判存在
       const prev = piHasProvider(bag, id) ? bag[id] : undefined
       // 留空 = 沿用已有 key（编辑场景）或走 $ENV 插值（新建场景），不把空串写进文件。

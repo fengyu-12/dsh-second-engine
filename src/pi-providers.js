@@ -6,15 +6,14 @@ import { extractModels } from './parse.js'
 import { invalidatePiModelsCache, piAvailableModels } from './engine/pi-probe.js'
 import { prunePiBackups } from './cleanup.js'
 import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { homedir } from 'node:os'
+import { dirname } from 'node:path'
+
 import { piHasProvider, piProvidersBag, readPiJson, readPiJsonStrict, readPiModelMemory, resolvePiProvider, sendPiWriteError, readPiMcp, modelsUrl, bigmodelAuxModelsUrl, rememberPiModel } from './index.js'
 import { PI_API_SET, PI_SETTINGS_PATH, PI_WIRE_OPTIONS, PI_WRITE_QUEUES, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, errMsg } from './index.js'
 import { PI_MODELS_PATH, PI_PROVIDERS } from './engine/pi-probe.js'
 import { PI_BRIDGE_PORT } from './engine/pi-bridge.js'
 import { send } from './core.js'
 import { readBody } from './io.js'
-
 
 // ===== 以下 12 个函数自 src/index.js 拆出（按原行号顺序），供 pi 渠道读写复用 =====
 
@@ -257,7 +256,7 @@ export async function piProviderActive(req, res) {
     const snap = piProvidersSnapshot()
     // 写基线必须严格读：snap.settings 来自宽松读，坏 JSON 时是 {}，
     // 直接写回会把用户 settings.json 里其它键（不止 defaultProvider/Model）全丢掉（P0-3）。
-    const out = await piWriteJson(PI_SETTINGS_PATH, (settings) => {
+    await piWriteJson(PI_SETTINGS_PATH, (settings) => {
       settings.defaultProvider = id
       // 切提供方时把 defaultModel 落到「该提供方上次选的模型」；没记忆才用默认。
       // 旧写法在 deepseek 分支只在 defaultModel 为空时才设，导致切回 deepseek 仍留着上一个厂商的模型。

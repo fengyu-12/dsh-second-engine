@@ -155,7 +155,15 @@ function itemToEntry(item) {
       return { t: 'act', name: '子代理', detail: oneLine(item.kind || item.tool, 80) };
     case 'contextCompaction':
       return { t: 'note', text: '上下文已压缩', level: '' };
-    case 'reasoning':
+    case 'reasoning': {
+      // appserver 的 reasoning item：summary[] 是官方摘要，content[] 是原始内容。
+      // 优先 summary —— 部分模型的 content 是加密块或空，宁可显示摘要也别显示空行。
+      const pick = (arr) => (Array.isArray(arr)
+        ? arr.map((x) => (x && (typeof x.text === 'string' ? x.text : (typeof x.summary_text === 'string' ? x.summary_text : ''))) || '').filter(Boolean).join(' ')
+        : '')
+      const txt = pick(item.summary) || pick(item.content) || (typeof item.text === 'string' ? item.text : '')
+      return txt === '' ? null : { t: 'act', name: '思考', detail: oneLine(txt, 240), full: txt }
+    }
     case 'functionCallOutput':
     case 'hookPrompt':
     case 'enteredReviewMode':
@@ -329,7 +337,8 @@ as.on('notification', (msg) => {
     case 'item/started': {
       if (!a) break;
       const entry = itemToEntry(p.item);
-      if (entry && entry.t === 'act') a.send({ kind: 'activity', name: entry.name, detail: entry.detail });
+      // full 仅「思考」这类长内容才有；没有就不带字段，前端按老条目渲染
+      if (entry && entry.t === 'act') a.send(entry.full ? { kind: 'activity', name: entry.name, detail: entry.detail, full: entry.full } : { kind: 'activity', name: entry.name, detail: entry.detail });
       break;
     }
     case 'thread/tokenUsage/updated':

@@ -1,14 +1,14 @@
-import { collabPreset } from './collab.js'
+
 import { CODEX_DIR, CONFIG_PATH, WIRE_API } from './constants.js'
 import { ERR_LOG, noteErr, send } from './core.js'
 import { activeEngineId } from './engine/registry.js'
+import { loadClaudeProviders, handleClaudeProvider } from './claude-providers.js'
 import { readBody, saveKeyring } from './io.js'
-import { keyConfigured, sessionsBytes } from './pi-misc.js'
+import { keyConfigured } from './pi-misc.js'
 import { piProviderActive, piProviderDelete, piProviderKey, piProviderUpdate, piProvidersRoot } from './pi-providers.js'
 import { resolveCodexBinary } from './review-core.js'
 import { existsSync } from 'node:fs'
 import { CODEX_WIRE_OPTIONS, DEFAULT_ACTIVE, PRESET_IDS, PROTECTED_IDS, collabStatus, engineView, errMsg, invalidIdError, loadKeyring, maskKey, providerView, sessionsBytesCached, wireApiError, writeCodexConfig } from './index.js'
-
 
 export async function handleStatus(_req, res) {
   try {
@@ -119,12 +119,30 @@ export async function handleKey(req, res) {
 
 export async function handleProvidersList(_req, res) {
   try {
+    if (activeEngineId() === 'claude') {
+      // Claude 用自己的 provider 配置（Anthropic 协议端点），不是 Codex 的 keyring。
+      const doc = loadClaudeProviders()
+      // 形状必须与 providerView 一致：前端读 p.apiKey.configured / p.apiKey.preview，
+      // 给 hasKey 布尔值会导致「填了 Key 仍显示未配置」（2026-11-05 实机确认）。
+      const view = (doc.providers || []).map((x) => {
+        const raw = typeof x.apiKey === 'string' ? x.apiKey.trim() : ''
+        const configured = raw !== ''
+        return {
+          id: x.id, name: x.name, baseUrl: x.baseUrl, model: x.model || '',
+          wireApi: x.wireApi || 'anthropic',
+          apiKey: { configured, preview: configured ? maskKey(raw) : '' },
+        }
+      })
+      return send(res, { ok: true, active: doc.active, providers: view, wireApiOptions: [{ value: 'anthropic', label: 'anthropic（Claude 原生）', bridged: false }] })
+    }
     const doc = loadKeyring()
     send(res, { ok: true, active: doc.active, providers: doc.providers.map(providerView), wireApiOptions: CODEX_WIRE_OPTIONS })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
 export async function handleProviderAdd(req, res) {
+  if (activeEngineId() === 'claude') return handleClaudeProvider('add', req, res, { readBody, send, errMsg })
+  // Codex 分支（wireApi 只认 responses/completions）
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
@@ -161,6 +179,7 @@ export async function handleProvidersRoot(req, res) {
 
 export async function handleProviderKey(req, res) {
   if (activeEngineId() === 'pi') return piProviderKey(req, res)
+  if (activeEngineId() === 'claude') return handleClaudeProvider('key', req, res, { readBody, send, errMsg })
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' ? body.id.trim() : ''
@@ -177,6 +196,7 @@ export async function handleProviderKey(req, res) {
 }
 
 export async function handleProviderActive(req, res) {
+  if (activeEngineId() === 'claude') return handleClaudeProvider('active', req, res, { readBody, send, errMsg })
   if (activeEngineId() === 'pi') return piProviderActive(req, res)
   try {
     const body = await readBody(req)
@@ -203,6 +223,7 @@ export async function handleProviderActive(req, res) {
 }
 
 export async function handleProviderDelete(req, res) {
+  if (activeEngineId() === 'claude') return handleClaudeProvider('delete', req, res, { readBody, send, errMsg })
   if (activeEngineId() === 'pi') return piProviderDelete(req, res)
   try {
     const body = await readBody(req)
@@ -233,6 +254,7 @@ export async function handleProviderDelete(req, res) {
 }
 
 export async function handleProviderUpdate(req, res) {
+  if (activeEngineId() === 'claude') return handleClaudeProvider('update', req, res, { readBody, send, errMsg })
   if (activeEngineId() === 'pi') return piProviderUpdate(req, res)
   try {
     const body = await readBody(req)

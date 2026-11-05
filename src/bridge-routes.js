@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { activeEngineId } from './engine/registry.js'
+import { readBody } from './io.js'
 import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl } from './engine/pi-bridge.js'
 
 /** 插件根目录（src/ 的上一级），默认桥目录随包走，装到 node_modules 里也成立。 */
@@ -188,12 +189,38 @@ async function handleBridgeUrl(req, res) {
   })
 }
 
+// 独立会话端点（2026-11-06）：不带消息地「新建 / 切到历史」。目前只有 Claude 桥实现了
+// POST /api/session；其它引擎诚实回 501，不假装转发成功（Codex 走 app-server 的 thread/new，
+// Pi 走 RPC new_session，都还没接——接的时候在这里加分支）。
+async function handleBridgeSession(req, res) {
+  if ((req.method ?? 'GET') !== 'POST') return methodNotAllowed(res, 'POST')
+  const engine = activeEngineId()
+  if (engine !== 'claude') {
+    return sendJson(res, { ok: false, error: `当前引擎（${engine}）的桥还没有独立会话端点；目前只有 Claude 桥支持` }, 501)
+  }
+  let body = {}
+  try { body = await readBody(req) } catch (e) { return sendJson(res, { ok: false, error: `请求体解析失败：${String(e && e.message ? e.message : e)}` }, 400) }
+  const port = Number(process.env.CLAUDE_BRIDGE_PORT || 8789)
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    })
+    const data = await r.json().catch(() => ({ ok: false, error: 'Claude 桥返回非 JSON' }))
+    return sendJson(res, data, r.status)
+  } catch (e) {
+    return sendJson(res, { ok: false, error: `Claude 桥不可达（端口 ${port}）：${String(e && e.message ? e.message : e)}；先在设置页点「启动桥」` }, 503)
+  }
+}
+
 export function registerBridgeRoutes(wctx) {
   const routes = [
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/status`, handler: handleBridgeStatus },
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/start`, handler: handleBridgeStart },
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/stop`, handler: handleBridgeStop },
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/url`, handler: handleBridgeUrl },
+    { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/session`, handler: handleBridgeSession },
   ]
   for (const route of routes) {
     wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)

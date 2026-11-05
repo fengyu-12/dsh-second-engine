@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { CODEX_DIR } from './constants.js'
+import { checkCriteria, collectCurrent, freezeCriteria } from './criteria-snapshot.js'
 import { tasks, REVIEWS_DIR } from './state.js'
 import { send, noteErr, atomicWriteFileSync } from './core.js'
 import { gitPorcelain } from './git.js'
@@ -9,7 +10,74 @@ import { pruneReviewFiles } from './cleanup.js'
 import { appendReviewIssuesBlock, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson } from './parse.js'
 import { REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_DEFAULT_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, normalizeLedgerEntries, normalizeReply } from './normalize.js'
 import { buildReviewContext, buildReviewPrompt, clipText, mergeRoundIntoLedger, readReviewOut, spawnReviewRound } from './review-core.js'
-import { taskWorkdirForEngine, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS, checkTokenBudget, ensureGitBaseline, ensureIssueIds, errMsg, finalizeJob, isBlockedVerdict, loadKeyring, notify, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, taskView, viewStatus } from './index.js'
+import { taskWorkdirForEngine, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS, checkTokenBudget, ensureGitBaseline, ensureIssueIds, errMsg, finalizeJob, isBlockedVerdict, loadKeyring, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, viewStatus } from './index.js'
+
+// ── 判据冻结（2026-11-06）──
+// 只冻结：被审 content 的 sha256 + body.files 显式列举的文件。没传 files = 只冻结 content，
+// 绝不扫工作区（无关改动会被误判 stale）。files 必须落在 workdir 内：快照要读文件内容算哈希，
+// 放开绝对路径等于让调用方探测任意文件（含凭据目录）是否存在/是否变化。
+export const CRITERIA_MAX_FILES = 50
+
+export function normalizeCriteriaFiles(files, workdir) {
+  if (files === undefined || files === null) return { ok: true, files: [] }
+  if (!Array.isArray(files) || files.length > CRITERIA_MAX_FILES
+    || !files.every((p) => typeof p === 'string' && p.trim() !== '')) {
+    return { ok: false, error: `files 必须是非空字符串数组（最多 ${CRITERIA_MAX_FILES} 项）` }
+  }
+  const root = resolve(workdir)
+  const out = []
+  for (const raw of files) {
+    const p = raw.trim()
+    const rel = relative(root, isAbsolute(p) ? resolve(p) : resolve(root, p))
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+      return { ok: false, error: `files 里的路径必须在 workdir 内：${p}` }
+    }
+    if (!out.includes(p)) out.push(p)
+  }
+  return { ok: true, files: out }
+}
+
+/** 给任务挂冻结快照。同一 taskId 已冻结（内存或落盘记录里已有 criteria）则拒绝覆盖。 */
+export function freezeTaskCriteria(task, files) {
+  if (task.criteria !== undefined && task.criteria !== null) {
+    throw new Error(`任务 '${task.id}' 判据已冻结，拒绝覆盖`)
+  }
+  if (loadReviewRecord(task.id)?.criteria) {
+    throw new Error(`任务 '${task.id}' 的落盘记录已含冻结判据，拒绝覆盖`)
+  }
+  task.criteria = freezeCriteria({ content: task.content, workdir: task.workdir, files })
+  return task.criteria
+}
+
+/**
+ * 收尾前判 stale。只对 status='done' 判（error/cancelled 本就不发布结论）。
+ * stale：状态保持 done（前端只认 done/error/cancelled），记录加 stale:true + 原因；
+ * verdict 换成 'stale'、stopReason 换成 'stale'，旧值收进 staleOf（证据留着，但不再作结论外显）。
+ * 返回要写入的 verdict。
+ */
+export function applyStaleCheck(task, status, verdict) {
+  if (status !== 'done' || task.criteria === undefined || task.criteria === null) return verdict
+  if (task.endedAt !== null && task.endedAt !== undefined) return verdict
+  let result
+  try { result = checkCriteria(task.criteria, collectCurrent(task.criteria, { content: task.content })) } catch (e) {
+    noteErr('review-stale-check', e)
+    return verdict
+  }
+  if (!result.stale) return verdict
+  task.stale = true
+  task.staleReasons = result.reasons
+  task.staleOf = { verdict, stopReason: typeof task.stopReason === 'string' ? task.stopReason : '' }
+  task.stopReason = 'stale'
+  return 'stale'
+}
+
+function appendStaleBlock(task) {
+  const base = typeof task.output === 'string' ? task.output : ''
+  const reasons = Array.isArray(task.staleReasons) ? task.staleReasons : []
+  task.output = `${base === '' ? '' : `${base}\n\n`}---\n`
+    + `[REVIEW_STALE] 复核期间判据已变，旧结论（${task.staleOf?.verdict ?? ''}）不发布，请对新版本重新复核：\n`
+    + `${reasons.map((r) => `- ${r}`).join('\n')}\n`
+}
 
 export function finalizeReview(task, status, verdict, error) {
   const first = finalizeJob(task, undefined, status, {
@@ -18,7 +86,11 @@ export function finalizeReview(task, status, verdict, error) {
   })
   // 首次落定才做的复核专属动作（#8-10）：摘要进 output（主 AI 必经通道）+ 落盘留档。
   if (first) {
-    try { appendReviewIssuesBlock(task, { clipText }) } catch (e) { noteErr('review-issues-block', e) }
+    if (task.stale === true) {
+      try { appendStaleBlock(task) } catch (e) { noteErr('review-stale-block', e) }
+    } else {
+      try { appendReviewIssuesBlock(task, { clipText }) } catch (e) { noteErr('review-issues-block', e) }
+    }
     try { persistReviewRecord(task) } catch (e) { noteErr('review-persist', e) }
   }
   return first
@@ -38,7 +110,8 @@ export async function captureReviewDirty(task) {
 
 export async function finishReview(task, status, verdict, error, notifyDone = true) {
   await captureReviewDirty(task)
-  if (finalizeReview(task, status, verdict, error) && notifyDone) void notifyTask(task)
+  const effectiveVerdict = applyStaleCheck(task, status, verdict)
+  if (finalizeReview(task, status, effectiveVerdict, error) && notifyDone) void notifyTask(task)
 }
 
 export function reviewRecord(task) {
@@ -68,6 +141,9 @@ export function reviewRecord(task) {
     // v2：i<N> 序号水位（单调递增，接力时接续上链最大号，防跨调用重号）。
     issueSeq: Number.isFinite(task.issueSeq) ? task.issueSeq : 0,
     reviewDirty: task.reviewDirty ?? null,
+    // 判据冻结快照随记录持久化；stale 只在命中时才出现。旧记录无这些键，读侧按缺省容忍。
+    ...(task.criteria ? { criteria: task.criteria } : {}),
+    ...(task.stale === true ? { stale: true, staleReasons: task.staleReasons ?? [], staleOf: task.staleOf ?? null } : {}),
     error: typeof task.error === 'string' ? task.error : '',
   }
 }
@@ -202,7 +278,7 @@ export async function runReview(task, active) {
       rtOf(task).setChildPid(null)
       rtOf(task).setChildStart(null)
       rtOf(task).setExitCode(rtOf(task).isCancelled() ? -1 : code)
-      const raw = readReviewOut(outPath)
+      const review = readReviewOut(outPath)
       // 墙钟到点被强杀：按 wallclock 正常收尾（而非落进下面的 unparsed 解析失败分支）。
       if (task.wallHit === true) {
         task.stopReason = 'wallclock'
@@ -210,12 +286,18 @@ export async function runReview(task, active) {
         return
       }
       if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
-      const parsed = parseReviewJson(raw, { isBlockedVerdict, clipText })
-      if (!parsed.ok) {
-        task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: parsed.raw })
+      if (review === null) {
+        task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: '' })
         await finishReview(task, 'error', 'unparsed', code === 0 ? '未能从复核输出解析出 JSON' : `codex 退出码 ${code}`)
         return
       }
+      const issues = review.findings.map((finding) => ({
+        severity: finding.severity,
+        point: `${finding.file}:${finding.line} ${finding.issue}`,
+        suggestion: finding.evidence,
+        verified: true,
+      }))
+      const parsed = { issues, verdict: review.verdict, responses: [] }
       // 跨轮 ledger 并账（先并再判收敛）：本轮 issues 先归并（i<N> 沿用/分配）再按
       // responses 做状态迁移，落盘记录与终止判据用的是同一份状态。非回辩调用同样记账
       //（纯留痕，不参与判定）。responses 先过 resolveResponseIds：issueIndex 兼容下标
@@ -314,6 +396,9 @@ export async function handleReviewCreate(req, res) {
     if (!existsSync(workdir)) {
       return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
     }
+    // 判据冻结的显式文件清单：不传 = 只冻结 content。形态/越界当场 400，不静默忽略。
+    const criteriaFiles = normalizeCriteriaFiles(body.files, workdir)
+    if (!criteriaFiles.ok) return send(res, { ok: false, error: criteriaFiles.error }, 400)
     // #6（2026-10-25）：与 task 路径对齐——无版本控制的 workdir 先打基线 commit
     //（幂等；已有 .git 的活仓库这里是空操作，窗口证据改由快照差集负责，见 runReview）。
     await ensureGitBaseline(workdir)
@@ -486,6 +571,8 @@ export async function handleReviewCreate(req, res) {
       wallMs: doc.reviewWallMs,
       tokenLimit: doc.reviewTokenLimit,
     }
+    // 冻结必须在 runReview 启动前完成（同步），这样快照反映的是「开审那一刻」的文件内容。
+    freezeTaskCriteria(task, criteriaFiles.files)
     tasks.set(id, task)
     pruneTasks()
     startWatchdog(task)

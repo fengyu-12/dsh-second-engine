@@ -144,7 +144,7 @@ interface TaskRuntime {
 |---|---|---|
 | `descriptor.transport` | `task.mode` 判断 `:1749`、赋值 `:2281`；`task.child:2328`、`task.app:2329` | 由「有没有 child / app」推导，替代字符串枚举 |
 | `capabilities` | 目前**无承载点** → 新增字段，落 `taskView:1735` 与 `/status` 响应 | 纯增量，UI 按能力降级 |
-| `capabilities.chatBridge` / `chatBridgeMode` / `mcp` / `webSearch`（P4.24） | 定义 `registry.js:ENGINES[*].capabilities` → 出口 `index.js:1202 engineView()` → 消费 `client.js:418` 兜底 | 同一提交内同步四处（任务书 v2 §4.5）；新字段对旧前端是惰性增量 |
+| `capabilities.chatBridge` / `chatBridgeMode` / `mcp` / `webSearch`（P4.24） | 定义 `registry.js:ENGINES[*].capabilities` → 出口 `engineView()` → 消费 `client.js:418` 兜底 | 同一提交内同步四处（任务书 v2 §4.5）；新字段对旧前端是惰性增量 |
 | `CleanupTarget`（P4.24） | `registry.js:CLEANUP_TARGETS` → `engineView().cleanup`；实际删除仍是 `handleCleanup:2492` / `handlePiCleanup:1495` | UI 必须显示 `dir`；`resume` 与清理不得互推 |
 | `start()` | `startAppServerTask:2267`、`spawnReviewRound:3089`、exec 的 `child.on('exit'):2456`、复核的 `:3116` | 三入口收敛成一个；child 归 runtime 持有 |
 | `cancel()` | `handleTaskCancel:2504`（写意图 `:2517`）、`handleReviewCancel:3518`（`:3530`） | 两处只写意图，不预置终态（已经是现状） |

@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { createRuntime } from './runtime.js'
 import { createPiRpcRuntime } from './pi-rpc-runtime.js'
+import { createClaudeRuntime } from './claude-runtime.js'
 
 /** 当前引擎落在 ~/.dsh/second-engine-engine.txt（一行引擎 id）；不存在 = codex。 */
 export const ENGINE_FILE = join(homedir(), '.dsh', 'second-engine-engine.txt')
@@ -34,6 +35,12 @@ export const CLEANUP_TARGETS = {
     filePattern: '*.jsonl',
     appliesToEngine: 'pi',
     confirmRequired: true,   // POST /api/pi-cleanup 要求 body.confirm === true
+  },
+  claude: {
+    dir: join(homedir(), '.claude', 'projects'),
+    filePattern: '*.jsonl',
+    appliesToEngine: 'claude',
+    confirmRequired: true,
   },
 }
 
@@ -77,6 +84,23 @@ export const ENGINES = {
       versionCheck: 'npm',         // npm registry
       mcp: 'pi-config',            // MCP 落 ~/.pi/agent/mcp.json（index.js:4587-4600 已映射成 Codex 形状）
       webSearch: false,            // Pi 无 web_search 开关：GET 如实回 disabled，写入 400（index.js:4557-4567）
+    },
+  },
+  claude: {
+    id: 'claude',
+    label: 'Claude',
+    create: createClaudeRuntime,
+    capabilities: {
+      executor: { protocolVersion: 1, events: true, cancel: true, resume: false },
+      eventStream: 'fine',         // stream-json：实测有 system/init、assistant、result
+      approvals: false,            // 一次性模式无权限回执通道（双向 NDJSON 才有 control_request）
+      resume: true,                // --resume 实测记忆保持（问它记住的数字能答对）
+      review: false,               // 2026-11-06：模型能审（实测抓出 bug），但**插件复核链路恒走 codex exec**（review-handlers.js:308），故按链路语义记 false；UI 照 Pi 一样隐藏复核区
+      chatBridge: true,            // 2026-11-06 实测通过：常驻双向 NDJSON，bridge/claude/server.mjs 监听 8789
+      modelSwitch: 'flag',         // --model 参数，不写任何配置文件（⇒ 不需要写入口锁）
+      versionCheck: 'npm',         // npm registry，不是 GitHub release
+      mcp: 'flag',                 // --mcp-config，同为命令行参数
+      webSearch: true,             // 内置 WebSearch 工具
     },
   },
 }

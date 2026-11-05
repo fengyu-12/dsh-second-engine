@@ -22,7 +22,7 @@
 
 在同一台 Android 设备的 DSHA 容器（Ubuntu / proot）里，双引擎并存：DSH 侧 agent 负责编排与审核，Codex 独立复核、并行下探、提供异构第二意见——三者各司其职：**Codex 生产 · DSH 侧 agent 编排审核 · 用户裁决**。
 
-**占用账单（安卓实测，2026-10-31）**：Codex CLI 本体 **265MB** + `code-mode-host` **68MB** + 会话数据 **127MB** + 插件 **4MB** ≈ **464MB**，换一个独立执行、互审、救场的第二 Agent。再加 Pi（本体 21MB + 数据 1MB）约 **486MB**——Pi 只有 Codex 的十三分之一，但功能也少（无复核链路、无内置联网）。
+**占用账单（安卓实测：Codex/Pi 测于 2026-10-31，Claude 补于 2026-11-06）**：Codex CLI 本体 **265MB** + `code-mode-host` **68MB** + 会话数据 **127MB** + 插件 **4MB** ≈ **464MB**；Pi 本体 **21MB** + 数据 1MB ≈ **22MB**；Claude Code 包 **323MB** + `~/.claude` 数据 **8.7MB** ≈ **332MB**。**三家全装约 818MB** —— 按需装，别为「以防万一」全上；Pi 只有 Codex 的十三分之一，但功能也少（无复核链路、无内置联网）。
 
 ## 为什么安卓上"多一个 agent"这么难，怎么绕过的
 
@@ -38,10 +38,11 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 |---|---|
 | Codex（默认第二引擎） | 生产：小粒度任务交付、独立复核、并行下探、内置联网搜索 |
 | Pi（可替换的第二引擎） | 同上，优势是**多 provider 并存**、体积仅 21MB；代价是无复核链路、无内置联网（要联网得自己配 MCP） |
+| Claude Code（第三引擎） | 异构第二意见：Anthropic 血统，`--effort` 五档可调、能跑真复核；代价是包大（323MB）、思考文本取决于 provider |
 | DSH 侧 agent | 编排：拆任务、布置环境、审 diff、落主区 |
 | 用户 | 裁决：分歧点上交，最终取舍由人 |
 
-两个引擎**面板是同一套**，切换只改 `~/.dsh/second-engine-engine.txt`；但**会话不迁移**——已开的工单留在原引擎。
+三家**面板是同一套**，切换只改 `~/.dsh/second-engine-engine.txt`；但**会话不迁移**——已开的工单留在原引擎。**派单时也可以不切引擎**：`POST /api/task` 的 body 加 `"engine":"claude"` 就只这一单走它，active 不动（2026-11-06 实测：两单不同引擎可同时跑）。
 
 ## 什么时候该把活交给另一个引擎（多引擎协作策略）
 
@@ -95,8 +96,22 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 |---|---|---|
 | Codex | `127.0.0.1:3095`（`bridge/web/ctl.sh`，`BRIDGE_PORT` 可改） | `codex-env -u` 直接取网址 |
 | Pi | `127.0.0.1:8788`（`bridge/pi/server.mjs`，`PI_BRIDGE_PORT` 可改） | 面板的桥卡或 `node bridge/pi/server.mjs` |
+| Claude | `127.0.0.1:8789`（`bridge/claude/server.mjs`，`CLAUDE_BRIDGE_PORT` 可改） | 面板的桥卡或 `node bridge/claude/server.mjs` |
 
-两个桥都**自带 token 鉴权**——等于密码，别外传。页面路由是 NDJSON 流，接自研前端时别按一次性 JSON 解析，否则界面静默无反应。
+三家桥都**自带 token 鉴权**——等于密码，别外传。页面路由是 NDJSON 流，接自研前端时别按一次性 JSON 解析，否则界面静默无反应。
+
+**2026-11-06 新增的三件事**（三家共用同一份前端）：
+
+- **切会话不用先编一条假消息**：`POST /api/bridge/session {action:"new"}` 新建，`{action:"switch", threadId:"<会话 UUID>"}` 切历史。原来只能靠 `POST /api/send` 带 `threadId` 顺带切，外部脚本为了切个会话得先发一句话。
+- **思考能展开看全文**：桥把模型的思考转成 `activity` 条目并附 `full` 完整文本，界面上显示前 240 字 + 「▸ 展开」，点一下看完整推理。Codex 能不能出思考取决于上游 provider 是否实现 reasoning summary（只回加密块的 provider 出不来）。
+- **Pi 的会话历史可切**：`/api/threads` 读 `~/.pi/agent/sessions/<cwd 编码>/` 列出全部历史，点开读回正文与思考，切过去能继续聊（内部走 `switch_session`，参数是**会话文件路径**不是 id）。
+
+**实拍**（手机浏览器，左 Claude 桥 / 右 Pi 桥）：
+
+<img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/bridge-claude.jpg" width="46%" alt="Claude 桥：思考条目可展开">
+<img src="https://github.com/fengyu-12/dsh-second-engine/raw/master/docs/images/bridge-pi.jpg" width="46%" alt="Pi 桥：思考条目可展开">
+
+两边都能看到「· 思考：…」那一行——那就是上面说的 activity 条目；点一下展开完整推理，再点收起。同一个页面、同一套操作，只有配色和底下的模型/档位跟着引擎变。
 
 ## 唤醒层：把消息递进指定会话（实验端点）
 
@@ -123,6 +138,30 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 - **AGENTS.md 双写**：插件启动时把协作协议同时写进 `~/.codex/AGENTS.md` 与 `~/.pi/agent/AGENTS.md`（Pi 那份用 Pi 身份，`"from":"pi"`）。
 - **会话落盘 + 独立工作区**：Pi 聊天桥的会话与 CLI 同源落 `~/.pi/agent/sessions/<cwd>/`；桥默认工作区 `~/pi-workspace`（`PI_BRIDGE_CWD` 可覆盖），不与 Codex 的工程目录混用。
 - **版本检查分源**：面板/浮球的版本徽标在 Codex 查 GitHub release、Pi 查 npm registry（`@earendil-works/pi-coding-agent`）。
+
+## 第三个引擎：Claude Code（2026-11-06 起）
+
+设置 → 第二引擎 → 引擎，现在有三项：`Codex` / `Pi` / `Claude`。第三个是 **Claude Code**（`claude`），Anthropic 血统——和三家里另外两家是真异构，不是同家族换壳。
+
+它走 `claude -p --input-format stream-json --output-format stream-json --verbose`，双向 NDJSON 常驻（`bridge/claude/server.mjs`，端口 **8789**）。
+
+| | Codex | Pi | Claude Code |
+|---|---|---|---|
+| 血统 | OpenAI | 自有框架 | **Anthropic** |
+| 任务下发 / 取消 / 进度 | ✅ | ✅ | ✅ |
+| 多轮复核（`/review`） | ✅ | ❌ | ❌（复核链路恒走 `codex exec`，面板照 Pi 一样隐藏复核区） |
+| 浏览器聊天桥 | 3095 | 8788 | **8789** |
+| 续会话 | ✅ | ✅ | ✅（`--resume`，实测记忆保持） |
+| 思考档位 | — | 七档 | **五档** `--effort low/medium/high/xhigh/max` |
+| MCP | `config.toml` 的 `[mcp_servers.*]` | `~/.pi/agent/mcp.json` | **`claude-mcp.json`**，经 `--mcp-config` 注入 |
+
+**三条实况，用之前先知道**：
+
+- **`--model` / `--effort` 都是启动参数**：改了必须重建进程，所以切档位或换模型会**开新会话**（旧上下文不迁移）。
+- **思考文本不一定有**：`--effort high` 能让它稳定出现（实测 4/4），但最终取决于上游 provider 是否实现 reasoning summary。中转实现的话能看到；只回加密块的 provider，界面就是空的——`output_tokens_details.thinking_tokens` 也不可靠，别拿它判断。
+- **刷新页面不保留思考**：桥的 transcript 回放只保留正文，重新加载后思考条不重现（正文与历史会话切换都在）。
+
+默认工作区 `~/claude-workspace`，会话落 `~/.claude/projects/<cwd 编码>/*.jsonl`（两层目录，清理卡按递归统计）。
 
 ## 随包分发的操作手册：skill 分层（400 行正文 + 4 个按需文件）
 
@@ -172,6 +211,22 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 提示以 `[MOOD_WATCH]` / `[POLICY_WATCH]` 标记追加到下一轮，**只报机械信号、不下结论**，是否派单仍由模型自己判断。三个开关**默认全部关闭**，只影响是否注入提示，不影响派单、互审、看板等任何功能。
 
 ## 装之前要准备什么
+
+### 工作区目录（**必须手动创建**）
+
+插件**不会**自动创建工作区。首次派单前按引擎建好：
+
+```sh
+mkdir -p ~/proj              # Codex 的默认工作区
+mkdir -p ~/pi-workspace      # Pi 的默认工作区
+mkdir -p ~/claude-workspace  # Claude 的默认工作区
+```
+
+- 想换位置：设环境变量 `SECOND_ENGINE_WORKDIR`，它会覆盖所有引擎的默认值。
+- **目录不存在时派单直接回 400**（默认工作区与自定义路径一视同仁）——这是刻意的：
+  插件不替你决定目录建在哪。
+- 也可以显式排除某个 CLAUDE.md / AGENTS.md —— 各引擎只在自己工作区里读指令文件。
+
 
 - DeepSeek Harness（新版 App + Web）
 - [OpenAI Codex CLI](https://github.com/openai/codex/releases) ≥ 0.155.1
@@ -364,10 +419,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v3.8.9）
+## 支持能力一览（v4.0.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **4.0.0 第三引擎 Claude Code + 桥与复核增强** | ✅ 4.0.0 | ① **接入 Claude Code 作第三引擎**：`ENGINES` 加 `claude`（Anthropic 血统），`claude -p` 双向 NDJSON 常驻，桥端口 8789；`registry` / 三处引擎白名单 / 工作区 `~/claude-workspace` / 知识层 `CLAUDE.md` 全部对齐 ② **桥**：新增 `POST /api/bridge/session`（`new` / `switch`，不用编一条假消息就能切会话）；三家桥把思考统一转成 `act` 条目并带 `full`，前端点一下展开全文；Pi 桥补齐**会话历史**（`/api/threads` 读 `~/.pi/agent/sessions`、`/api/transcript?id=`、`switch_session` 切过去继续聊）；新增 **Pi 皮肤**（浅色青 / 深色紫）③ **复核**：判据冻结 + stale（`/api/review` 可带 `files`，复核期间被审文件变了就不发布旧结论）；输出改严格 JSON（`verdict` + `findings[{severity,file,line,issue,evidence}]`，不合 schema 判无效复核）；派活前置校验（`timeoutMs` / `acceptance` 非法当场 400）④ **修三个真 bug**：切会话时 `stdin.end()` 之后再写导致 `ERR_STREAM_WRITE_AFTER_END` **把整座桥带走**（现在写前检查 `writable`，且桥的 stderr 落 `claude-bridge.log`、异常打 `[fatal]` 栈）；派单默认 `workdir` 按 **active 引擎** 算而不是任务引擎（active=claude 时派 pi 单会落进 `~/claude-workspace`）；桥崩溃零日志（原来 `stdio:'ignore'`）⑤ **MCP**：Claude 的 MCP 走 `--mcp-config`，设置页可增删（停用搬到旁路文件，不动启用清单） |
 | **3.8.9 Pi 失联检测 + 工作区分流 + 角色补齐** | ✅ 3.8.9 | ① **修 Pi 任务失联检测失效**：`probeTaskLost` 在 `pid` 非整数时直接 `return null`，而 `startPiTask` 的 `childPid` 初始值正是 `null` ⇒ 失联分支成死代码，Pi 进程静默消失后任务永挂 `running`（实测卡过 385 秒）。改为 pid 无效时看 `task.activityAt`，超 `WATCHDOG_STALL_MS`(300s) 返回 `activity-stale` ② **board 内置 `pi` 角色**：`DEFAULT_ROLES` 此前只有 `lead`(dsh) / `codex`(codex)，而 `new --engine` 早就支持 `pi` ⇒ `claim --owner pi` 报「角色不存在」`exit=5`；补齐后 `inbox-pi.md` 开箱可用 ③ **任务工作区按引擎分流**：`DEFAULT_TASK_WORKDIR` 原为常量、不分引擎，Pi 工单被丢进 Codex 的 `/root/proj`；新增 `taskWorkdirForEngine()`（`SECOND_ENGINE_WORKDIR` 优先 → `pi` 用 `~/pi-workspace` → 其余 `~/proj`）。**复核处固定传 `codex`** 而非当前引擎——复核恒走 `codex exec`（`pi.review=false`），跟 activeEngine 走会让工作区与执行者错位 ④ **skill §2.9 示例修正**：`board.sh new` 缺必填 `--task`（与 `--subject` 是两个独立字段）、`claim --owner pi` 在角色补齐前不可用，照抄旧示例必失败 ⑤ **skill 新增 §2.7.1 签字分级**：低风险（可回滚 + 一句话验收）直接做并事后汇报，高风险（发布 / 凭据 / 删数据 / 改运行中机制）停手等确认；并写明「人签无法认证主体，控制点是动作前停」⑥ **AGENTS.md board 段**：Pi 角色已内置，删掉过时的 `roles set pi` 指引 |
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。

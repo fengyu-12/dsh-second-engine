@@ -14,11 +14,11 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { StringDecoder } from 'node:string_decoder'
-import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
-import { join } from 'node:path'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { randomBytes } from 'node:crypto'
-import { resolvePiProvider, PI_MODELS_PATH } from '../../src/engine/pi-probe.js'
+import { join } from 'node:path'
+
+import { resolvePiProvider } from '../../src/engine/pi-probe.js'
 
 const PORT = Number(process.env.PI_BRIDGE_PORT || 8788)
 const HOST = process.env.PI_BRIDGE_HOST || '127.0.0.1'
@@ -29,6 +29,63 @@ const PI_BIN = process.env.PI_BIN || 'pi'
 const log = (...a) => console.log(new Date().toISOString(), ...a)
 
 const resolveProvider = () => resolvePiProvider()
+
+// ── 会话历史（2026-11-06）──
+// Pi 把每个会话落成 jsonl：sessions/--<cwd 编码>--/<时间戳>_<id>.jsonl。
+// 首行 type:'session' 带 id/cwd，后续 type:'message' 带 role/content（assistant 的
+// content 里 thinking 与 text 分开）。桥原来只认「当前这一个会话」，所以历史切不了。
+function sessionsDir() {
+  const enc = '--' + CWD.split('/').filter(Boolean).join('-') + '--'
+  return join(homedir(), '.pi', 'agent', 'sessions', enc)
+}
+
+function readSessionFile(path) {
+  let raw = ''
+  try { raw = readFileSync(path, 'utf8') } catch { return null }
+  let meta = null
+  const entries = []
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue
+    let o = null
+    try { o = JSON.parse(line) } catch { continue }
+    if (o.type === 'session' && typeof o.id === 'string') { meta = o; continue }
+    if (o.type !== 'message') continue
+    const msg = o.message || {}
+    if (msg.role !== 'user' && msg.role !== 'assistant') continue
+    const blocks = Array.isArray(msg.content) ? msg.content : []
+    const pick = (type, key) => blocks.filter((b) => b && b.type === type && typeof b[key] === 'string').map((b) => b[key]).join('\n').trim()
+    const think = pick('thinking', 'thinking')
+    const text = pick('text', 'text')
+    if (msg.role === 'assistant' && think !== '') entries.push({ t: 'act', name: '思考', detail: think.slice(0, 240), full: think })
+    if (text !== '') entries.push({ t: msg.role === 'user' ? 'me' : 'ai', text })
+  }
+  return { meta, entries }
+}
+
+function listSessions() {
+  const dir = sessionsDir()
+  let names = []
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.jsonl')) } catch { return [] }
+  const out = []
+  for (const n of names) {
+    const p = join(dir, n)
+    let st = null
+    try { st = statSync(p) } catch { continue }
+    const parsed = readSessionFile(p)
+    if (parsed === null) continue
+    const meta = parsed.meta || {}
+    const firstUser = parsed.entries.find((e) => e.t === 'me')
+    out.push({
+      id: typeof meta.id === 'string' ? meta.id : n.replace(/\.jsonl$/, ''),
+      title: String((firstUser && firstUser.text) || meta.cwd || CWD).slice(0, 60),
+      cwd: meta.cwd || CWD,
+      updatedAt: st.mtime.toISOString(),
+      messageCount: parsed.entries.filter((e) => e.t === 'ai').length,
+      pending: false,
+    })
+  }
+  return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
+}
 
 // ── RPC 客户端：严格 JSONL，命令 id 关联（rpc.md「Correlate commands and responses」）──
 class PiRpc {
@@ -161,7 +218,7 @@ const server = createServer(async (req, res) => {
         )
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
         return res.end(injected)
-      } catch (e) {
+      } catch {
         return send(res, 500, { ok: false, error: `首页读取失败：${page}` })
       }
     }
@@ -237,9 +294,23 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/api/threads') {
       const st = await rpc.command('get_state', {}, 10000).catch(() => ({}))
-      return send(res, 200, { ok: true, threads: [{ id: st.sessionId || 'session', title: CWD, messageCount: st.messageCount ?? 0, pending: !!st.isStreaming }] })
+      const cur = typeof st.sessionId === 'string' ? st.sessionId : ''
+      const threads = listSessions().map((t) => ({ ...t, busy: !!(cur !== '' && t.id === cur && st.isStreaming) }))
+      // 当前会话可能还没落盘（刚开的新会话）：保证它出现在列表里
+      if (cur !== '' && !threads.some((t) => t.id === cur)) {
+        threads.unshift({ id: cur, title: '（当前会话）', cwd: CWD, updatedAt: new Date().toISOString(), messageCount: st.messageCount ?? 0, pending: false, busy: !!st.isStreaming })
+      }
+      return send(res, 200, { ok: true, threads })
     }
     if (url.pathname === '/api/transcript') {
+      const qid = (() => { try { return new URL(req.url, 'http://127.0.0.1').searchParams.get('id') || '' } catch { return '' } })()
+      if (qid !== '') {
+        const dir = sessionsDir()
+        let name = ''
+        try { name = readdirSync(dir).find((n) => n.endsWith('.jsonl') && n.includes(qid)) || '' } catch { name = '' }
+        const parsed = name === '' ? null : readSessionFile(join(dir, name))
+        return send(res, 200, { ok: true, entries: parsed === null ? [] : parsed.entries })
+      }
       const st = await rpc.command('get_messages', {}, 10000).catch(() => ({ messages: [] }))
       return send(res, 200, { ok: true, messages: st.messages || [] })
     }
@@ -247,6 +318,26 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req)
       const text = typeof body.text === 'string' ? body.text : (typeof body.message === 'string' ? body.message : '')
       if (text === '') return send(res, 400, { ok: false, error: 'text 不能为空' })
+      // 前端「新会话」只做本地清屏并把 threadId 置 null（bridge/web/public/index.html:newThread）。
+      // Pi 桥原来完全不看 threadId ⇒ 清屏后仍续旧会话。这里补一次 new_session。
+      if (body.threadId === null) {
+        try { await rpc.command('new_session', {}, 15000) } catch { /* 该 Pi 版本不支持则忽略，不阻断发送 */ }
+      } else if (typeof body.threadId === 'string' && body.threadId !== '') {
+        // 切到历史会话（2026-11-06）：前端点了左侧某条会话后，发消息时带的就是它的 id。
+        // switch_session 的参数是 **sessionPath 文件路径**，不是 id（docs/rpc-commands.md:592）。
+        // 当前已经是它就不切，避免无谓地重开会话。
+        const want = body.threadId
+        const st0 = await rpc.command('get_state', {}, 10000).catch(() => ({}))
+        if (st0.sessionId !== want) {
+          const dir = sessionsDir()
+          let name = ''
+          try { name = readdirSync(dir).find((n) => n.endsWith('.jsonl') && n.includes(want)) || '' } catch { name = '' }
+          if (name !== '') {
+            try { await rpc.command('switch_session', { sessionPath: join(dir, name) }, 20000) }
+            catch { /* 切换失败不阻断：继续在当前会话发，比直接报错好 */ }
+          }
+        }
+      }
 
       // ⚠️ 前端（bridge/web/public/index.html 的 send()）读的是 **NDJSON 流**，逐行 {kind:...}：
       //    meta → 设 threadId；text → addAgentChunk；activity → addActivity；
@@ -259,9 +350,21 @@ const server = createServer(async (req, res) => {
       let finished = false
       let off = () => {}
       let timer = null
+      // 思维链（2026-11-06）：Pi RPC 推 thinking_start / thinking_delta 增量，逐条发会把
+      // 活动区刷爆 ⇒ 累积成一段，出正文或收尾时 flush 成一条 activity（前端 addActivity）。
+      let thinkBuf = ''
+      const flushThink = () => {
+        const text = thinkBuf.trim()
+        thinkBuf = ''
+        if (text === '') return
+        // 预览压空白成一行，全文走 full：前端点击展开（2026-11-06）
+        const detail = text.replace(/\s+/g, ' ').slice(0, 240)
+        try { res.write(JSON.stringify({ kind: 'activity', name: '思考', detail, full: text }) + '\n') } catch { /* 断开 */ }
+      }
       const finish = () => {
         if (finished) return
         finished = true
+        flushThink()
         try { off() } catch { /* 已解绑 */ }
         if (timer !== null) clearTimeout(timer)
         try { res.write(JSON.stringify({ kind: 'end' }) + '\n') } catch { /* 客户端已断开 */ }
@@ -274,7 +377,10 @@ const server = createServer(async (req, res) => {
         if (rec.type === 'message_update') {
           const ev = rec.assistantMessageEvent || {}
           if (ev.type === 'text_delta' && typeof ev.delta === 'string' && ev.delta !== '') {
+            flushThink()
             try { res.write(JSON.stringify({ kind: 'text', text: ev.delta }) + '\n') } catch { /* 断开 */ }
+          } else if (ev.type === 'thinking_delta' && typeof ev.delta === 'string' && ev.delta !== '') {
+            thinkBuf += ev.delta
           }
           return
         }

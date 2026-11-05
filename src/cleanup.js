@@ -16,10 +16,9 @@
 //   本来就有这一格），函数体留在 index.js；下一轮把 `tasks` 全量迁到 state.js 后即可搬。
 import { readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { CODEX_DIR } from './constants.js'
+
 import { CONFIG_BACKUP_KEEP } from './io.js'
 import { REVIEWS_DIR } from './state.js'
-
 
 // ── Pi JSON 备份轮转（原 index.js L1977-1998）──
 // Codex 侧早有这套：backupConfig() 按 CONFIG_BACKUP_NAME_RE 只认自己那套文件名，
@@ -28,7 +27,6 @@ import { REVIEWS_DIR } from './state.js'
 // 这里复用同一个保留数，以及同一套「只按自己的文件名模式轮转」的纪律：
 // 只匹配 ^<本文件名>\.bak- ，别的一律不碰（用户手放的备份、别的文件都安全）。
 // 备份名是 <文件>.bak-<毫秒>-<pid>-<8hex>，时间戳定长在最前 → 字典序即时间序，sort() 就够。
-
 
 export function baseNameOf(p) { const i = String(p).lastIndexOf('/'); return i === -1 ? String(p) : String(p).slice(i + 1) }
 
@@ -47,7 +45,6 @@ export function prunePiBackups(path, keep = PI_BACKUP_KEEP) {
   }
   return removed
 }
-
 
 // ── Codex 会话清理（原 index.js L2674-2697）──
 // 递归删除 sessions 下 mtime 早于 keepDays 天的 *.jsonl，统计数量与释放字节
@@ -74,7 +71,6 @@ export function cleanupSessions(dir, cutoff, stats) {
     } catch { /* 跳过无法删除的条目 */ }
   }
 }
-
 
 // ── 复核记录目录：数量截断（原 index.js L3229-3244）──
 

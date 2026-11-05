@@ -50,7 +50,7 @@ export function extractPreservedSections() {
 
 const TEMPLATE_OWNED_TOP_LEVEL = new Set([
   'model_provider', 'model', 'sandbox_mode', 'web_search', 'approval_policy',
-  'model_context_window', 'model_max_output_tokens',
+  'model_context_window', 'model_max_output_tokens', 'model_reasoning_summary',
 ])
 
 // 首个段头之前的非模板顶层 key = value 行（原样保留；TOML 顶层键必须在首个 [table] 前）。

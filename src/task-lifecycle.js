@@ -1,4 +1,7 @@
 import { startAppServerTurn } from './app-server-client.js'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { send } from './core.js'
 import { activeEngineId } from './engine/registry.js'
 import { CANCEL_FORCE_FINALIZE_MESSAGE, CANCEL_FORCE_FINALIZE_MS, CANCEL_RETRY_MS, readBody } from './io.js'
@@ -7,12 +10,32 @@ import { piModels } from './pi-providers.js'
 import { resolveCodexBinary } from './review-core.js'
 import { tasks } from './state.js'
 import { tokenTotal } from './token-ledger.js'
-import { statSync, utimesSync } from 'node:fs'
-import { ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, bigmodelAuxModelsUrl, cleanupLiveFiles, errMsg, finalizeJob, finalizeTask, loadKeyring, modelsUrl, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, taskView, viewStatus } from './index.js'
+import { claudeCredentialsFromConfig } from './claude-providers.js'
 
+import { ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, bigmodelAuxModelsUrl, errMsg, finalizeTask, loadKeyring, modelsUrl, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, viewStatus } from './index.js'
 
 export async function handleModels(req, res) {
   if (activeEngineId() === 'pi') return piModels(req, res)
+  if (activeEngineId() === 'claude') {
+    // Claude 只支持 Anthropic 协议（无标准 /models 端点），但**大多数厂商同时开 OpenAI 兼容端点**。
+    // 所以拉列表走 OpenAI 的 /v1/models，发请求仍走 Anthropic 端点（2026-11-05 实测 DeepSeek 两者都通）。
+    // 推导：去掉结尾的 /anthropic，再拼 /v1/models。
+    try {
+      const { loadClaudeProviders } = await import('./claude-providers.js')
+      const doc = loadClaudeProviders()
+      const act = (doc.providers || []).find((x) => x.id === doc.active)
+      const cur = act && typeof act.model === 'string' && act.model !== '' ? [act.model] : []
+      const base = act && typeof act.baseUrl === 'string' ? act.baseUrl.replace(/\/+$/, '') : ''
+      const modelsBase = base.endsWith('/anthropic') ? base.slice(0, -'/anthropic'.length) : base
+      if (modelsBase === '' || !act || !act.apiKey) {
+        return send(res, { ok: true, models: cur, note: '未配置 Key 或地址；先填 Key 再拉列表' })
+      }
+      const r = await fetch(`${modelsBase}/v1/models`, { headers: { authorization: `Bearer ${act.apiKey}` }, signal: AbortSignal.timeout(15000) })
+      const j = await r.json().catch(() => null)
+      const list = Array.isArray(j && j.data) ? j.data.map((x) => x && x.id).filter((x) => typeof x === 'string') : []
+      return send(res, { ok: true, models: list.length > 0 ? list : cur, note: list.length > 0 ? '' : '该端点未列模型，可用手填' })
+    } catch (e) { return send(res, { ok: false, error: errMsg(e) }) }
+  }
   try {
     if (typeof fetch !== 'function') {
       return send(res, { ok: false, error: '当前 Node 运行时不支持 fetch（需要 Node 18+）' })
@@ -175,6 +198,113 @@ export function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, 
     })
 
   send(res, { ok: true, id, mode: 'appserver' })
+}
+
+/**
+ * Claude 的凭证来源（2026-11-05）：环境变量优先，其次 `~/.claude/settings.json` 的 env 段。
+ * 两者都没有 → null，由 startClaudeTask 回 400 并指明配置位置。
+ * ⚠️ 凭证只经 env 传给子进程，**绝不进 argv**（同 Pi/Codex 的红线）。
+ */
+function claudeCredentials() {
+  if (process.env.ANTHROPIC_BASE_URL && process.env.ANTHROPIC_AUTH_TOKEN) {
+    return { baseUrl: process.env.ANTHROPIC_BASE_URL, token: process.env.ANTHROPIC_AUTH_TOKEN, from: 'env' }
+  }
+  try {
+    const p = join(homedir(), '.claude', 'settings.json')
+    const s = JSON.parse(readFileSync(p, 'utf8'))
+    const e = (s !== null && typeof s === 'object' && s.env !== null && typeof s.env === 'object') ? s.env : {}
+    if (e.ANTHROPIC_BASE_URL && e.ANTHROPIC_AUTH_TOKEN) {
+      return { baseUrl: e.ANTHROPIC_BASE_URL, token: e.ANTHROPIC_AUTH_TOKEN, from: p }
+    }
+  } catch { /* 文件不存在或坏 JSON：继续看预设 */ }
+  // Claude 自己的 provider 配置优先（设置页写入 claude-providers.json）
+  try {
+    const fromCfg = claudeCredentialsFromConfig()
+    if (fromCfg !== null) return fromCfg
+  } catch { /* 继续下面的兜底 */ }
+  // 预设（2026-11-05 实测可用）：DeepSeek 官方 Anthropic 端点。
+  // 用户只需在现有 keyring 里有 deepseek 的 key，无需另配。
+  try {
+    const doc = loadKeyring()
+    const ds = (doc.providers || []).find((x) => x.id === 'deepseek')
+    if (ds && typeof ds.apiKey === 'string' && ds.apiKey !== '') {
+      return { baseUrl: 'https://api.deepseek.com/anthropic', token: ds.apiKey, from: 'preset:deepseek' }
+    }
+  } catch { /* 无 keyring：走报错 */ }
+  return null
+}
+
+/** Claude 的默认模型：设置页写入的 claude-model.txt，没有就 haiku。 */
+function claudeDefaultModel() {
+  try {
+    const v = readFileSync(join(homedir(), '.dsh', 'second-engine', 'claude-model.txt'), 'utf8').trim()
+    if (v !== '') return v
+  } catch { /* 未配置 */ }
+  return 'haiku'
+}
+
+/** Claude Code 的按引擎启动（形状照 startPiTask；差异只在凭证来源与 runtime 的 done() 调用）。 */
+export function startClaudeTask({ res, id, outPath, workdir, prompt, model, boardId }) {
+  const cred = claudeCredentials()
+  if (cred === null) {
+    return send(res, {
+      ok: false,
+      error: 'Claude 未配置：在 ~/.claude/settings.json 的 env 里设 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN，或在本机环境变量里设同名项',
+    }, 400)
+  }
+  const task = {
+    id,
+    boardId,
+    kind: 'task',
+    engine: 'claude',
+    status: 'running',
+    exitCode: null,
+    output: '',
+    startedAt: Date.now(),
+    endedAt: null,
+    workdir,
+    outPath,
+    cancelled: false,
+    progress: [],
+    activityAt: Date.now(),
+    stuckSuspect: false,
+    signal: null,
+    forcedKill: false,
+    childPid: null,
+    childStart: null,
+  }
+  tasks.set(id, task)
+  pruneTasks()
+  const rt = rtOf(task)
+  startWatchdog(task)
+  void (async () => {
+    try {
+      await rt.start({
+        prompt,
+        workdir,
+        outPath,
+        model: (typeof model === 'string' && model !== '') ? model : claudeDefaultModel(),
+        env: {
+          ANTHROPIC_BASE_URL: cred.baseUrl,
+          ANTHROPIC_AUTH_TOKEN: cred.token,
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        },
+      })
+      await persistBoardChild(task)
+    } catch (e) {
+      rt.setAppError(errMsg(e))
+      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+      send(res, { ok: false, error: errMsg(e) })
+      return
+    }
+    send(res, { ok: true, id, engine: 'claude' })
+    // 终态唯一落定点（state 与 exitCode 由 index.js 的 finalizeJob 写）
+    try {
+      const ev = await rt.done()
+      const status = ev.aborted || task.cancelled === true ? 'cancelled' : (ev.exitCode === 0 ? 'done' : 'error')
+      if (finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
+    } catch { /* 上面 catch 已收尾 */ }
+  })()
 }
 
 export function startPiTask({ res, id, outPath, workdir, prompt, model, provider, boardId }) {

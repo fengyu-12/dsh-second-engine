@@ -43,6 +43,12 @@ export function normalizeTaskRequest(body, defaults = {}) {
     provider: typeof body.provider === 'string' ? body.provider : undefined,
     model: typeof body.model === 'string' ? body.model : undefined,
     ephemeral: body.ephemeral !== false,
+    // 派活前置校验的两项（2026-11-06）：合法值原样带进任务对象，非法值由
+    // handleTaskCreate 当场 400 —— 不靠 agent 记得写，也不假装它们能校验质量。
+    timeoutMs: Number.isInteger(body.timeoutMs) && body.timeoutMs > 0 ? body.timeoutMs : undefined,
+    acceptance: Array.isArray(body.acceptance)
+      ? body.acceptance.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
+      : (typeof body.acceptance === 'string' && body.acceptance.trim() !== '' ? body.acceptance.trim() : undefined),
   }
 }
 

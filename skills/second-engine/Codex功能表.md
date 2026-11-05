@@ -2,7 +2,7 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `<Codex 安装目录>/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `src/index.js:3460` 本就当合法终态）。
+> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `<Codex 安装目录>/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `taskView` 本就当合法终态（搜 `return 'cancelled'` 定位））。
 > **二进制**：`<Codex 安装目录>/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
 > **升级方式（2026-10-31 实测修订 —— 正选换成 npm 平台包）**：`curl -fL -o pkg.tgz https://registry.npmmirror.com/@openai/codex/-/codex-<版本>-linux-arm64.tgz`，**单文件整包**（0.166.0 = 164,402,913 B，约 3 分钟，字节数校验相符），不走 GitHub release。**release 直连 2026-10-31 实测 75 秒零字节、`ghproxy.net` 同样卡、`ghfast.top` 更早已挂** ⇒ 本机现状是 release 资产走不动，10-17 那条"直连通"已过期（网络会变，但"能通"也要先探再信）。
 > **包内结构与取用**：`vendor/aarch64-unknown-linux-musl/` 内含 `bin/codex`(~277 MB) + `bin/codex-code-mode-host`(~70 MB) + `codex-resources/`(voice host、bwrap、gstreamer 库) + `codex-path/rg`。**只取两个二进制**装进 `<Codex 安装目录>/`，sidecar 必须叫**无后缀** `codex-code-mode-host`；`codex-resources/` 本机当前**未装**（exec / app-server / 代码模式用不到，要 voice 或沙箱资源再补）。替换姿势：`cp -a` 备份 → `cp` 到临时名 → `mv -f` 原子落位 → `codex --version` 复核。
@@ -213,7 +213,7 @@ chmod +x <Codex 安装目录>/codex-code-mode-host
 
 **但当下影响很低（实测口径）**：`~/.codex/task-*.out.live` 里 67 条历史工单的 token 用量 —— 中位 **12,814**、90 分位 **77,180**、最大 **154,423**，**没有一条超过 258,400**。⇒ 本机实际用法从未触到兜底上限，压缩也从未触发过。
 
-**谁该填、怎么填**：这两个值在 second-engine 里是**按提供方各存一份**（keyring 的 `contextWindow` / `maxOutput`），**填一次永久生效**，不是每次派单都要改；keyring 里目前只有 `deepseek` 有值（`1048576 / 393216`），其余 provider 为空 ⇒ config.toml 里就没有这两个键（插件 `src/index.js:765-769` 是"有值才写"）。填法：设置面板改提供方，或 `POST /second-engine/api/providers/update`，然后**切一次 active** 重写 config.toml；**别手改** `keyring.json` / `config.toml`（红线 11）。
+**谁该填、怎么填**：这两个值在 second-engine 里是**按提供方各存一份**（keyring 的 `contextWindow` / `maxOutput`），**填一次永久生效**，不是每次派单都要改；keyring 里目前只有 `deepseek` 有值（`1048576 / 393216`），其余 provider 为空 ⇒ config.toml 里就没有这两个键（插件 `writeCodexConfig` 里是「有值才写」（搜 `model_context_window` 定位））。填法：设置面板改提供方，或 `POST /second-engine/api/providers/update`，然后**切一次 active** 重写 config.toml；**别手改** `keyring.json` / `config.toml`（红线 11）。
 
 **验收判据**：填完跑一次 `codex exec`，看 rollout 的 `model_context_window` 是否变成 `1048576`、以及那行 warning 是否消失。
 

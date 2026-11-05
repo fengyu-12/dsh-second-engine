@@ -44,7 +44,8 @@ LOCK_TRIES = 50          # 50 × 0.1s = 5s
 LOCK_SLEEP = 0.1
 DEFAULT_ROLES = {"lead": {"inbox": "inbox-lead.md", "engine": "dsh"},
                  "codex": {"inbox": "inbox-codex.md", "engine": "codex"},
-                 "pi": {"inbox": "inbox-pi.md", "engine": "pi"}}
+                 "pi": {"inbox": "inbox-pi.md", "engine": "pi"},
+                 "claude": {"inbox": "inbox-claude.md", "engine": "claude"}}
 
 _INBOX_LOCKS = {}
 _INBOX_LOCKS_GUARD = threading.Lock()
@@ -163,7 +164,7 @@ def validate_roles(roles: object) -> None:
         if inbox in inboxes:
             raise ValueError(f"inbox 重复：{inbox}")
         inboxes.add(inbox)
-        if engine not in ("dsh", "codex", "pi"):
+        if engine not in ("dsh", "codex", "pi", "claude"):
             raise ValueError(f"角色 {role} engine 非法：{engine!r}")
 
 def load_roles(data: dict) -> dict:
@@ -487,9 +488,9 @@ def cmd_roles(a) -> None:
         die(2, "roles 需要 show 或 set")
     role = a.role
     if not role:
-        die(2, "roles set 需要角色名：roles set <role> --engine <dsh|codex|pi> [--inbox <file>]")
-    if a.engine not in ("dsh", "codex", "pi"):
-        die(5, f"engine 非法：{a.engine}（只允许 dsh / codex / pi）")
+        die(2, "roles set 需要角色名：roles set <role> --engine <dsh|codex|pi|claude> [--inbox <file>]")
+    if a.engine not in ("dsh", "codex", "pi", "claude"):
+        die(5, f"engine 非法：{a.engine}（只允许 dsh / codex / pi / claude）")
     with _Lock():
         data = load_board()
         roles = dict(load_roles(data))
@@ -527,7 +528,7 @@ def cmd_set(a) -> None:
                            f"——要重做请开新任务并引用它")
             if k == "owner" and v and not role_exists(roles, v):
                 die(5, f"角色不存在：{v}")
-            if k == "engine" and v not in ("dsh", "codex", "pi"):
+            if k == "engine" and v not in ("dsh", "codex", "pi", "claude"):
                 die(5, f"engine 非法：{v}")
             if k in ("child_pid", "child_start"):
                 t[k] = None if v in ("", "null") else v
@@ -959,7 +960,7 @@ def cmd_doctor(a) -> None:
                 problems.append(f"{t.get('id')} owner 不在 roles：{t.get('owner')}")
             session = t.get("session")
             engine = t.get("engine")
-            if session and engine is not None and engine not in ("dsh", "codex", "pi"):
+            if session and engine is not None and engine not in ("dsh", "codex", "pi", "claude"):
                 problems.append(f"{t.get('id')} engine 非法：{engine!r}")
             if session and engine is None:
                 problems.append(f"{t.get('id')} session 非空但缺 engine（兼容旧板，视同 codex）")

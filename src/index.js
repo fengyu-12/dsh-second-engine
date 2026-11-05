@@ -37,44 +37,47 @@ import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 // 以及 rc.7 插件自有设置表面：settings 命名空间 'second-engine'（keepDays）与
 // llm 的可配置 provider 目录条目，二者缺一浏览器端设置页都不渲染本插件面板。
 // 请求体与响应均为 JSON，handler 用原生 node:req/res 风格。
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, chmodSync, readFileSync, copyFileSync, utimesSync, renameSync, openSync, fstatSync, readSync, closeSync, createWriteStream, accessSync, constants } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, readFileSync, renameSync, openSync, createWriteStream } from 'node:fs'
 import { execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
-import { piProbe, piAvailableModels, resolvePiProvider as resolvePiProviderRaw, invalidatePiModelsCache, PI_PROVIDERS, PI_MODELS_PATH } from './engine/pi-probe.js'
-import { piBridgeStatus, startPiBridge, stopPiBridge, piBridgeUrl, PI_BRIDGE_PORT } from './engine/pi-bridge.js'
+import { piProbe, piAvailableModels, resolvePiProvider as resolvePiProviderRaw } from './engine/pi-probe.js'
+
 import http from 'node:http'
-import { join, resolve, dirname, delimiter } from 'node:path'
+import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { createBridgeServer } from './bridge.js'
-import { startAppServerTurn } from './app-server-client.js'
+
 import { resolveCollab, collabPreset, writeCollab } from './collab.js'
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { WIRE_API, CODEX_DIR, CONFIG_PATH } from './constants.js'
-import { normalizeProvider, normalizeReviewRounds, normalizeReviewWallMs, normalizeReviewTokenLimit, normalizeIssue, normalizeReply, normalizeResponses, normalizeLedgerEntries, issueFingerprintOf,
-  REVIEW_DEFAULT_ROUNDS, REVIEW_ROUNDS_CHOICES, REVIEW_DEFAULT_WALL_MS, REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_MIN_TOKEN_LIMIT,
-  asText, ISSUE_REF_RE, REPLY_REASON_CLIP, RESPONSE_REASON_CLIP, LEDGER_ID_RE } from './normalize.js'
-import { noteErr, atomicWriteFileSync, send, readConfigRaw, ERR_LOG } from './core.js'
-import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, policyWatchErr, POLICY_WATCH_DELIVERY_COOLDOWN_MS, POLICY_WATCH_FRESH_MS } from './policy-watch.js'
+import { normalizeProvider, normalizeReviewRounds, normalizeReviewWallMs, normalizeReviewTokenLimit, normalizeIssue, REVIEW_DEFAULT_ROUNDS, REVIEW_ROUNDS_CHOICES, REVIEW_DEFAULT_WALL_MS, REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, asText, ISSUE_REF_RE } from './normalize.js'
+import { noteErr, atomicWriteFileSync, send, readConfigRaw } from './core.js'
+import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, POLICY_WATCH_DELIVERY_COOLDOWN_MS, POLICY_WATCH_FRESH_MS } from './policy-watch.js'
 import { diagnoseMood, lastUserText, buildMoodMessage, MOOD_COOLDOWN_MS } from './mood-watch.js'
-import { readHintToggles, writeHintToggles } from './hint-toggles.js'
-import { REVIEWS_DIR, tasks, TASK_KEEP_LIMIT } from './state.js'
-import { canonicalIssueText, pointJaccard, resolveCodexBinary, buildReviewContext, wrapReviewMaterial, buildReviewPrompt, spawnReviewRound, readReviewOut, mergeRoundIntoLedger } from './review-core.js'
-import { finalizeReview, captureReviewDirty, finishReview, reviewRecord, persistReviewRecord, cleanupReviewFiles, loadReviewRecord, handleReviewsList, runReview, handleReviewCreate, handleReviewCancel } from './review-handlers.js'
-import { execMode, keyConfigured, sessionsBytes } from './pi-misc.js'
-import { piRuntimeModel, piWithPathLock, piWriteJson, piApiFromWire, piWireFromApi, piLooksLikeApiKey, piRejectKeyAsModel, piProvidersSnapshot, piChannelApiOf, piProvidersList, piProviderAdd, piProviderIdError, piProviderKey, piProviderActive, piProviderDelete, piProviderUpdate, piModels, piModelsEmptyReason, piProviderModel, piProvidersRoot, piMcpServers } from './pi-providers.js'
-import { handlePiPanel, handlePiChannelCreate, handlePiModelSet, handlePiBridge, handlePiCleanup, handlePiChannelDelete, handlePiMcpList, handlePiMcpAdd, handlePiMcpDelete, handlePiMcpToggle } from './pi-panel.js'
-import { handleStatus, handleExperimentalWake, handleKey, handleProvidersList, handleProviderAdd, handleProvidersRoot, handleProviderKey, handleProviderActive, handleProviderDelete, handleProviderUpdate } from './routes-a.js'
-import { handleTaskGet, handleTaskList, handleTaskRoot, handleConfigGet, handleConfigRoot, handleHintToggles, handleConsultsList, handleWebSearchGet, handleWebSearchSet, handleWebSearchRoot, handleMcpList, handleMcpAdd, handleMcpDelete, handleMcpToggle, handleMcpRoot, handlePluginVersion } from './routes-misc.js'
-import { handleModels, startAppServerTask, startPiTask, handleTaskCancel } from './task-lifecycle.js'
-import { baseNameOf, prunePiBackups, cleanupSessions, pruneReviewFiles, REVIEW_KEEP_FILES, PI_BACKUP_KEEP } from './cleanup.js'
-import { gitPorcelain, gitOk } from './git.js'
-import { appendConsultBlock, appendReviewIssuesBlock, extractFirstJsonObject, extractMcpServerBlocks, extractModels, extractPreservedSections, extractPreservedTopLevelLines, issueTextFingerprint, issueTrigrams, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson, parseTokensUsed, parseVersion } from './parse.js'
-import { KEYRING_PATH, MAX_BODY_BYTES, CONFIG_BACKUP_KEEP, CONFIG_BACKUP_NAME_RE, TASK_OUTPUT_CLIP, CANCEL_RETRY_MS, CANCEL_FORCE_FINALIZE_MS, CANCEL_FORCE_FINALIZE_MESSAGE, newId, readBody, saveKeyring, backupConfig, readHeadTail, queryParam } from './io.js'
+import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending } from './mood-watch-state.js'
+import { readHintToggles } from './hint-toggles.js'
+import { tasks, TASK_KEEP_LIMIT } from './state.js'
+import { resolveCodexBinary } from './review-core.js'
+import { cleanupReviewFiles, handleReviewsList, handleReviewCreate, handleReviewCancel } from './review-handlers.js'
+import { execMode, sessionsBytes } from './pi-misc.js'
+import { piRuntimeModel, piWriteJson, piProviderModel } from './pi-providers.js'
+import { handlePiPanel, handlePiChannelCreate, handlePiModelSet, handlePiBridge, handlePiCleanup, handlePiChannelDelete } from './pi-panel.js'
+import { handleClaudeCleanup } from './engine/claude-cleanup.js'
+import { handleClaudeBridge, autoStartIfEnabled } from './engine/claude-bridge-control.js'
+import { verifyClaudeEffect } from './engine/claude-verify.js'
+import { WATCH_TAIL } from './watch-notice.js'
+import { handleStatus, handleExperimentalWake, handleKey, handleProvidersRoot, handleProviderKey, handleProviderActive, handleProviderDelete, handleProviderUpdate } from './routes-a.js'
+import { handleTaskList, handleTaskRoot, handleConfigRoot, handleHintToggles, handleConsultsList, handleWebSearchRoot, handleMcpRoot, handlePluginVersion } from './routes-misc.js'
+import { handleModels, startAppServerTask, startPiTask, startClaudeTask, handleTaskCancel } from './task-lifecycle.js'
+import { prunePiBackups, cleanupSessions } from './cleanup.js'
+import { gitOk } from './git.js'
+import { appendConsultBlock, extractPreservedSections, extractPreservedTopLevelLines, parseVersion } from './parse.js'
+import { KEYRING_PATH, TASK_OUTPUT_CLIP, newId, readBody, saveKeyring, backupConfig, readHeadTail } from './io.js'
 import { WATCHDOG_STALL_MS } from './engine/runtime.js'
 
 // The bridge is started by ctl.sh; pass the host API address through its inherited environment.
@@ -94,7 +97,13 @@ const MOOD_ABORT_TRIGGER = 2 // 窗口内被打断 ≥2 次才提示（单次多
 // 两引擎写同一段协作文案，各文件里的成对标记保证幂等、互不干扰。
 const PI_AGENT_DIR = join(homedir(), '.pi', 'agent')
 function agentsTargets() {
-  return [join(CODEX_DIR, 'AGENTS.md'), join(PI_AGENT_DIR, 'AGENTS.md')]
+  // Claude 的全局记忆是 ~/.claude/CLAUDE.md（2026-11-06 实测：它同时读这个文件和工作目录的
+  // AGENTS.md，两个标记都能答出来）⇒ 三写目标，与 Codex/Pi 的全局段同构。
+  return [
+    join(CODEX_DIR, 'AGENTS.md'),
+    join(PI_AGENT_DIR, 'AGENTS.md'),
+    join(homedir(), '.claude', 'CLAUDE.md'),
+  ]
 }
 export const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
 
@@ -137,7 +146,9 @@ export function checkTokenBudget(res) {
   }
 }
 function accountJob(task) {
-  const source = task.engine === 'pi' ? 'pi-session-stats' : task.mode === 'appserver' ? 'appserver-total' : 'codex-exec'
+  const source = task.engine === 'pi' ? 'pi-session-stats'
+    : task.engine === 'claude' ? 'claude-result'
+      : task.mode === 'appserver' ? 'appserver-total' : 'codex-exec'
   let tokens = task.accountedTokens ?? null
   if (task.engine === 'pi') {
     const stats = rtOf(task).snapshot().details?.stats
@@ -155,20 +166,19 @@ function accountJob(task) {
 export const DEFAULT_TASK_WORKDIR = process.env.SECOND_ENGINE_WORKDIR || join(process.env.HOME || '/root', 'proj')
 export function taskWorkdirForEngine(engine) {
   if (process.env.SECOND_ENGINE_WORKDIR) return process.env.SECOND_ENGINE_WORKDIR
-  return engine === 'pi' ? join(homedir(), 'pi-workspace') : join(homedir(), 'proj')
+  if (engine === 'pi') return join(homedir(), 'pi-workspace')
+  if (engine === 'claude') return join(homedir(), 'claude-workspace')
+  return join(homedir(), 'proj')
 }
 export const TASK_LIST_LIMIT = 10
 // 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
 const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
-
 
 // ── Codex 卡点求助（consult）──
 // 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
 // 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
 export const consults = []
 export const CONSULT_KEEP_LIMIT = 20
-
-
 
 // ── 吞错留痕（D，2026-10-25）──
 // 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
@@ -203,25 +213,6 @@ export function resolvePiProvider(preferredId = '') {
 export const REVIEW_MIN_ROUNDS = 1
 export const REVIEW_MAX_ROUNDS = 5
 // 设置页可选轮数（GET/POST /api/config 的白名单，仅这三档）。
-// ⚠️ 首轮模板就是全部纪律所在：历史 16 条复核绝大多数只跑 1 轮（reviewRounds=1），而
-// 「三态裁决 / 不许只写『我仍然认为』/ 未回应必须自行裁决」那一整套，只在带 reply 的第 2 轮起注入
-// ⇒ 首轮这行才是 90% 复核真正看到的提示词（2026-10-26 实测）。三条硬要求（对照 secondop-panel 的
-// SYSTEM 条款与 ICML AR 论文点名的「虚假共识」失败模式）：
-//   ① 诚实条款：材料不足就明说并标 verified:false，不许用推测把句子填完整；
-//   ② 只找缺陷：禁赞美、禁总结整体质量（否则退化成「整体不错，但有三点」的空转）；
-//   ③ 必须交代核查依据：否则 `converged` 与「没读只目测」无法区分（对应 ISSUE：2600 行注释）。
-const REVIEW_TEMPLATE =
-  '你是独立复核引擎。只找缺陷：不要赞美、不要总结整体质量，只列具体问题'
-  + '（自洽却错误的推理、漏掉的边界条件、更优备选、可复现的边界失败）。'
-  + '材料不足以判断的那一条，明确写「这一条材料不足，未核实」并把它的 verified 标 false——'
-  + '不要用推测把结论填完整。'
-  + '每条 issue 必须给出你实际核查过的依据（文件:行号 / 命令 / 复现步骤），'
-  + '禁止「建议加强测试」这类无定位的空话。'
-  + '若判定无问题，必须写明你核查了哪几处之后才得出无问题，不得只回一个空 verdict。'
-  + '发现不可上线级缺陷（涉及钱 / 数据丢失 / 安全漏洞）时：verdict 写 "blocked"，'
-  + '该条 issue 的 severity 写 blocker——这是硬停档：此类问题不存在「再改一轮试试」，'
-  + '必须立即停手交人裁决。'
-  + '输出 JSON: {issues:[{severity,point,suggestion,verified}], verdict}'
 // 看门狗间隔与阈值已随 P3.2 搬进 src/engine/runtime.js（WATCHDOG_INTERVAL_MS / WATCHDOG_STALL_MS）。
 // 解析失败时回显的原始输出上限，避免把超长文本灌进任务表。
 const REVIEW_RAW_CLIP = 2000
@@ -294,10 +285,6 @@ function readConfig() {
 // ── node:http 小工具（同 guard 写法）──
 export const errMsg = (e) => (e && e.message) ? e.message : String(e)
 
-
-
-
-
 // status 轮询缓存：递归 stat 整棵 sessions 树不便宜（设置页/浮球会反复刷），
 // TTL 内复用上次结果；runAutoCleanup 仍用新鲜的 sessionsBytes()。
 const SESSIONS_BYTES_TTL_MS = 10000
@@ -324,12 +311,10 @@ function presetProviders() {
 
 // 归一化单条 provider：缺字段补默认值，调用方拿到的形状始终稳定。
 
-
 // 复核轮数：只认 1/3/5，其余（含缺失、非法、字符串数字以外的垃圾值）一律回落默认 3。
 
 // 互审硬预算（2026-10-03）：非法/缺失/过小一律回落缺省值 ——
 // 宁可给个保守值，也不要"0 预算"把互审一进去就停。
-
 
 // ── Codex 协作协议（AGENTS.md 自动写入）──
 // 让 Codex 拥有「卡点求助本能」：连续失败/绕圈时主动调 /api/consult。
@@ -337,6 +322,23 @@ function presetProviders() {
 // 旧写法两个坑：① 模板内容的任何修订（如 DSH_WEB_URL 端口变更）对已注入的老用户永不生效；
 // ② v1→v2 分支在末句锚未命中时会把 v1 段之后直到文件尾的内容静默丢弃（可能夹着用户手写段）。
 // 段边界判定见 stripManagedSection 的三级降级。
+// mood-watch 状态机：每会话一个 JSON（事件 ID / 待回执 / 待确认清单）
+const MOOD_STATE_DIR = join(homedir(), '.dsh', 'second-engine', 'mood-state')
+
+// 取最后一条助手文本：状态机用它判断上一轮有没有交回执
+function lastAssistantText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || m.role !== 'assistant') continue
+    // content 可能是字符串，也可能是 [{type:'text',text}] 数组（用户消息那边已兼容两种）
+    if (typeof m.content === 'string') { if (m.content) return m.content; continue }
+    const blocks = Array.isArray(m.content) ? m.content : []
+    const text = blocks.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+    if (text) return text
+  }
+  return ''
+}
+
 const AGENTS_MARK = '<!-- dsh-second-engine:v2 -->'
 const AGENTS_END = '<!-- /dsh-second-engine:v2 -->'
 const AGENTS_V1_MARK = '<!-- dsh-second-engine:v1 -->'
@@ -362,10 +364,14 @@ const AGENTS_BASE_URL = (() => {
 // P4.26：Pi 的通知段用 Pi 的身份（标题与 from 字段），其余文案两引擎通用。
 // 只替换这两处 —— 段里其它「Codex」字样出现在历史/对照语境，不影响 Pi 照做。
 function agentsSectionFor(targetPath) {
-  if (!String(targetPath).startsWith(PI_AGENT_DIR)) return AGENTS_SECTION
+  const p = String(targetPath)
+  // 三值化：原来只有 Pi 分支，Claude 的 ~/.claude/CLAUDE.md 会落进 Codex 默认分支，
+  // 标题写「Codex 全局协作协议」、consult 的 from 也是 codex（2026-11-06 实测踩到）。
+  const label = p.startsWith(PI_AGENT_DIR) ? 'Pi' : (p.includes('/.claude/') ? 'Claude' : 'Codex')
+  if (label === 'Codex') return AGENTS_SECTION
   return AGENTS_SECTION
-    .replace('# Codex 全局协作协议（by dsh-second-engine）', '# Pi 全局协作协议（by dsh-second-engine）')
-    .replace('"from":"codex"', '"from":"pi"')
+    .replace('# Codex 全局协作协议（by dsh-second-engine）', `# ${label} 全局协作协议（by dsh-second-engine）`)
+    .replace('"from":"codex"', `"from":"${label.toLowerCase()}"`)
 }
 const AGENTS_SECTION = `${AGENTS_MARK}
 # Codex 全局协作协议（by dsh-second-engine）
@@ -500,7 +506,7 @@ const BOARD_SECTION = `${BOARD_MARK}
 - **协议全文**：本插件包内 \`tools/dual-board/PROTOCOL.md\`。派单 prompt 提到 dual-board、或数据目录里 \`board.json\` 还有未完成任务时，**先读协议再动工**。
 - **写板唯一入口**：本插件包内 \`tools/dual-board/board.sh\`（\`new\` / \`claim\` / \`complete\` / \`block\` / \`abandon\` / \`show\` / \`ready\` / \`inbox-append|unread|read|archive\` / \`scope-check\` / \`doctor\`）—— **不要手写 \`board.json\`**。
 - **脚本与协议在哪**：\`ls -d ~/.dsh/profiles/*/node_modules/dsh-second-engine/tools/dual-board/\`（以 \`link:\` 方式安装时该路径是软链，用 \`readlink -f\` 看实体）。
-- **收件箱**：\`board.sh roles show\` 里**你那个角色**对应的 \`inbox\`（内置三角色，无需手动建：\`lead\` → \`inbox-lead.md\`、\`codex\` → \`inbox-codex.md\`、\`pi\` → \`inbox-pi.md\`）—— **每次被唤醒的第一动作必读**。
+- **收件箱**：\`board.sh roles show\` 里**你那个角色**对应的 \`inbox\`（内置三角色，无需手动建：\`lead\` → \`inbox-lead.md\`、\`codex\` → \`inbox-codex.md\`、\`pi\` → \`inbox-pi.md\`、\`claude\` → \`inbox-claude.md\`）—— **每次被唤醒的第一动作必读**。
 - **交付必含四段**：交付 / 异议位 / 下一步建议 / 自验（并注明遵守的协议版本）。异议位不许沉默——列前提、标未验证项。
 - **终态不可复改**：\`completed\` / \`abandoned\`；出问题开新任务，并在 \`context\` / \`blocked_by\` 引用旧任务。
 - **数据目录**：默认 \`~/proj/dual-board\`，用环境变量 \`DUAL_BOARD_DIR\` 覆盖。
@@ -664,32 +670,13 @@ function tomlString(value) {
   return `"${String(value).replace(/[\r\n]+/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 }
 
-
 // 提取原 config.toml 中全部 [mcp_servers.*] 段（段体直到下一个段头或文件尾）。
 // 插件模板不生成这些段；切换提供方时原样保留，避免用户经 codex mcp add 挂载的
 // 外部 MCP（如 exa）在重写中丢失。原文件不存在或读取失败时返回空数组。
 
-// 插件模板自己生成的段（每次重写都会重新生成）—— 重写时只排除这一类，其余段原样保留。
-// 用黑名单而非白名单：白名单每出现一种新段就要补一次名单，漏补 = 静默丢配置。
-// 2026-10-02 实证：旧白名单只保留 mcp_servers.*，切一次提供方就把 [features] 整段丢掉，
-// memories / multi_agent_v2 / network_proxy / recommended_plugins 全部回到默认 false，
-// [projects."$HOME/proj"] 的 trust_level 也一并消失，且全程零报错。
-//
-// memories 也归模板管：它的两个模型字段必须跟随当前提供方。缺省时 Codex 会去挑
-// 内置目录里的 OpenAI 模型名，落到第三方提供方上就是「模型不存在，请检查模型代码」，
-// 记忆生成全失败（2026-10-02 实证：jobs 表 6 条全 error、stage1_outputs 0 行）。
-const TEMPLATE_OWNED_SECTION = /^\[(?:model_providers\.[^\]\n]+|memories)\][^\n]*$/
 
 // 提取原 config.toml 中「除模板自有段之外」的全部段（段体直到下一个段头或文件尾）。
 // 原文件不存在或读取失败时返回空数组。
-
-// 模板自己生成的顶层键（每次重写重新生成）；其余顶层键值行重写时原样带回。
-// 原先只显式保留 sandbox_mode/web_search，用户手写的其它顶层键（如
-// disable_response_storage）在切换提供方时被静默丢弃。
-const TEMPLATE_OWNED_TOP_LEVEL = new Set([
-  'model_provider', 'model', 'sandbox_mode', 'web_search', 'approval_policy',
-  'model_context_window', 'model_max_output_tokens',
-])
 
 // 首个段头之前的非模板顶层 key = value 行（原样保留；TOML 顶层键必须在首个 [table] 前）。
 
@@ -1106,6 +1093,10 @@ export async function writeCodexConfig(provider) {
     `model = ${tomlString(provider.model)}`,
     `sandbox_mode = ${tomlString(sandboxMode)}`,
     `web_search = ${tomlString(webSearch)}`,
+    // 2026-11-06：Codex 的 reasoning summary 默认 none —— 上游只回 encrypted_content，
+    // 界面上看不到任何思考（openai/codex#38160）。设 auto 让上游尽量给可读摘要；
+    // provider 不支持时 Codex 会忽略该字段，不会因此失败。
+    'model_reasoning_summary = "auto"',
     // 审批策略固定 never：exec 模式非交互，默认值下工作副本外写入会请求人工审批 → 无限挂起假死（2026-09-21 实证）
     `approval_policy = "never"`,
   ]
@@ -1147,8 +1138,17 @@ export async function writeCodexConfig(provider) {
   return envKey
 }
 
-
 async function activeEngineModel(id) {
+  if (id === 'claude') {
+    // Claude 不读 keyring：模型来自设置页写入的 claude-model.txt，缺省 haiku。
+    // 不修这里的话「当前模型」永远显示 Codex 的 active provider model（实测过 gpt-6.1-sol）。
+    let model = 'haiku'
+    try {
+      const v = readFileSync(join(homedir(), '.dsh', 'second-engine', 'claude-model.txt'), 'utf8').trim()
+      if (v !== '') model = v
+    } catch { /* 未配置 */ }
+    return { providerId: 'claude', model, fallback: false, source: 'claude-config' }
+  }
   if (id !== 'pi') {
     try {
       const doc = loadKeyring()
@@ -1163,21 +1163,56 @@ async function activeEngineModel(id) {
   return { providerId: '', model: '', fallback: true, source: 'none' }
 }
 
+/** 递归算目录字节数。绝不抛错；单项失败只跳过该项。 */
+function dirBytes(root) {
+  let total = 0
+  const stack = [root]
+  while (stack.length > 0) {
+    const cur = stack.pop()
+    let entries
+    try { entries = readdirSync(cur, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      const p = join(cur, e.name)
+      try {
+        if (e.isDirectory()) stack.push(p)
+        else if (e.isFile()) total += statSync(p).size
+      } catch { /* 单项失败不影响总数 */ }
+    }
+  }
+  return total
+}
+
 /** 当前引擎的探测 + 能力（status/config 共用，别写两份）。 */
 export async function engineView() {
   const active = activeEngineId()
   const caps = ENGINES[active] !== undefined ? ENGINES[active].capabilities : null
-  const view = { active, list: engineList(), caps, model: await activeEngineModel(active), cleanup: cleanupTarget(active) }
+  // cleanup.bytes = **当前引擎自己**的会话目录大小。顶层 sessionsBytes 恒指 ~/.codex/sessions，
+  // 在 Claude/Pi 面板上渲染它就是「Claude 面板写着 Codex 会话占用」（2026-11-05 用户截图）。
+  const cleanup = cleanupTarget(active)
+  if (cleanup !== null && typeof cleanup === 'object' && typeof cleanup.dir === 'string' && cleanup.dir !== '') {
+    cleanup.bytes = dirBytes(cleanup.dir)
+  }
+  const view = { active, list: engineList(), caps, model: await activeEngineModel(active), cleanup }
   if (active === 'pi') {
     try { view.probe = { pi: await piProbe(), models: await piAvailableModels() } }
     catch (e) { view.probe = { pi: null, models: null, error: errMsg(e) } }
+  } else if (active === 'claude') {
+    // Claude 不读 config.toml / keyring（凭证走 ANTHROPIC_* 或中转面板），
+    // 有排障价值的两项：可执行文件在不在 PATH，模型落盘文件在不在。
+    const r = spawnSync('sh', ['-c', 'command -v claude'], { encoding: 'utf8', timeout: 5000 })
+    const bin = r !== null && r.status === 0 ? String(r.stdout || '').trim() : ''
+    let modelFile = { exists: false, value: '' }
+    try {
+      const { CLAUDE_MODEL_PATH } = await import('./claude-providers.js')
+      const v = readFileSync(CLAUDE_MODEL_PATH, 'utf8').trim()
+      modelFile = { exists: true, value: v }
+    } catch { /* 未落盘 = 用默认 haiku */ }
+    view.probe = { claude: { inPath: bin !== '', path: bin, modelFile } }
   } else {
     view.probe = { pi: null, models: null }
   }
   return view
 }
-
-
 
 // ── Pi 面板数据（P4.6）：Pi 引擎专用，字段与 lib/pi-cards.js 契约一一对应 ──
 // 为什么单独出口：Codex 的 keyring/config.toml 与 ~/.codex/sessions 在 Pi 下全无意义，
@@ -1199,7 +1234,6 @@ export function countPiJsonl(dir) {
   return { count, sizeBytes }
 }
 
-
 // ── Pi 自定义模型渠道（P4.7）：写 ~/.pi/agent/models.json 的 providers.<id> ──
 // 格式依据 Pi docs/models.md:45「Configure a compatible endpoint」：
 //   { providers: { <id>: { baseUrl, api, apiKey, models: [{ id }] } } }
@@ -1209,10 +1243,6 @@ export const PI_CHANNEL_APIS = new Set([
   'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream',
 ])
 
-
-
-
-
 // D8-① 用的引擎门禁：期望引擎与实际激活引擎不一致 → 返回一条可直接 send 的错误体；一致 → null 放行。
 // ⚠️ 复核订正（我上轮缺陷表 D8 里写「引擎未知时放行」）：activeEngineId() 是**读文件、读不到就返回
 // 'codex'**（src/engine/registry.js:82-88），它永远不会返回空串，所以那半句是错的、也是死代码 ——
@@ -1220,14 +1250,14 @@ export const PI_CHANNEL_APIS = new Set([
 export function engineGateFor(expected) {
   const active = activeEngineId()
   if (active === expected) return null
-  const want = expected === 'pi' ? 'Pi' : 'Codex'
-  const now = active === 'pi' ? 'Pi' : (active === 'codex' ? 'Codex' : active)
+  const labelOf = (id) => (ENGINES[id] !== undefined ? ENGINES[id].label : id)
+  const want = labelOf(expected)
+  const now = labelOf(active)
   return {
     error: `当前引擎是 ${now}，本接口只清 ${want} 的会话（已中止，未改动任何文件）`,
     engineMismatch: { active, expected },
   }
 }
-
 
 // 协议选项：由后端下发，前端不写死。Codex 只有两种（completions 需经本地桥翻译），
 // Pi 直连六种原生 api，没有桥的概念 —— 写死两选项会让 Pi 用户缺 anthropic/gemini。
@@ -1313,20 +1343,13 @@ export function readPiJsonStrict(path) {
   return doc
 }
 
-
 // wireApi（Codex 术语）↔ api（Pi 术语）
 // 接受三种输入：Codex 的 responses/completions，或 Pi 自己的 api 值（原样直通）。
 export const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream'])
 
-
 /** Pi 快照 → Codex 形状。内置只预设 deepseek（用户要求），其余全在 models.json 里。 */
 /** 模型名不该长成 API Key 的样子（智谱是 id.secret，49 字符）。
  *  用户实测把 key 填进「模型名」，结果被当模型名写进 models.json 并显示在面板上。 */
-
-
-
-
-
 
 // Pi 写入口统一错误出口：PiWriteAborted 带自己的 status（409/500），其余按 200 + ok:false（与历史一致）。
 // ── Pi JSON 备份轮转（D4，2026-10-29）────────────────────────────────
@@ -1370,23 +1393,8 @@ export function sendPiWriteError(res, e) {
   send(res, { ok: false, error: errMsg(e) }, status)
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // POST /providers/delete：核心默认（deepseek/zhipu）不可删；自定义提供方均可删。删除 active 时回落并同步 config.toml。
 export const PROTECTED_IDS = new Set(['deepseek', 'zhipu'])
-
 
 // ── /models 与 /model：模型获取与选择 ──
 
@@ -1409,11 +1417,32 @@ export function bigmodelAuxModelsUrl(baseUrl) {
 //   Z.ai（智谱）：      { models:[{ id, display_name, ... }] }
 // 取 id；无 id 时回落 display_name；顺带容忍纯字符串条目与重复项。
 
-
 // POST /model：body { id, model }（id 缺省 = active）。写入 provider.model；
 // 若该提供方正是 active，则同步重写 config.toml，使引擎立刻用上新模型。
 async function handleProviderModel(req, res) {
   if (activeEngineId() === 'pi') return piProviderModel(req, res)
+  if (activeEngineId() === 'claude') {
+    // Claude 不走 keyring/config.toml：模型只存插件自己的一个小文件，
+    // 派单时由 startClaudeTask 读出来传给 --model。
+    try {
+      const body = await readBody(req)
+      const model = typeof body.model === 'string' ? body.model.trim() : ''
+      if (model === '') return send(res, { ok: false, error: 'model 不能为空' }, 400)
+      const p2 = join(homedir(), '.dsh', 'second-engine', 'claude-model.txt')
+      mkdirSync(dirname(p2), { recursive: true })
+      writeFileSync(p2, `${model}\n`, 'utf8')
+      // 同时回写 provider.model —— 否则列表里该行永远显示「未设模型」
+      // （前端读的是 providers[].model，不是 claude-model.txt）。
+      try {
+        const { loadClaudeProviders, saveClaudeProviders } = await import('./claude-providers.js')
+        const doc = loadClaudeProviders()
+        const wantId = typeof body.id === 'string' && body.id.trim() !== '' ? body.id.trim() : doc.active
+        const hit = (doc.providers || []).find((x) => x.id === wantId)
+        if (hit) { hit.model = model; saveClaudeProviders(doc) }
+      } catch { /* 配置写失败不阻塞主流程 */ }
+      return send(res, { ok: true, engine: 'claude', model })
+    } catch (e) { return send(res, { ok: false, error: errMsg(e) }) }
+  }
   try {
     const body = await readBody(req)
     const id = typeof body.id === 'string' && body.id.trim() !== '' ? body.id.trim() : ''
@@ -1642,7 +1671,7 @@ export function taskView(task) {
     // Codex 侧视图）。判据就是创建时写下的 `task.engine`（Pi 分支 :3600 已写 'pi'）。
     // ⚠️ 别用 `piProvider` 判：调用方不传 provider 时它是 undefined，会把 Pi 单误判成 codex
     // （2026-10-31 实机踩过：Pi 的单返回 engine:'codex'）。
-    engine: task.engine === 'pi' ? 'pi' : 'codex',
+    engine: task.engine || 'codex',
     tokenUsage: task.tokenUsage ?? { status: 'pending' },
   }
   // 实时进度可见性：exec 模式看 liveBytes（过程流字节数，在涨=在动），
@@ -1679,6 +1708,12 @@ export function taskView(task) {
     // 「stopReason=blocked 即阻断」的映射规则；rounds[].verdict 与 task.verdict 里
     // 同步可见归一化后的 'blocked'。
     if (task.stopReason === 'blocked') view.blocked = true
+    // 判据 stale（2026-11-06）：复核期间被审文件变了 → 旧结论不发布。status 仍是 done（前端只认
+    // done/error/cancelled），这里单独外显，调用方据此重审。与 activity-stale（失联检测）无关。
+    if (task.stale === true) {
+      view.stale = true
+      view.staleReasons = Array.isArray(task.staleReasons) ? task.staleReasons : []
+    }
     // 独立来源可见性（2026-10-26，secondop-panel 的 quorum 语义）：「converged 是谁说的」
     // 必须看得见——本插件恒 1 个独立复核家族（写代码的模型可以发言但永不计入 quorum，
     // 本插件里「写方发言」就是被审 content 本身）。只读证据字段（同 reviewDirty：证据、
@@ -1750,7 +1785,6 @@ function stopWatchdog(task) { rtOf(task).stopWatchdog() }
 // spawn 后启动：每 30s 看一次活性（心跳 ∨ -o 文件 mtime 兜底），超 300s 无变化 → stuckSuspect + 通知一次。
 export function startWatchdog(task) { rtOf(task).startWatchdog() }
 
-
 // ── A（2026-10-25）：唯一收尾路径 ──
 // finalizeTask 与 finalizeReview 原是两套平行实现且行为漂移（复核不读 output、不删
 // outPath，轮次文件只能靠 keepDays 清理兜底）—— 统一为 finalizeJob：
@@ -1765,7 +1799,6 @@ function consultsForTask(task) {
     (typeof c.taskId === 'string' && c.taskId !== '' && c.taskId === task.id)
     || ((c.taskId === undefined || c.taskId === null || c.taskId === '') && typeof c.at === 'number' && c.at >= started))
 }
-
 
 // P2.3（2026-10-28）：finalizeJob 的 extra 是历史旁路 —— 若允许任意字段，等于给
 // 「终态唯一落定」开一个后门（任何调用方都能绕过 status/exitCode 直接改 task）。
@@ -1806,7 +1839,17 @@ export function finalizeJob(task, exitCode, status, extra) {
 
 // 工单收尾：统一走 finalizeJob。
 export function finalizeTask(task, exitCode, status) {
+  // 顺序很重要：finalizeJob 会用工单的 -o 文件**覆盖** task.output，
+  // 所以外部事实验收必须放在它之后 —— 否则追加的失败原因会被冲掉
+  //（2026-11-06 实测：假成功单 status=error 但 output 里只有模型回答、没有原因）。
   const first = finalizeJob(task, exitCode, status)
+  if (first && task.engine === 'claude' && status === 'done') {
+    const verification = verifyClaudeEffect({ ...task, exitCode })
+    if (!verification.ok) {
+      task.status = 'error'
+      task.output = `${typeof task.output === 'string' ? task.output : ''}${task.output ? '\n' : ''}${verification.reason}`
+    }
+  }
   if (first) publishTaskReport(task, buildReport(task))
   return first
 }
@@ -1861,23 +1904,12 @@ export function notifyTask(task) {
   void notify(text).then((ok) => { if (!ok) { task.notifyUndelivered = true; auditNotifyFailure(task, 'app notify rejected or unavailable') } })
 }
 
-
-
-
-
 // ── #8-10（2026-10-25）：复核接力链 ──
 // ③ 摘要进 output：主 AI 收单必读 output（与 appendConsultBlock 同通道同先例），
 // 它即使不知道 /api/reviews，下一次 GET /task?id= 也能看到未决问题与接力入口。
 // （dual-board 收件箱被否决：inbox-append --sender 只允许 {lead,codex}，插件写入=冒充协议方。）
 
-
-
 // 数量截断：目录超 REVIEW_KEEP_FILES 个按 mtime 删最旧。
-
-
-
-
-
 
 async function gitCommitEnv(workdir) {
   const hasEmail = await gitOk(['config', '--get', 'user.email'], { cwd: workdir, timeout: 15000 })
@@ -1934,7 +1966,6 @@ function projectProgress(list) {
   return list.slice(-PROGRESS_LIMIT).map((e) => progressEntry(e, e?.at ?? null))
 }
 
-
 // POST /task：body { prompt, workdir?, ephemeral? }。立刻返回 { ok, id }，任务后台跑。
 // ephemeral 缺省 true（不落盘 rollout），只有显式 body.ephemeral === false 才持久化会话。
 export async function handleTaskCreate(req, res) {
@@ -1943,11 +1974,26 @@ export async function handleTaskCreate(req, res) {
     const body = await readBody(req)
     const boardId = requestedBoardId(body)
     const engine = activeEngineId()
-    const request = normalizeTaskRequest(body, { workdir: taskWorkdirForEngine(engine), engine })
+    // 默认 workdir 必须按**任务指定的引擎**算，不是按 active 算（2026-11-06 实测 bug：
+    // active=claude 时派 pi 单，落到了 /root/claude-workspace）。body.engine 有值就以它为准。
+    const requestedEngine = typeof body.engine === 'string' && body.engine !== '' ? body.engine : engine
+    const request = normalizeTaskRequest(body, { workdir: taskWorkdirForEngine(requestedEngine), engine })
     const { prompt, workdir } = request
     if (prompt === '') return send(res, { ok: false, error: 'prompt 不能为空' }, 400)
+    // 派活前置校验（借 tandem，2026-11-06）：**明确传了但非法**当场 400，
+    // 不传不拦（老调用方一律没有这两项）。校验类型与范围，不校验内容质量。
+    if (body.timeoutMs !== undefined && !(Number.isInteger(body.timeoutMs) && body.timeoutMs > 0 && body.timeoutMs <= 86400000)) {
+      return send(res, { ok: false, error: 'timeoutMs 必须是 1..86400000 的整数（毫秒）' }, 400)
+    }
+    if (body.acceptance !== undefined && typeof body.acceptance !== 'string'
+      && !(Array.isArray(body.acceptance) && body.acceptance.every((x) => typeof x === 'string'))) {
+      return send(res, { ok: false, error: 'acceptance 必须是字符串或字符串数组' }, 400)
+    }
     if (!existsSync(workdir)) {
-      return send(res, { ok: false, error: `workdir 不存在：${workdir}` }, 400)
+      // 2026-11-05 用户裁定：**不自动创建**。工作区由使用者手动建立，
+      // README「装之前要准备什么」里写明。插件只检查、不代建 —— 避免替人
+      // 决定目录落在哪，也让「工作区不存在」这个错误暴露得早。
+      return send(res, { ok: false, error: `workdir 不存在：${workdir}（请先手动创建，见 README）` }, 400)
     }
     // P4.2（2026-10-28）：按引擎分流。Pi 走自己的 provider（env/models.json），
     // 不依赖 Codex 的 keyring，所以这一支必须在 loadKeyring 之前。
@@ -1985,6 +2031,21 @@ export async function handleTaskCreate(req, res) {
         prompt,
         model: typeof body.model === 'string' ? body.model : undefined,
         provider: typeof body.provider === 'string' ? body.provider : undefined,
+      })
+    }
+
+    // Claude 也不依赖 Codex 的 keyring（凭证走 ANTHROPIC_* 环境变量或 ~/.claude/settings.json），
+    // 同样必须放在 loadKeyring 之前。
+    if (engineId === 'claude') {
+      const claudeId = newId()
+      return startClaudeTask({
+        res,
+        id: claudeId,
+        boardId,
+        outPath: join(CODEX_DIR, `task-${claudeId}.out`),
+        workdir,
+        prompt,
+        model: typeof body.model === 'string' ? body.model : undefined,
       })
     }
 
@@ -2125,10 +2186,6 @@ export async function handleTaskCreate(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-
-
-
-
 // ── /review、/review/cancel：双向互审 ──
 // 两引擎相互批判性复核：每轮把同一份 content 交给独立复核引擎，只累加 issues 对照，
 // 不做自动改写（v1 语义）；issues 清空即收敛，轮数到顶即打包交用户裁决。
@@ -2139,17 +2196,9 @@ const clipText = (text, limit = REVIEW_RAW_CLIP) => {
 }
 
 // 宽松解析：从自由文本里截取「首个配平的 {...} 块」（跳过字符串内的花括号与转义）。
-const ISSUE_PUNCT_TABLE = { '，': ',', '、': ',', '。': '.', '！': '!', '？': '?', '：': ':', '；': ';', '（': '(', '）': ')', '【': '[', '】': ']', '「': '"', '」': '"', '『': '"', '』': '"', '“': '"', '”': '"', '‘': "'", '’': "'", '—': '-', '－': '-', '～': '~', '《': '<', '》': '>' }
-const ISSUE_PUNCT_RE = /[，、。！？：；（）【】「」『』“”‘’—－～《》]/g
 // fingerprint：sha256(severity + '\0' + 规范化 point) 前 12 位 hex（v1 的 id 算法原样保留，
 // 只是不再当身份）。仅用于同一条目「文本是否原样重列」的判断与 mergedFrom 谱系留痕。
 
-// ── 相似度归并阈值（提成常量，调参只动这里）──
-// 归并须同时满足：severity 相同、point 3-gram Jaccard ≥ ISSUE_MERGE_THRESHOLD、
-// suggestion 3-gram Jaccard ≥ ISSUE_MERGE_SUGGESTION_THRESHOLD。point 太松会把近邻
-// 主张并成一条，suggestion 太松会把「同问题不同修法」拧成同一条。
-const ISSUE_MERGE_THRESHOLD = 0.8
-const ISSUE_MERGE_SUGGESTION_THRESHOLD = 0.5
 
 // 引用形态：i<N>（v2 账本 id）或 4..64 位 hex（v1 内容哈希——经 ledger aliases 仍可命中）。
 
@@ -2216,8 +2265,6 @@ export function resolveResponseIds(responses, prevIssues) {
 
 // id/alias → 条目 的索引（回辩与 responses 解析共用：旧哈希引用经 aliases 命中）。
 
-
-
 // ledger 终止判据（纯函数）：open/disputed 清零 且 本轮 responses 无 upheld → converged。
 // 取代旧的下标版 dialogueConverged（「issues 无新增且无 upheld」）：旧判据下「原样重列
 // 但不坚持」也算收敛；账本口径更严——问题还挂在 issues 里就是未了结。
@@ -2241,26 +2288,11 @@ export function isBlockedVerdict(verdictText, issues) {
 // responses 可缺省：旧格式（无该键）照常解析，缺失 = 未回应，恒为 []。
 // blocked 时返回值另带 blocked:true，verdict 恒为归一化后的 'blocked'。
 
-
-// c)（#6，2026-10-25）：被审产出用成对分隔标记包住并声明「数据非指令」——content 是
-// 任意字符串、原样进 prompt，而它交给的是 danger-full-access + approval never 的进程，
-// 这里从结构上把「材料里夹带的指令」隔离掉一层。标记串在 content 内出现时先中和，防自封闭。
-const REVIEW_MATERIAL_BEGIN = '<<<待审材料-开始>>>'
-const REVIEW_MATERIAL_END = '<<<待审材料-结束>>>'
-
-
-
-
 // 从 codex exec 输出尾部抽 "tokens used\nN"（codex 自报的累计用量）。
 // 抽不到返回 0 —— 宁可少算也不误停（硬预算语义是"到量才停"，不是"猜一个"）。
 
 // 振荡检测用的稳定指纹：只取 issues 的三个语义字段，排序后哈希（顺序无关）。
 // 两个 AI 在「主张 X / 反对 X」之间来回时，同一批 issues 会原样回来 → 命中即判循环。
-
-
-
-
-
 
 export async function handleConfigSet(req, res) {
   try {
@@ -2371,8 +2403,6 @@ export async function handleConfigSet(req, res) {
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
 
-
-
 // ── /consult、/consults：Codex 卡点求助信道 ──
 // 供第二引擎（Codex）在卡住时把上下文交给主 AI；内存队列，不落盘。
 async function handleConsultCreate(req, res) {
@@ -2404,10 +2434,6 @@ async function handleConsultCreate(req, res) {
     send(res, { ok: true, id: entry.id, at: entry.at, count: consults.length })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }
-
-
-
-
 
 // ── Pi 引擎下的 MCP 兼容层（P4.22）──
 // 前端 WebSearchMcpCard 一行不改：把 ~/.pi/agent/mcp.json 的 mcpServers
@@ -2442,19 +2468,9 @@ export async function writePiMcp(mutate) {
   return out
 }
 
-
-
-
-
-
 // ── /mcp：MCP 服务器增删查（config.toml 的 [mcp_servers.*] 段）──
 // 注册为 prefix 路由（'prefix' 同时命中 /mcp 与 /mcp/<name>），按方法+子路径分发。
 export const MCP_ROUTE_PREFIX = '/second-engine/api/mcp'
-
-
-
-
-
 
 // ── /version：版本检查 ──
 // 本机 `codex --version` 与 GitHub 最新 release 对比。远端结果做模块级缓存 60 分钟：
@@ -2552,6 +2568,34 @@ async function handleVersion(_req, res) {
       if (error !== '') payload.error = error
       return send(res, payload)
     }
+    if (activeEngineId() === 'claude') {
+      // Claude 走 npm（与 Pi 同类），版本号取自 `claude --version` 第一段。
+      let cur = ''
+      try {
+        const r = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 15000 })
+        const line = String((r && r.stdout) || '').trim()
+        const m = line.match(/^(\d+\.\d+\.\d+)/)
+        if (m) cur = m[1]
+      } catch { /* 取不到就留空，前端显示未知 */ }
+      let lat = ''
+      let err2 = ''
+      try {
+        const r = await fetch('https://registry.npmmirror.com/@anthropic-ai/claude-code/latest', { signal: AbortSignal.timeout(15000) })
+        const j = await r.json()
+        if (j && typeof j.version === 'string') lat = j.version
+      } catch (e) { err2 = errMsg(e) }
+      const payload = {
+        ok: true,
+        engine: 'claude',
+        current: cur,
+        latest: lat,
+        updateAvailable: compareVersions(lat, cur) > 0,
+        htmlUrl: 'https://www.npmjs.com/package/@anthropic-ai/claude-code',
+        checkedAt: Date.now(),
+      }
+      if (err2 !== '') payload.error = err2
+      return send(res, payload)
+    }
     const current = await localCodexVersion()
     let latest = ''
     let error = ''
@@ -2623,7 +2667,6 @@ export async function latestPluginVersion() {
   }
 }
 
-
 export function apply(ctx) {
   loadPolicyWatchState()
   ctx.on('session/event', async (session, event) => {
@@ -2675,12 +2718,33 @@ export function apply(ctx) {
         const abortHit = hintToggles.interruption && recentAborts.length >= MOOD_ABORT_TRIGGER
           ? { kind: 'interrupt', reason: `最近 ${Math.round(MOOD_ABORT_WINDOW_MS / 60000)} 分钟内被你打断 ${recentAborts.length} 次（单次不算，连续才算方向偏）` }
           : null
-        const hit = textHit !== null ? textHit : abortHit
+        const rawHit = textHit !== null ? textHit : abortHit
+        // 冷却守卫（v1 就有，接入状态机时被我漏掉，导致「命中率偏高」）。
+        // 2026-11-06 用户定：一律 120 秒，**不再给 stop 豁免** —— 宁可吞掉一次提醒。
         const nowMs = Date.now()
-        // stop 是明确叫停，必须立刻生效，不受冷却压制（Codex 评估指出）。
-        if (hit !== null && (hit.kind === 'stop' || nowMs - (moodWatchLastAt.get(sessionId) || 0) >= MOOD_COOLDOWN_MS)) {
-          moodWatchLastAt.set(sessionId, nowMs)
-          decision = { ...decision, messages: [...decision.messages, buildMoodMessage(hit, `mood-watch-${sessionId}`)] }
+        const withinCooldown = nowMs - (moodWatchLastAt.get(sessionId) || 0) < MOOD_COOLDOWN_MS
+        const hit = rawHit !== null && !withinCooldown ? rawHit : null
+        // 2026-11-06：改走回执校验状态机（Z1）。命中 → 注入带事件 ID 的提醒；
+        // 下一轮看模型回复里有没有 [MW_ACK] 可校验回执；缺 ⇒ 再提醒；连续 2 次缺 ⇒ 标待确认。
+        const statePath = join(MOOD_STATE_DIR, `${sessionId}.json`)
+        const prevState = loadState(statePath, { sessionId })
+        const stepped = stepTurn(prevState, {
+          sessionId,
+          anchorText: lastUserText(decision.messages),
+          replyText: lastAssistantText(decision.messages),
+          hit,
+          buildMessage: buildMoodMessage,
+        })
+        saveState(statePath, stepped.state)
+        for (const inj of stepped.actions.inject) {
+          decision = { ...decision, messages: [...decision.messages, inj.message] }
+        }
+        if (stepped.actions.inject.length > 0) moodWatchLastAt.set(sessionId, nowMs)
+        // 待确认清单：节流提醒（默认 90s），只在有内容且未刚提醒过时插一条
+        if (stepped.state.pendingConfirm.length > 0
+          && shouldRemindPending(stepped.state, { lastAt: moodWatchLastAt.get(sessionId) || 0 })) {
+          moodWatchLastAt.set(sessionId, Date.now())
+          decision = { ...decision, messages: [...decision.messages, buildPendingReminder(stepped.state)] }
         }
       } catch (e) { noteErr('mood-watch', e) }
     }
@@ -2714,7 +2778,8 @@ export function apply(ctx) {
         + '先自己判断这是哪一种：① 你在验证同一个东西（重复是有意的，合理）；② 你在原地打转（同一命令反复跑、同一处反复改、连续多步没有实质推进）。\n'
         + '若判断为②：不要再重复同一条命令或同一处修改。换一个量、换一条路径，或把这步交给第二引擎做独立判断——派单执行或复核你最近的动作都行。\n'
         + '第二引擎只承担「独立判断或执行」这部分，派不派、派什么仍由你决定；它看不到当前会话，交代过去的活必须自包含。\n'
-        + '不要在本轮回复中提及这条提醒，只处理判断后该做的事。' }],
+        + '不要在本轮回复中提及这条提醒，只处理判断后该做的事。\n'
+        + WATCH_TAIL }],
     }
     return { ...decision, messages: [...decision.messages, message] }
   })
@@ -2731,6 +2796,8 @@ export function apply(ctx) {
   ensureAgentsProtocol()
   // 长任务协作看板（dual-board）用法段：同样写进全局 AGENTS.md（独立幂等）。
   ensureBoardProtocol()
+  // 桥自恢复：Web 重启会带走桥进程；上次手动开过就重新拉起（主动关过则不动）
+  try { autoStartIfEnabled() } catch { /* 不影响插件启动 */ }
   // 主动开口与整体评估段（2026-10-25）：三档开关 SECOND_ENGINE_VOICE=ask|voice|off，
   // 成对标记支持切档删除；缺省 ask 不写段。
   ensureVoiceProtocol()
@@ -2769,6 +2836,8 @@ export function apply(ctx) {
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-model', desc: 'Pi 默认模型切换 { provider, model }：写 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel（新建会话生效）', handler: handlePiModelSet },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-bridge', desc: 'Pi 聊天桥启停 { action: start|stop }（起后真探活 8788 再回报）', handler: handlePiBridge },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-cleanup', desc: 'Pi 会话清理 { confirm: true }：删 ~/.pi/agent/sessions 下 *.jsonl', handler: handlePiCleanup },
+      { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/claude-bridge', desc: 'Claude 聊天桥：GET 状态 / POST {action: start|stop|status}（端口 8789）', handler: handleClaudeBridge },
+      { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/claude-cleanup', desc: 'Claude 会话清理 { confirm: true, keepDays? }：删 ~/.claude/projects 下超期 *.jsonl', handler: handleClaudeCleanup },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/pi-channel-delete', desc: 'Pi 删除自定义渠道 { id }（写前 .bak、0600）', handler: handlePiChannelDelete },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/status', desc: '引擎/密钥/会话占用概览', handler: handleStatus },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/providers', desc: 'GET 提供方列表（apiKey 脱敏）+ active；POST 新增自定义提供方 { id, baseUrl, api, apiKey, name? }', handler: handleProvidersRoot },

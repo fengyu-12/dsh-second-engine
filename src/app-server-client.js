@@ -137,7 +137,6 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
   // A: thread/settings/update 能力开关（codex-driver.ts:643-700）
   let settingsUpdateUnsupported = false
   let threadModel = null
-  let contextTokens = null
   let contextWindow = null
   const serverRequestHandlers = []
   const respond = (id, result) => write({ jsonrpc: '2.0', id, result })
@@ -346,7 +345,6 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
               contextUsageRatio: Number(Math.min(1, (u.contextTokens ?? 0) / contextWindow).toFixed(6)) }
           }
         }
-        if (un && typeof un.contextTokens === 'number') contextTokens = un.contextTokens
         emit({ kind: 'usage', usage: { tokens: p.tokenUsage, ...(un ? { normalized: un } : {}) },
           done: false, meta: base })
         break
@@ -354,7 +352,6 @@ export function startAppServerTurn({ cwd, env, prompt, outPath, onEvent, codexAr
       case 'thread/compacted':
         // A: 压缩完成信号（codex 0.158 起 thread/compacted 已废弃，只可能来自旧版运行时）：
         // 我方一个 turn 一个线程，不需要 compaction 事务闭环，只需投影 + 清零用量记账。
-        contextTokens = 0
         emit({ kind: 'status', text: 'context compacted', done: false, meta: base })
         break
       case 'thread/status/changed':
