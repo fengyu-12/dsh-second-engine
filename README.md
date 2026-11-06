@@ -417,10 +417,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.0.0）
+## 支持能力一览（v4.1.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **4.1.0 孤儿进程兜底 + 复核回合制 + 回归网** | ✅ 4.1.0 | ① **孤儿进程兜底**：`spawnLimited` 加 `detached:true` + `killGroup`（进程组回收，连孙进程一起）；`process.on('exit')` + SIGTERM/SIGINT 钩子清组；killGroup 失败落审计；补三个漏洞（reconcile 判失联后仍起新轮 / 异常路径不杀 child / 取消无强制 finalize） ② **复核改回合制**：`REVIEW_DEFAULT_ROUNDS` 3→1；首轮去 `--ephemeral`，第 2 轮起 `exec resume <threadId>` 续同一会话（不再回灌 prev/reply），resume 失败回退新开；用量优先取 `turn.completed.usage`（resume 轮标疑似累计） ③ **回归网**：smoke 第 11 段（blocked / responses / 严格 schema 三条断言，做过反证：删枚举即变红）；`npm test` 接入（18 用例，含 `probe-task-lost` 失联检测 4 案）；JS 侧 `/proc` 端口兜底 ④ **`tools/engine-audit.sh`**：新引擎接入 12 项机械检查，`codex\|pi\|claude` 三引擎全绿 ⑤ **结构债**：反向 import 9→6（`index.js` −275 行、`core.js` +310 行），剩余 6 处全为运行时绑定 ⑥ **skill**：503→491 行，去重（能力契约单源化到 §2.5、并发规则两处改指针），分工按引擎契约重写、不写死模型分数 |
 | **4.0.0 第三引擎 Claude Code + 桥与复核增强** | ✅ 4.0.0 | ① **接入 Claude Code 作第三引擎**：`ENGINES` 加 `claude`（Anthropic 血统），`claude -p` 双向 NDJSON 常驻，桥端口 8789；`registry` / 三处引擎白名单 / 工作区 `~/claude-workspace` / 知识层 `CLAUDE.md` 全部对齐 ② **桥**：新增 `POST /api/bridge/session`（`new` / `switch`，不用编一条假消息就能切会话）；三家桥把思考统一转成 `act` 条目并带 `full`，前端点一下展开全文；Pi 桥补齐**会话历史**（`/api/threads` 读 `~/.pi/agent/sessions`、`/api/transcript?id=`、`switch_session` 切过去继续聊）；新增 **Pi 皮肤**（浅色青 / 深色紫）③ **复核**：判据冻结 + stale（`/api/review` 可带 `files`，复核期间被审文件变了就不发布旧结论）；输出改严格 JSON（`verdict` + `findings[{severity,file,line,issue,evidence}]`，不合 schema 判无效复核）；派活前置校验（`timeoutMs` / `acceptance` 非法当场 400）④ **修三个真 bug**：切会话时 `stdin.end()` 之后再写导致 `ERR_STREAM_WRITE_AFTER_END` **把整座桥带走**（现在写前检查 `writable`，且桥的 stderr 落 `claude-bridge.log`、异常打 `[fatal]` 栈）；派单默认 `workdir` 按 **active 引擎** 算而不是任务引擎（active=claude 时派 pi 单会落进 `~/claude-workspace`）；桥崩溃零日志（原来 `stdio:'ignore'`）⑤ **MCP**：Claude 的 MCP 走 `--mcp-config`，设置页可增删（停用搬到旁路文件，不动启用清单） |
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。

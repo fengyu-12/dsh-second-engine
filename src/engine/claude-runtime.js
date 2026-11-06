@@ -46,9 +46,16 @@ export function createClaudeRuntime(task, deps = {}) {
       child = spawnLimited('claude', args, {
         cwd: spec.workdir || process.cwd(),
         env: { ...process.env, ...(spec.env || {}) },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       }, 'claude')
       rt.setChild(child)
+      // 提示词经 stdin 送，不进 argv（/proc/<pid>/cmdline 可见）。写失败不中断，由 error 处理器兜底。
+      try {
+        if (typeof spec.prompt === 'string' && spec.prompt !== '') child.stdin.write(spec.prompt)
+        child.stdin.end()
+      } catch (e) {
+        rt.setAppError(`claude stdin 写入失败：${e?.message ?? e}`)
+      }
       runOutPath = typeof spec.outPath === 'string' && spec.outPath !== '' ? spec.outPath : null
       assistantText = ''
       lastResult = null

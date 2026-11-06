@@ -1,7 +1,7 @@
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { SESSIONS_DIR, loadKeyring } from './index.js'
+import { loadKeyring } from './index.js'
 
 export function execMode() {
   const fromEnv = process.env.SECOND_ENGINE_EXEC_MODE
@@ -23,21 +23,4 @@ export function keyConfigured() {
   }
 }
 
-export function sessionsBytes(dir = SESSIONS_DIR) {
-  let total = 0
-  let entries
-  try {
-    entries = readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return 0
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry.name)
-    try {
-      if (entry.isDirectory()) total += sessionsBytes(full)
-      else if (entry.isFile()) total += statSync(full).size
-      else if (entry.isSymbolicLink()) total += statSync(full).size
-    } catch { /* 忽略瞬时错误 */ }
-  }
-  return total
-}
+export { sessionsBytes } from './core.js'

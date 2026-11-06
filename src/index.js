@@ -43,7 +43,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
-import { piProbe, piAvailableModels, resolvePiProvider as resolvePiProviderRaw } from './engine/pi-probe.js'
+import { piProbe, piAvailableModels } from './engine/pi-probe.js'
 
 import http from 'node:http'
 import { join, resolve, dirname } from 'node:path'
@@ -57,6 +57,9 @@ import { randomBytes } from 'node:crypto'
 import { WIRE_API, CODEX_DIR, CONFIG_PATH } from './constants.js'
 import { normalizeProvider, normalizeReviewRounds, normalizeReviewWallMs, normalizeReviewTokenLimit, normalizeIssue, REVIEW_DEFAULT_ROUNDS, REVIEW_ROUNDS_CHOICES, REVIEW_DEFAULT_WALL_MS, REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, asText, ISSUE_REF_RE } from './normalize.js'
 import { noteErr, atomicWriteFileSync, send, readConfigRaw } from './core.js'
+import { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PATTERN, TASK_LIST_LIMIT, CONSULT_KEEP_LIMIT, ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MIN_ROUNDS, REVIEW_MAX_ROUNDS, errMsg, sessionsBytesCached, invalidIdError, wireApiError, countPiJsonl, PI_CHANNEL_APIS, CODEX_WIRE_OPTIONS, PI_WIRE_OPTIONS, PI_SETTINGS_PATH, readPiModelMemory, rememberPiModel, readPiJson, PI_WRITE_QUEUES, readPiJsonStrict, PI_API_SET, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, piProvidersBag, piHasProvider, sendPiWriteError, PROTECTED_IDS, modelsUrl, bigmodelAuxModelsUrl, readPiMcp, MCP_ROUTE_PREFIX, compareVersions, resolvePiProvider, PRESET_PROVIDERS, SUPPORTED_WIRE_APIS, ID_PATTERN, PI_MCP_PATH, sessionsBytes } from './core.js'
+export { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PATTERN, TASK_LIST_LIMIT, CONSULT_KEEP_LIMIT, ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MIN_ROUNDS, REVIEW_MAX_ROUNDS, errMsg, sessionsBytesCached, invalidIdError, wireApiError, countPiJsonl, PI_CHANNEL_APIS, CODEX_WIRE_OPTIONS, PI_WIRE_OPTIONS, PI_SETTINGS_PATH, readPiModelMemory, rememberPiModel, readPiJson, PI_WRITE_QUEUES, readPiJsonStrict, PI_API_SET, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, piProvidersBag, piHasProvider, sendPiWriteError, PROTECTED_IDS, modelsUrl, bigmodelAuxModelsUrl, readPiMcp, MCP_ROUTE_PREFIX, compareVersions, resolvePiProvider } from './core.js'
+export { writePiMcp } from './pi-providers.js'
 import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, POLICY_WATCH_DELIVERY_COOLDOWN_MS, POLICY_WATCH_FRESH_MS } from './policy-watch.js'
 import { diagnoseMood, lastUserText, buildMoodMessage, MOOD_COOLDOWN_MS } from './mood-watch.js'
 import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending } from './mood-watch-state.js'
@@ -64,8 +67,8 @@ import { readHintToggles } from './hint-toggles.js'
 import { tasks, TASK_KEEP_LIMIT } from './state.js'
 import { resolveCodexBinary } from './review-core.js'
 import { cleanupReviewFiles, handleReviewsList, handleReviewCreate, handleReviewCancel } from './review-handlers.js'
-import { execMode, sessionsBytes } from './pi-misc.js'
-import { piRuntimeModel, piWriteJson, piProviderModel } from './pi-providers.js'
+import { execMode } from './pi-misc.js'
+import { piRuntimeModel, piWriteJson, piProviderModel, writePiMcp } from './pi-providers.js'
 import { handlePiPanel, handlePiChannelCreate, handlePiModelSet, handlePiBridge, handlePiCleanup, handlePiChannelDelete } from './pi-panel.js'
 import { handleClaudeCleanup } from './engine/claude-cleanup.js'
 import { handleClaudeBridge, autoStartIfEnabled } from './engine/claude-bridge-control.js'
@@ -105,26 +108,8 @@ function agentsTargets() {
     join(homedir(), '.claude', 'CLAUDE.md'),
   ]
 }
-export const SESSIONS_DIR = join(CODEX_DIR, 'sessions')
 
-// 首次初始化写入的三家预设（apiKey 空，待设置页填写）。
-const PRESET_PROVIDERS = [
-  // DeepSeek 官方文档实证的上下文/输出上限，写 config.toml 顶层（见 writeCodexConfig）。
-  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'responses', model: 'deepseek-flash', contextWindow: 1048576, maxOutput: 393216 },
-  { id: 'zhipu', name: '智谱', baseUrl: 'https://open.bigmodel.cn/api/v1', wireApi: 'responses', model: 'glm-4.6' },
-]
-export const PRESET_IDS = new Set(PRESET_PROVIDERS.map((p) => p.id))
-export const DEFAULT_ACTIVE = PRESET_PROVIDERS[0].id
-// Codex 侧永远讲 Responses（config.toml 的 wire_api 恒为它），
-// 'completions' 提供方由本地翻译桥转接（见 ensureBridge）。
-const SUPPORTED_WIRE_APIS = new Set(['responses', 'completions'])
-const ID_PATTERN = /^[a-z][a-z0-9_-]*$/
-// config.toml 顶层 web_search：Codex 原生联网搜索档位（二进制 WebSearchMode 枚举实证）。
-// disabled=关闭，live=开启；cached/indexed 是中间档，面板只暴露 disabled/live 两档。
-export const WEB_SEARCH_MODES = ['disabled', 'cached', 'indexed', 'live']
 const DEFAULT_WEB_SEARCH = 'disabled'
-// MCP 段名：限定字符集堵住段头注入（换行/']'/引号都进不来）。
-export const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 
 // ── 异步工单 ──
 // 进程内任务表：{ id, status:'running'|'done'|'error', exitCode, output, startedAt, endedAt, workdir }。
@@ -170,7 +155,6 @@ export function taskWorkdirForEngine(engine) {
   if (engine === 'claude') return join(homedir(), 'claude-workspace')
   return join(homedir(), 'proj')
 }
-export const TASK_LIST_LIMIT = 10
 // 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
 const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
 
@@ -178,7 +162,6 @@ const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
 // 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
 // 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
 export const consults = []
-export const CONSULT_KEEP_LIMIT = 20
 
 // ── 吞错留痕（D，2026-10-25）──
 // 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
@@ -189,29 +172,14 @@ export const CONSULT_KEEP_LIMIT = 20
 // progress 排障旁路（2026-10-28）：归一化事件的 meta 原文环形上限（条/字节，两者都封）。
 // 只存内存，不落盘、不进 taskView —— 引擎事件可能含模型/工具正文，不往 ERR_LOG（/status
 // 会回显最近 10 条）那种对外通道里放。
-export const ENGINE_EVENTS_LIMIT = 20
-export const ENGINE_EVENTS_META_BYTES = 4096
 
 const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
 const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(process.env.HOME || '/root', '.dsh'), '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
-// Provider selection is runtime/request (via preferredId) then Pi config default;
-// the keyring is consulted by the probe only to fill the selected provider's key.
-export function resolvePiProvider(preferredId = '') {
-  if (preferredId !== '') return resolvePiProviderRaw(preferredId)
-  let configured = ''
-  try {
-    const settings = JSON.parse(readFileSync(join(homedir(), '.pi', 'agent', 'settings.json'), 'utf8'))
-    configured = typeof settings.defaultProvider === 'string' ? settings.defaultProvider : ''
-  } catch { /* optional */ }
-  return resolvePiProviderRaw(configured)
-}
 
 // ── 双向互审（review）──
 // 每轮以固定模板要求独立复核引擎输出 JSON；轮数默认 3、上限 5。
-export const REVIEW_MIN_ROUNDS = 1
-export const REVIEW_MAX_ROUNDS = 5
 // 设置页可选轮数（GET/POST /api/config 的白名单，仅这三档）。
 // 看门狗间隔与阈值已随 P3.2 搬进 src/engine/runtime.js（WATCHDOG_INTERVAL_MS / WATCHDOG_STALL_MS）。
 // 解析失败时回显的原始输出上限，避免把超长文本灌进任务表。
@@ -225,13 +193,10 @@ const REVIEW_RAW_CLIP = 2000
 // 只是单来源自洽，不是多来源共识。硬约束：这两个字段是只读证据（同 reviewDirty：
 // 证据、非归因），不参与任何收敛/终止判定——不做成「不足就不许 converged」（那会让
 // 双引擎永远无法收敛），只让来源数在写「已收敛」之前看得见。
-export const INDEPENDENT_SOURCES = 1
-export const QUORUM_NOTE = '1 个独立复核家族 < 建议下限 3，converged 仅代表单来源自洽'
 // ── #8-10（2026-10-25）：复核记录持久化与接力 ──
 // ~/.codex/reviews/<id>.json（0600 原子写）。双重清理从第一天接上（.live 的教训）：
 // 写入时按数量截断（pruneReviewFiles）+ 定时/手动清理按 mtime 龄汰（cleanupReviewFiles）。
 // 复核 id 形如 "<base36 时间戳>-<16 hex>"（newId）；接力与读档都先过这道闸，防路径注入。
-export const REVIEW_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 
 // 保留天数（设置页 keepDays）：宿主 settings 文档是持久真值，这里只放默认值。
 const DEFAULT_KEEP_DAYS = 7
@@ -283,17 +248,7 @@ function readConfig() {
 }
 
 // ── node:http 小工具（同 guard 写法）──
-export const errMsg = (e) => (e && e.message) ? e.message : String(e)
 
-// status 轮询缓存：递归 stat 整棵 sessions 树不便宜（设置页/浮球会反复刷），
-// TTL 内复用上次结果；runAutoCleanup 仍用新鲜的 sessionsBytes()。
-const SESSIONS_BYTES_TTL_MS = 10000
-let sessionsBytesCache = { at: 0, value: 0 }
-export function sessionsBytesCached() {
-  if (Date.now() - sessionsBytesCache.at < SESSIONS_BYTES_TTL_MS) return sessionsBytesCache.value
-  sessionsBytesCache = { at: Date.now(), value: sessionsBytes() }
-  return sessionsBytesCache.value
-}
 
 // 脱敏预览：前 6 后 4；过短的 key 只留首尾各 2 位
 export function maskKey(key) {
@@ -347,7 +302,7 @@ const AGENTS_V1_END = '<!-- /dsh-second-engine:v1 -->'
 // （2026-10-26 实测：3080→HTTP 000，43309→200），求助只能退回 [CONSULT-NEEDED] 文本兜底。
 // ⚠️ 宿主进程**不注入** DSH_WEB_URL（那是 DSH 给工具子进程的），实测插件里 process.env.DSH_WEB_URL 为空
 // ⇒ 唯一可靠来源是宿主自己的启动参数：`node .../dsh/lib/bin.js web --host 127.0.0.1 --port 43309`。
-const AGENTS_BASE_URL = (() => {
+export const AGENTS_BASE_URL = (() => {
   const env = process.env.SECOND_ENGINE_BASE_URL || process.env.DSH_WEB_URL
   if (typeof env === 'string' && env.trim() !== '') return env.trim().replace(/\/+$/, '')
   const argv = process.argv
@@ -359,6 +314,19 @@ const AGENTS_BASE_URL = (() => {
     const host = rawHost === '' || rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost
     return `http://${host}:${argv[pi + 1]}`
   }
+  // /proc 兜底（2026-11-07）：宿主不是以 --port 启动时（systemd / 包装脚本），
+  // 自己 argv 里没有端口，但父进程（dsh web）的命令行里有。
+  try {
+    const raw = readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8')
+    const parts = raw.split('\0')
+    const qi = parts.indexOf('--port')
+    if (qi !== -1 && /^\d+$/.test(parts[qi + 1] || '')) {
+      const hi = parts.indexOf('--host')
+      const rawHost = hi !== -1 ? String(parts[hi + 1] || '') : ''
+      const host = rawHost === '' || rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost
+      return `http://${host}:${parts[qi + 1]}`
+    }
+  } catch { /* 非 Linux / 无权限：落 3080 */ }
   return 'http://127.0.0.1:3080'
 })()
 // P4.26：Pi 的通知段用 Pi 的身份（标题与 from 字段），其余文案两引擎通用。
@@ -651,18 +619,6 @@ export function providerView(p) {
   }
 }
 
-export function invalidIdError(id) {
-  if (id === '') return 'id 不能为空'
-  if (!ID_PATTERN.test(id)) return 'id 必须以小写字母开头，且只含小写字母、数字、下划线或连字符'
-  return null
-}
-
-// 接受 'responses'（直连）与 'completions'（经本地翻译桥）；其余取值拒绝。
-export function wireApiError(value) {
-  if (value === undefined || value === null || value === '') return null
-  if (SUPPORTED_WIRE_APIS.has(value)) return null
-  return `wireApi 只支持 'responses'（直连）或 'completions'（经本地桥），收到 '${value}'`
-}
 
 // ── config.toml 生成 ──
 // TOML 基本字符串转义，并压掉换行避免注入额外键。
@@ -1002,6 +958,8 @@ async function reconcileOnce() {
     const why = probeTaskLost(task)
     if (why === null) continue
     rtOf(task).setReconcileLost(why)
+    // 判失联后先杀进程组，再 finalize（否则 task 已终态、子进程树仍在跑）。
+    try { rtOf(task).child?.()?.killGroup?.('SIGKILL') } catch { /* best effort */ }
     // 2026-10-31 修：finalizeJob 只写 task 侧（status/endedAt/output），**完全不碰 runtime**。
     // Pi runtime 有自己的 ended 哨兵与 donePromise（pi-rpc-runtime.js:688），不调它的 finalize
     // 就会留下「task 已判失联、pi 子进程还活着、donePromise 永不 resolve」。
@@ -1217,31 +1175,11 @@ export async function engineView() {
 // ── Pi 面板数据（P4.6）：Pi 引擎专用，字段与 lib/pi-cards.js 契约一一对应 ──
 // 为什么单独出口：Codex 的 keyring/config.toml 与 ~/.codex/sessions 在 Pi 下全无意义，
 // 前端若在共享卡片里做行级 if，漏一处就把 Codex 的数字显示在 Pi 面板上（真实踩过）。
-export function countPiJsonl(dir) {
-  let count = 0
-  let sizeBytes = 0
-  const walk = (current) => {
-    let entries = []
-    try { entries = readdirSync(current, { withFileTypes: true }) } catch { return }
-    for (const entry of entries) {
-      const full = join(current, entry.name)
-      if (entry.isDirectory()) { walk(full); continue }
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
-      try { count += 1; sizeBytes += statSync(full).size } catch { /* skip transient file errors */ }
-    }
-  }
-  walk(dir)
-  return { count, sizeBytes }
-}
 
 // ── Pi 自定义模型渠道（P4.7）：写 ~/.pi/agent/models.json 的 providers.<id> ──
 // 格式依据 Pi docs/models.md:45「Configure a compatible endpoint」：
 //   { providers: { <id>: { baseUrl, api, apiKey, models: [{ id }] } } }
 // apiKey 支持 $ENV 插值；本接口不回显明文、不写日志，文件权限 0600，改动前留 .bak。
-export const PI_CHANNEL_APIS = new Set([
-  'openai-completions', 'openai-responses', 'anthropic-messages',
-  'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream',
-])
 
 // D8-① 用的引擎门禁：期望引擎与实际激活引擎不一致 → 返回一条可直接 send 的错误体；一致 → null 放行。
 // ⚠️ 复核订正（我上轮缺陷表 D8 里写「引擎未知时放行」）：activeEngineId() 是**读文件、读不到就返回
@@ -1259,158 +1197,12 @@ export function engineGateFor(expected) {
   }
 }
 
-// 协议选项：由后端下发，前端不写死。Codex 只有两种（completions 需经本地桥翻译），
-// Pi 直连六种原生 api，没有桥的概念 —— 写死两选项会让 Pi 用户缺 anthropic/gemini。
-export const CODEX_WIRE_OPTIONS = [
-  { value: 'responses', label: 'responses（直连）', bridged: false },
-  { value: 'completions', label: 'chat（经本地桥）', bridged: true },
-]
-export const PI_WIRE_OPTIONS = [
-  { value: 'openai-completions', label: 'OpenAI 兼容（chat completions）', bridged: false },
-  { value: 'openai-responses', label: 'OpenAI Responses', bridged: false },
-  { value: 'anthropic-messages', label: 'Anthropic Messages', bridged: false },
-  { value: 'google-generative-ai', label: 'Google Generative AI', bridged: false },
-  { value: 'azure-openai-responses', label: 'Azure OpenAI Responses', bridged: false },
-  { value: 'bedrock-converse-stream', label: 'AWS Bedrock Converse', bridged: false },
-]
 
-// ── Pi 引擎下的 providers/models 兼容层（P4.11）──
-// 目的：前端 ProviderCard 一行都不改。把 Pi 的 models.json + settings.json 映射成
-// Codex 的 { ok, active, providers:[{id,name,baseUrl,model,apiKey:{configured,preview}}] }。
-// 这样「编辑 / 删除 / 填 Key / 拉模型 / 切当前」全部沿用既有实现 —— 不再维护第二套 UI。
-export const PI_SETTINGS_PATH = join(homedir(), '.pi', 'agent', 'settings.json')
-// per-provider 模型记忆（2026-11-02）：Pi 的 settings.json 只有一对全局 defaultProvider/defaultModel，
-// 切提供方时模型不跟着换（实测：当前是 deepseek 但仍显示 glm-5.2）。按 provider 各记一份。
-// ⚠️ 不写进 models.json —— 那是 Pi 的配置且有 schema 校验，塞未知字段可能整份被拒。
-const PI_MODEL_MEMORY_PATH = join(homedir(), '.dsh', 'second-engine', 'pi-model-memory.json')
-
-export function readPiModelMemory() {
-  try {
-    const parsed = JSON.parse(readFileSync(PI_MODEL_MEMORY_PATH, 'utf8'))
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
-  } catch { return {} }
-}
-
-export function rememberPiModel(id, model) {
-  if (id === '' || model === '') return
-  try {
-    // 目录不会自动创建：atomicWriteFileSync 只写文件，父目录缺失会 ENOENT（真实事故：
-    // ~/.dsh/second-engine/ 不存在时每次写记忆都失败，异常被 catch 吞掉，表现为"选了模型又回默认"）。
-    mkdirSync(dirname(PI_MODEL_MEMORY_PATH), { recursive: true })
-    const mem = readPiModelMemory()
-    mem[id] = model
-    atomicWriteFileSync(PI_MODEL_MEMORY_PATH, `${JSON.stringify(mem, null, 2)}\n`, 0o600)
-  } catch (e) { noteErr('pi-model-memory', e) }
-}
-
-export function readPiJson(path) {
-  if (!existsSync(path)) return {}
-  try {
-    const doc = JSON.parse(readFileSync(path, 'utf8'))
-    return doc !== null && typeof doc === 'object' ? doc : {}
-  } catch { return {} }
-}
-
-// ── Pi 配置文件写入的并发保护（2026-10-29 任务 1）────────────────────────
-// 问题：六个写入口（piProviderAdd / piProviderKey / piProviderDelete / piProviderUpdate /
-// piProviderActive / piProviderModel）各自都是「读整份 → 改一个键 → 写整份」，入口之间
-// 没有任何互斥。面板与浮球并发点两下 = 后一次用自己的**旧读**覆盖前一次的结果（丢写）；
-// 两个 handler 同毫秒抢同一份 `${path}.tmp-${process.pid}`（同进程同 pid，名字**必然撞**），
-// rename 之后 tmp 已被顶走 → ENOENT 半途失败；`.bak-<ts>` 同毫秒也互相覆盖。
-// 做法：per-path  promise 链（进程内串行队列）。只在本进程内串行，不是跨进程文件锁
-// （那需要新依赖，本轮禁止）；跨进程仍靠原子 rename 保证「不出现半截文件」。
-export const PI_WRITE_QUEUES = new Map()
-
-// 严格读（写基线专用）：坏 JSON / 读不到 → 抛 PiWriteAborted，**绝不**拿 {} 当基线。
-// 与旧 readPiJsonForWrite 同一口径（紫东审查 P0-2/P0-3），只是把「已发响应」改成抛错，
-// 好让它在 piWriteJson 的锁内闭包里复用。
-class PiWriteAborted extends Error {
-  constructor(message, status) { super(message); this.status = status === undefined ? 409 : status }
-}
-export function readPiJsonStrict(path) {
-  if (!existsSync(path)) return {}
-  let raw = ''
-  try { raw = readFileSync(path, 'utf8') } catch (e) {
-    throw new PiWriteAborted(`读不到 ${path}：${errMsg(e)}`, 500)
-  }
-  let doc = null
-  try { doc = JSON.parse(raw) } catch {
-    throw new PiWriteAborted(`${path} 不是合法 JSON，已中止（未改动文件）。请先手工修好再加。`, 409)
-  }
-  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    throw new PiWriteAborted(`${path} 顶层不是对象，已中止（未改动文件）。`, 409)
-  }
-  return doc
-}
-
-// wireApi（Codex 术语）↔ api（Pi 术语）
-// 接受三种输入：Codex 的 responses/completions，或 Pi 自己的 api 值（原样直通）。
-export const PI_API_SET = new Set(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai', 'azure-openai-responses', 'bedrock-converse-stream'])
-
-/** Pi 快照 → Codex 形状。内置只预设 deepseek（用户要求），其余全在 models.json 里。 */
-/** 模型名不该长成 API Key 的样子（智谱是 id.secret，49 字符）。
- *  用户实测把 key 填进「模型名」，结果被当模型名写进 models.json 并显示在面板上。 */
-
-// Pi 写入口统一错误出口：PiWriteAborted 带自己的 status（409/500），其余按 200 + ok:false（与历史一致）。
-// ── Pi JSON 备份轮转（D4，2026-10-29）────────────────────────────────
-// Codex 侧早有这套：backupConfig() 按 CONFIG_BACKUP_NAME_RE 只认自己那套文件名，
-// 排序后 slice 掉超出 CONFIG_BACKUP_KEEP 的旧份（:759-774）。Pi 侧这几个 JSON 之前
-// 每次真写都留一份 .bak-<ts>，永远不清 → ~/.pi/agent 下无限增长。
-// 这里复用同一个保留数，以及同一套「只按自己的文件名模式轮转」的纪律：
-// 只匹配 ^<本文件名>\.bak- ，别的一律不碰（用户手放的备份、别的文件都安全）。
-// 备份名是 <文件>.bak-<毫秒>-<pid>-<8hex>，时间戳定长在最前 → 字典序即时间序，sort() 就够。
-
-// ── Pi 提供方/渠道 id 白名单（D1，2026-10-29）──────────────────────────
-// 原来只有 piProviderAdd / handlePiChannelCreate 各写了一份同样的字面量正则，
-// piProviderKey / piProviderDelete / piProviderModel 只判非空 —— 见缺陷表 D1。
-// 注意：`__proto__` 本来就被首字符 [A-Za-z0-9] 挡掉，真正能穿过去的是
-// constructor / prototype / toString 这类**首字符合法**的 Object.prototype 键名，
-// 所以正则之外还要显式列出要拒绝的键。
-export const PI_PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/
-export const PI_PROVIDER_ID_BLOCKED = ['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']
-// providers 容器的安全取法：一律 hasOwnProperty 判存在，读到的是对象自己的键才算数，
-// 继承链上的 constructor/toString 不会被当成「已存在的提供方」。
-// 另外把已存在的普通对象换成原型为 null 的副本（原对象属性逐个 own-key 拷过来，
-// 值引用不变，所以 piWriteJson 的内容比对仍等价 → 不会因此多写一份备份）。
-export function piProvidersBag(doc) {
-  if (doc.providers === null || typeof doc.providers !== 'object') {
-    doc.providers = Object.create(null)
-    return doc.providers
-  }
-  if (Object.getPrototypeOf(doc.providers) !== null) {
-    const safe = Object.create(null)
-    for (const k of Object.keys(doc.providers)) safe[k] = doc.providers[k]
-    doc.providers = safe
-  }
-  return doc.providers
-}
-export function piHasProvider(bag, id) {
-  return Object.prototype.hasOwnProperty.call(bag, id)
-}
-
-export function sendPiWriteError(res, e) {
-  const status = e instanceof PiWriteAborted ? e.status : 200
-  send(res, { ok: false, error: errMsg(e) }, status)
-}
 
 // POST /providers/delete：核心默认（deepseek/zhipu）不可删；自定义提供方均可删。删除 active 时回落并同步 config.toml。
-export const PROTECTED_IDS = new Set(['deepseek', 'zhipu'])
 
 // ── /models 与 /model：模型获取与选择 ──
 
-// 拼出 /models 端点：压掉 baseUrl 末尾斜杠，避免 '//models'。
-export function modelsUrl(baseUrl) {
-  return `${baseUrl.replace(/\/+$/, '')}/models`
-}
-
-// 智谱：open.bigmodel.cn 上 /api/v1 是 **Codex 专用适配端点**（模型清单只列 codex 适配好的几个），
-// 而 /api/coding/paas/v4 是编程端点、列出全量模型；两者共用同一把 key（2026-09-28 实测）。
-// 这里给它一个辅助清单 URL，与主端点求并集展示，避免"面板只显示 3 个模型"的误判。
-export function bigmodelAuxModelsUrl(baseUrl) {
-  return /open\.bigmodel\.cn/i.test(baseUrl)
-    ? 'https://open.bigmodel.cn/api/coding/paas/v4/models'
-    : null
-}
 
 // 兼容两种实测返回格式：
 //   OpenAI（DeepSeek）：{ object:'list', data:[{ id, ... }] }
@@ -1945,7 +1737,6 @@ export async function ensureGitBaseline(workdir) {
 // 字段名 progress 保持不变（外部消费者可能按名字取数组）。
 const PROGRESS_KINDS = new Set(['status', 'text', 'reasoning', 'tool', 'usage', 'done'])
 const PROGRESS_TEXT_LIMIT = 2000
-export const PROGRESS_LIMIT = 20
 
 // 归一化事件 → 封闭条目：显式构造，绝不展开原事件（缺字段就是空串，不会带出引擎形状）。
 export function progressEntry(evt, at) {
@@ -2440,37 +2231,10 @@ async function handleConsultCreate(req, res) {
 // 映射成 Codex 的 [{ name, url, enabled }] 形状。
 // Pi 的 mcp.json 格式见 docs/mcp.md:47 —— url 型是 { url }，stdio 型是 { command, args }，
 // 禁用是条目里 { enabled: false }（与 Codex 的 enabled 语义一致，无需额外映射）。
-const PI_MCP_PATH = join(homedir(), '.pi', 'agent', 'mcp.json')
 
-export function readPiMcp() {
-  if (!existsSync(PI_MCP_PATH)) return { mcpServers: {} }
-  try {
-    const doc = JSON.parse(readFileSync(PI_MCP_PATH, 'utf8'))
-    if (doc === null || typeof doc !== 'object') return { mcpServers: {} }
-    if (doc.mcpServers === null || typeof doc.mcpServers !== 'object') doc.mcpServers = {}
-    return doc
-  } catch { return { mcpServers: {} } }
-}
-
-// D2（2026-10-29）：本函数原先自己写一份「备份 + tmp + rename」，三个 MCP 写入口
-// （handlePiMcpAdd / Delete / Toggle）全在它外面各自 readPiMcp → 改 → 写，既无互斥，
-// tmp 名又只带 pid（同进程两个入口并发时名字必撞），.bak 只带 Date.now()（同毫秒互相覆盖）。
-// 现在统一走 piWriteJson：与 settings.json / models.json 同一把锁队列、同一套严格读与
-// 随机后缀 tmp/备份；mcp.json 坏 JSON 同样中止而不是拿 { mcpServers: {} } 当基线覆盖掉用户的 MCP 配置。
-// 读侧 readPiMcp 保留原样：它是**展示用**的宽松读（坏文件要让面板照常渲染并提示），
-// 写基线一律用锁内的严格读，两者语义不同、不再共用。
-export async function writePiMcp(mutate) {
-  const out = await piWriteJson(PI_MCP_PATH, (doc) => {
-    if (doc.mcpServers === null || typeof doc.mcpServers !== 'object') doc.mcpServers = Object.create(null)
-    return mutate(doc)
-  })
-  prunePiBackups(PI_MCP_PATH)
-  return out
-}
 
 // ── /mcp：MCP 服务器增删查（config.toml 的 [mcp_servers.*] 段）──
 // 注册为 prefix 路由（'prefix' 同时命中 /mcp 与 /mcp/<name>），按方法+子路径分发。
-export const MCP_ROUTE_PREFIX = '/second-engine/api/mcp'
 
 // ── /version：版本检查 ──
 // 本机 `codex --version` 与 GitHub 最新 release 对比。远端结果做模块级缓存 60 分钟：
@@ -2487,18 +2251,6 @@ let latestVersionCache = { at: 0, version: '' }
 
 // 取首个 x.y.z：'codex-cli 0.155.1'、'OpenAI Codex v0.155.1'、'v0.156.0' 都能吃。
 
-// 三段数字比较：a>b → 1，a<b → -1，相等或任一侧不可解析 → 0。
-export function compareVersions(a, b) {
-  const left = parseVersion(a)
-  const right = parseVersion(b)
-  if (left === null || right === null) return 0
-  const [ax, ay, az] = left.split('.').map(Number)
-  const [bx, by, bz] = right.split('.').map(Number)
-  if (ax !== bx) return ax > bx ? 1 : -1
-  if (ay !== by) return ay > by ? 1 : -1
-  if (az !== bz) return az > bz ? 1 : -1
-  return 0
-}
 
 // 本机版本：execFile 带 8s 超时；二进制缺失/超时/输出无版本号一律回落 null。
 function localCodexVersion() {
@@ -2875,12 +2627,30 @@ export function apply(ctx) {
         send(res, { ok: true, routes: routes.map((r) => ({ method: r.method, path: r.path, desc: r.desc })) })
       } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
     }
+    // ── 路由鉴权：本机免 token，非 loopback 必须带 SECOND_ENGINE_TOKEN（2026-11-06）──
+    // 照 Pi / Claude 桥的「省的做法」（bridge/pi/server.mjs:180-184），不用 Codex 桥那种
+    // 强制 token + 启动打印带 ?t= 网址的形态：面板在本机，强制 token 只会让用户每次去翻日志。
+    // 现状（实测 2026-11-06）：DSH Web 只绑 loopback 且自带 401 ⇒ 这层当前恒 pass。它是
+    // 显式意图，不是收益；写在这里是为了「别把端口暴露到局域网」这件事有代码兜底，不只靠 README。
+    // 非 loopback 且没配 SECOND_ENGINE_TOKEN 时一律 401 —— 宁拒绝，不静默放行。
+    const ROUTE_TOKEN = String(process.env.SECOND_ENGINE_TOKEN || '').trim()
+    const isLoopbackReq = (req) => {
+      const a = String(req?.socket?.remoteAddress || '')
+      return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1'
+    }
+    const guardRoute = (handler) => (req, res) => {
+      if (isLoopbackReq(req)) return handler(req, res)
+      if (ROUTE_TOKEN !== '' && String(req?.headers?.['x-bridge-token'] || '') === ROUTE_TOKEN) return handler(req, res)
+      send(res, { ok: false, error: 'token 无效：插件默认只接受本机请求；外部调用需配置 SECOND_ENGINE_TOKEN 并带 x-bridge-token' }, 401)
+      return undefined
+    }
     for (const route of routes) {
-      wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
+      const guarded = { ...route, handler: guardRoute(route.handler) }
+      wctx.effect(() => wctx.webServer.register(guarded), `second-engine: ${route.path} route`)
     }
     // 浏览器聊天桥（2026-09-29）：4 个透传路由（status/start/stop/url）由模块自行注册。
     // 模块内用 execFile + 固定子命令白名单，不做通用透传；桥目录可用 BRIDGE_DIR 覆盖。
-    registerBridgeRoutes(wctx)
+    registerBridgeRoutes(wctx, guardRoute)
   })
 
   // 设置 > 插件 > 插件配置 的 namespace：宿主 settings 服务只派发「served 的

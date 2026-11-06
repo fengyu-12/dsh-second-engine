@@ -44,6 +44,37 @@ function append(record) {
 export function finishSpawnAudit(child, exitCode, signal = null, endedAt = new Date().toISOString()) {
   child?.finishSpawnAudit?.(exitCode, signal, endedAt)
 }
+// detached 后子进程自成进程组，终端 Ctrl-C 不再波及它；宿主正常退出时靠此登记表兜底清组。
+const liveGroups = new Set()
+let exitHookInstalled = false
+function signalGroup(pid, sig) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try { process.kill(-pid, sig); return true } catch { return false } // ESRCH：组已空
+}
+function auditCleanupFailure(pid, sig, phase) {
+  const record = { at: new Date().toISOString(), type: 'process-group-cleanup-failure', pid, signal: sig, phase }
+  append(record)
+  try { process.stderr.write(`[second-engine safety] process-group cleanup failed pid=${pid} signal=${sig} phase=${phase}\n`) } catch {}
+}
+function cleanupLiveGroups(sig, phase) {
+  for (const pid of liveGroups) {
+    if (!signalGroup(pid, sig)) auditCleanupFailure(pid, sig, phase)
+  }
+}
+function installExitHook() {
+  if (exitHookInstalled) return
+  exitHookInstalled = true
+  process.on('exit', () => cleanupLiveGroups('SIGKILL', 'exit'))
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    const handler = () => {
+      cleanupLiveGroups('SIGKILL', sig)
+      // Restore the default action so the host keeps its normal signal exit semantics.
+      process.removeListener(sig, handler)
+      process.kill(process.pid, sig)
+    }
+    process.once(sig, handler)
+  }
+}
 export function spawnLimited(command, args = [], options = {}, engine = 'unknown') {
   const env = options.env || process.env
   const f = limit(env, 'F', 102400)
@@ -55,8 +86,18 @@ export function spawnLimited(command, args = [], options = {}, engine = 'unknown
   const workdir = resolve(options.cwd || process.cwd())
   const record = { id: randomUUID(), at: new Date().toISOString(), engine, workdir,
     argv: redactArgv([command, ...args]), pid: null, startedAt: new Date().toISOString(), endedAt: null, exitCode: null, signal: null }
-  const child = spawn('sh', ['-c', script, 'second-engine', command, ...args], { ...options, cwd: workdir, shell: false })
+  const child = spawn('sh', ['-c', script, 'second-engine', command, ...args], { ...options, cwd: workdir, shell: false, detached: true })
   record.pid = child.pid ?? null
+  // 对整个进程组发信号；leader 已退出（exitCode/signalCode 非 null）则不发，避免 pgid 被复用后误杀。
+  child.killGroup = (sig = 'SIGTERM') => {
+    if (child.exitCode !== null || child.signalCode !== null) return false
+    // The guard and kill are separate operations: the leader may exit (or its PGID
+    // be reused) between them. A false result is observable and audited by callers.
+    const sent = signalGroup(child.pid, sig)
+    if (!sent) auditCleanupFailure(child.pid, sig, 'killGroup')
+    return sent
+  }
+  if (Number.isInteger(child.pid)) { liveGroups.add(child.pid); installExitHook() }
   append(record)
   let finished = false
   child.finishSpawnAudit = (code, signal, endedAt) => {
@@ -64,7 +105,13 @@ export function spawnLimited(command, args = [], options = {}, engine = 'unknown
     finished = true
     append({ ...record, endedAt: endedAt || new Date().toISOString(), exitCode: code ?? null, signal: signal || null })
   }
-  child.once('exit', (code, signal) => finishSpawnAudit(child, code, signal))
-  child.once('error', () => finishSpawnAudit(child, -1))
+  child.once('exit', (code, signal) => {
+    finishSpawnAudit(child, code, signal)
+    // Leader 已退，仍清掉可能残留的孙进程；此处必须绕过 killGroup 的守卫，
+    // 因为 exitCode 已置位，但 check-then-kill 仍可能撞上 PGID 消失/复用竞态。
+    if (!signalGroup(child.pid, 'SIGKILL')) auditCleanupFailure(child.pid, 'SIGKILL', 'child-exit')
+    liveGroups.delete(child.pid)
+  })
+  child.once('error', () => { finishSpawnAudit(child, -1); liveGroups.delete(child.pid) })
   return child
 }

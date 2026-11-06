@@ -8,11 +8,9 @@ import { prunePiBackups } from './cleanup.js'
 import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { piHasProvider, piProvidersBag, readPiJson, readPiJsonStrict, readPiModelMemory, resolvePiProvider, sendPiWriteError, readPiMcp, modelsUrl, bigmodelAuxModelsUrl, rememberPiModel } from './index.js'
-import { PI_API_SET, PI_SETTINGS_PATH, PI_WIRE_OPTIONS, PI_WRITE_QUEUES, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, errMsg } from './index.js'
+import { piHasProvider, piProvidersBag, readPiJson, readPiJsonStrict, readPiModelMemory, resolvePiProvider, sendPiWriteError, readPiMcp, modelsUrl, bigmodelAuxModelsUrl, rememberPiModel, PI_API_SET, PI_SETTINGS_PATH, PI_WIRE_OPTIONS, PI_WRITE_QUEUES, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, PI_MCP_PATH, errMsg, send } from './core.js'
 import { PI_MODELS_PATH, PI_PROVIDERS } from './engine/pi-probe.js'
 import { PI_BRIDGE_PORT } from './engine/pi-bridge.js'
-import { send } from './core.js'
 import { readBody } from './io.js'
 
 // ===== 以下 12 个函数自 src/index.js 拆出（按原行号顺序），供 pi 渠道读写复用 =====
@@ -538,5 +536,21 @@ export function piMcpServers() {
     else if (typeof one.command === 'string' && one.command !== '') url = `stdio: ${one.command}`
     out.push({ name, url, enabled: one.enabled !== false })
   }
+  return out
+}
+
+// D2（2026-10-29）：本函数原先自己写一份「备份 + tmp + rename」，三个 MCP 写入口
+// （handlePiMcpAdd / Delete / Toggle）全在它外面各自 readPiMcp → 改 → 写，既无互斥，
+// tmp 名又只带 pid（同进程两个入口并发时名字必撞），.bak 只带 Date.now()（同毫秒互相覆盖）。
+// 现在统一走 piWriteJson：与 settings.json / models.json 同一把锁队列、同一套严格读与
+// 随机后缀 tmp/备份；mcp.json 坏 JSON 同样中止而不是拿 { mcpServers: {} } 当基线覆盖掉用户的 MCP 配置。
+// 读侧 readPiMcp 保留原样：它是**展示用**的宽松读（坏文件要让面板照常渲染并提示），
+// 写基线一律用锁内的严格读，两者语义不同、不再共用。
+export async function writePiMcp(mutate) {
+  const out = await piWriteJson(PI_MCP_PATH, (doc) => {
+    if (doc.mcpServers === null || typeof doc.mcpServers !== 'object') doc.mcpServers = Object.create(null)
+    return mutate(doc)
+  })
+  prunePiBackups(PI_MCP_PATH)
   return out
 }

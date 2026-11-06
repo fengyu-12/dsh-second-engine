@@ -177,7 +177,13 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 
 ## 2.3 选哪个引擎：Pi / Codex / Claude Code（按能力，不按偏好）
 
-**要「审」（多轮批判复核 `/review`）或要流式进度/真打断/web_search ⇒ Codex；要多 provider 并存随时横向比 ⇒ Pi；要 Anthropic 血统的第三家异构 ⇒ Claude Code（`--effort` 五档、`review:true`、桥 8789）。** 别把「能换模型」当 Pi 的卖点（Codex 同样能换，差别是能否并存）。完整判据矩阵、切换后会话不迁移、Pi 下卡片隐藏不是故障 → `references/ref-engine-pick.md`
+**写代码（尤其并发 / 进程 / 资源生命周期）与复核 ⇒ Codex；设计、多文件小工单、看图/UI、MCP 生态 ⇒ Claude；多 provider 横向比 ⇒ Pi（不当主力）。**
+
+能力契约（`review` / `resume` / `webSearch` / `mcp` / `worktree` / `Agent SDK` / `子代理` / `流式` / `打断`）**单源化，本节不再复述**：分工理由见 §2.5 的表，引擎细节见 `references/ref-engine-pick.md`（2026-11-07 去重，原三条 bullet 与 §2.5 判据列重复）。
+
+关于「同模型换引擎差多少」：2026 年受控研究给出约 8–13 个百分点的 scaffold 效应，差异在失败指纹、token 成本与并行方式上（`The Scaffold Effect in Coding Agents` / `Harness or Model?`）。⇒ 选引擎先看能力契约，模型强弱让用户按档位决定。
+
+**编排时**：跨引擎可并行（Codex + Claude 同时各跑一单），但**写域必须不重叠**；同一引擎不叠加（判据与例外见 §2.7 第 2 条）。别把「能换模型」当 Pi 的卖点。切换后会话不迁移、Pi 下卡片隐藏不是故障 → `references/ref-engine-pick.md`
 
 ## 2.4 各方边界（2026-11-01 维护 · 去名化）
 
@@ -195,9 +201,9 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 | 角色 | 定位 | 判据（为什么是它） |
 |---|---|---|
 | **我** | 裁定 + 落地 + 记账 | 只有我能读本机、动文件、签判断 |
-| **Codex** | **复核 / 判真伪** | 能读本机、能跑命令、**行号准**、敢判假、会当场指出你口径错 |
-| **Pi** | 第二引擎的**另一引擎** | 多 provider 并存可横比、无 web_search；选型见「选哪个引擎」 |
-| **Claude Code** | 第三引擎（异构） | Anthropic 血统、`--effort` 五档、`review:true`；工作区 `~/claude-workspace`；细节见 `references/ref-claude-runtime.md` |
+| **Codex** | **写代码 + 复核 / 判真伪** | 唯一 `review:true`（复核链路恒走 `codex exec`）；app-server 有流式进度与真打断；`webSearch:true`；支持 worktree / 云隔离、`codex exec` 无头；单 pid 进程模型（清理简单）。涉及并发/进程/资源生命周期的改动，写与复核都给它 |
+| **Pi** | 多 provider **横向比 / 实验** | `resume:false`、`review:false`、`webSearch:false`；唯一能力是**多 provider 并存**（可同 prompt 横比），不当主力 |
+| **Claude Code** | **设计 / 多文件小工单 / 看图·UI / MCP 生态** | `resume:true`（实测记忆保持）；`--mcp-config` 走 MCP 生态；官方支持在一个会话内并行大量子代理；`-p` 无头 + Agent SDK；**`review:false`（链路语义：能审，但复核恒走 codex）**；工作区 `~/claude-workspace` |
 | **外部通道**（第三方模型服务，自行接入） | **批量读 / 粗筛** | 看不到本机、只能被喂文件、**行号常不可信** ⇒ 只能出候选，不能定稿 |
 
 - **两轮收敛优于一轮全量**：第一轮全量粗筛（只求覆盖），第二轮**只清第一轮标"不确定"的条目，并取消推理预算**。2026-10-30 实测：第一轮卡「最多 2 次不落盘动作」→ 25 条里 14 条"不确定"；第二轮放开后同样工作量一次判完。⇒ **复核类工单不加推理预算**，那是给写代码的纪律。
@@ -215,6 +221,8 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 - **完成**：打 `[x]` + 证据（命令 + exit 码），不写「已完成」；派单验收仍按 §2.7 第 6 条「三项全绿」——冲突时以它为准。
 - **失败处置**：并行阶段标**写域**与汇合点；不可逆操作写清失败后是停、重试还是回滚。
 - **收尾**：用户说「收尾」才归档；项目完工删表，下个项目另起新表。这是**项目表**归档，不等于 board 出板（后者要 `--reviewed-by human`）。
+- **停手前必答三问（2026-11-07 立）**：① 现在有什么在跑（`job_list` 非空？）② 下一个**前置已满足**的阶段是什么 ③ 谁做（我 / Codex / Claude / Pi）。**三问答不出来 = 不许空停**：要么立刻派一单把 `job` 挂上，要么发通知向用户要拍板。理由：把「一轮结束」当「任务结束」是编排失效的头号原因（2026-11-07 实测：验收完就停，等用户来催）。**与 §3.2 的关系**：三问是「决策层」——要不要派、派给谁；② 的答案直接喂给交接单的 `NEXT`，① 喂 `STOP-AT`。不是两套流程，是先后两步。
+- **不知道下一步时先清账（降级动作，2026-11-07 立）**：核实现状——哪些条目其实已完成、哪些数字/路径已过时、哪些是重复劳动。清账本身就是一轮推进，不算空转（同日教训：T4 白派、T5 工单写「6 处」而实际「9 处」，都是没清账）。
 - **与交接单**：规划表是阶段级；派单前从当前项切出 §3.2 的 STOP-AT / DONE / NEXT 三行。
 - **两层记账**：桥与档位记**执行层**（谁在干、输出在哪），规划表记**主 AI 的核销**（做到哪、归谁）。两层同时存在，谁也顶替不了谁。
 
@@ -225,7 +233,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 1. **能不能拆**：拆成写域互不重叠的块？写同一文件/同一目录的块**不许并行**；真要并行，先**冻结接口**。
 2. **谁来干**：本机可读可跑的执行体做「改动 + 自测」；外部通道只接「自包含、可判分、不需要本机实时状态」的活（批量读、写测试、文本改写）。后者行号不可信，产出只当候选。
 3. **怎么干**：每块给**文件级落点 + 一条可复跑判据**；改代码的工单里必须要求它跑现有回归，失败即视为改坏兼容。
-4. **什么时间**：工时按「跨权威源 / 多路径 ×2」估；先排依赖，**并行只按任务分块，同一执行通道的进程不许叠加**（实测并发会 429 / 拖垮，见「异常速查」）；每块给出可观察的完成信号（不是「我改好了」）。
+4. **什么时间**：工时按「跨权威源 / 多路径 ×2」估；先排依赖，**并行只按任务分块**（并发上限与 429 的处置见 §2.7 第 2 条 / §3.12）；每块给出可观察的完成信号（不是「我改好了」）。
 5. **谁能接**：一块在跑时，其它执行体能不能接别的块？不能就让它们空着，**别硬塞同一写域**。
 6. **怎么验收**：跑被测对象（自报的绿灯不算）；回归/契约/冒烟至少一条；失败路径也要造一次；改了协议要能指出「谁在消费」；多块并行时还要写清「一块失败时整体算什么状态」（合并与失败传播）。
 
@@ -310,16 +318,7 @@ bash tools/dual-board/accept.sh T1 --test "python3 -m unittest discover -s tests
 
 ### 多桥：跨引擎并行（2026-11-04 实测）
 
-**只跨引擎多开**（Codex + Pi + Claude）。同引擎两桥是同一模型两个上下文，边际收益低。
-
-- **Pi**：`PI_BRIDGE_PORT=8788 node bridge/pi/server.mjs`（插件根下跑）；每个桥 = 1 个 node 进程，内部是否再拉 Pi RPC 子进程**未实测个数**。
-- **Codex**：`BRIDGE_STATE_DIR=/tmp/bx BRIDGE_PORT=3195 BRIDGE_AS_PORT=3196 ./ctl.sh start`（在 `bridge/web/` 下）；每个桥 = **2 个常驻进程**（app-server + 网页桥）。
-- **Claude**：`CLAUDE_BRIDGE_PORT=8789 node bridge/claude/server.mjs`；1 个 node 进程 + 内部 1 个常驻 claude 子进程（懒启动）；页面复用 `bridge/web/public/index.html`
-- **后果**：每加一个桥 ≈ 多占一组端口 + 一份常驻内存；Codex 桥还会拉起完整 app-server（`/api/health` 里 `appServer.connected` 可验证）。桥没有 `task.output` ⇒ **必须各自 `board.sh new` 记账**，否则只剩轮询会话文件这一条路。
-- **别共用状态目录**：`.pid` / `.as.pid` / `.token` 固定落在 `BRIDGE_STATE_DIR`，两个实例会互相覆盖 ⇒ **一桥一目录**。
-- **收尾**：`ctl.sh stop`（同目录同端口）；Pi 桥按**精确 PID** 结束；临时状态目录与日志一并删掉。
-
-实测（2026-11-04）：Codex 桥 3195/3196 = pid 31012(app-server) + 31057(网页桥)，health `ok:true, connected:true`；Pi 8788 = 1 个 node 进程，根路径 HTTP 302。
+**只跨引擎多开**（Codex + Pi + Claude；同引擎两桥边际收益低）。**桥没有 `task.output` ⇒ 必须各自 `board.sh new` 记账**；`BRIDGE_STATE_DIR` **一桥一目录**（`.pid`/`.as.pid`/`.token` 会互相覆盖）；收尾 `ctl.sh stop` + Pi 桥按精确 PID 结束。三条启动命令、端口组合与进程数实测 → `references/ref-dual-board.md` §8。
 
 ## 3.1 派单前：查档位与发法（2026-10-25 定 · 责任在主 AI 不在 Codex）
 
@@ -400,7 +399,7 @@ CHECKPOINTS:
 
 ## 3.5 复核怎么发、怎么收敛（2026-10-25/26 已落地，源码复核在案）
 
-- **一次只发一条复核**（同一内容重复发起没有信息增量，自动多轮就是空转：5 轮配置下第 5 轮判 `loop`）；**不每轮裁决，最终结论一次上交用户**（`reviewRounds` 是上限不是目标）。发起前主动 `GET /api/config` 读 reviewRounds（主 AI 没有推送；实测当前 3，`roundsChoices:[1,3,5]`）；要锁定轮数就显式传 `rounds`，响应必回 `maxRounds` 可核对。发起时写清三件事：被审对象是什么（含路径）、验收到什么程度算过、几轮内不收敛就停。
+- **一次只发一条复核**（同一内容重复发起没有信息增量）。**默认 1 轮**（`REVIEW_DEFAULT_ROUNDS=1`，2026-11-07 起），`roundsChoices:[1,3,5]`；要自动多轮就显式传 `rounds`，响应回 `maxRounds` 可核对。**多轮走同一 thread**（2026-11-07 起）：第 2 轮用 `exec resume <threadId>` 续审，模型自己记得前几轮，不再每轮回灌 prev/reply；threadId 解析失败会回退新开一轮（`task.resumeFallback` 可查）。**不每轮裁决，最终结论一次上交用户**（`reviewRounds` 是上限不是目标）。发起时写清三件事：被审对象是什么（含路径）、验收到什么程度算过、几轮内不收敛就停。
 - 生命周期：结果落盘 `~/.codex/reviews/<id>.json`（`GET /api/reviews?limit=` 可列）；收尾时未决问题摘成 `[REVIEW_ISSUES]` 追加进复核任务 output（**收单必读**）；复核窗口内工作区被改动会记 `reviewDirty`（证据、非归因）。
 - **判据冻结 / stale（2026-11-06 落地）**：`POST /api/review` 可带 `files:["相对 workdir 的路径", …]`。服务端发起时冻结 `content` 的 sha256 + 各文件的内容哈希，收尾前重算，不一致即判 stale（`status` 仍是 `done`、记录里 `stale:true`、`verdict` 换成 `'stale'`、原值收进 `staleOf`），**旧结论不发布**。⚠️ **不传 `files` 时只有 `content` 参与比对，而内存里的 content 不会变 ⇒ 等于没开 stale 检测**；要它真的生效，得把「复核期间可能被改的文件」列进 `files`。
 - **续轮**：`POST /api/review {content, prev:"<上一轮id>"}`，服务端取上一轮 issues 作种子（跨重启可用），响应 `prevSeeded:true`。

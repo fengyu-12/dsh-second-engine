@@ -1,12 +1,15 @@
 {
   "name": "dsh-second-engine",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "Second engine plugin for DeepSeek Harness: plug a second local coding agent (OpenAI Codex CLI or pi) into DSH — async work orders, adversarial review, a shared terminal/web session bridge, and a file-based task board.",
   "type": "module",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./client": "./lib/client.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
   },
   "files": [
     "lib/client.js",

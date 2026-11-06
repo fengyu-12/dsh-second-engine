@@ -214,7 +214,9 @@ async function handleBridgeSession(req, res) {
   }
 }
 
-export function registerBridgeRoutes(wctx) {
+// guard：由 index.js 注入的路由鉴权包装（本机免 token / 非 loopback 需 SECOND_ENGINE_TOKEN）。
+// 走参数注入而不是在这里再写一份，是为了鉴权只有一个实现、一个判据（2026-11-06）。
+export function registerBridgeRoutes(wctx, guard = (h) => h) {
   const routes = [
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/status`, handler: handleBridgeStatus },
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/start`, handler: handleBridgeStart },
@@ -223,6 +225,7 @@ export function registerBridgeRoutes(wctx) {
     { kind: 'exact', path: `${BRIDGE_ROUTE_PREFIX}/session`, handler: handleBridgeSession },
   ]
   for (const route of routes) {
-    wctx.effect(() => wctx.webServer.register(route), `second-engine: ${route.path} route`)
+    const guarded = { ...route, handler: guard(route.handler) }
+    wctx.effect(() => wctx.webServer.register(guarded), `second-engine: ${route.path} route`)
   }
 }

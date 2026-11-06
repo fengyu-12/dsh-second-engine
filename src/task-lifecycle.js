@@ -2,7 +2,7 @@ import { startAppServerTurn } from './app-server-client.js'
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { send } from './core.js'
+import { send, ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, bigmodelAuxModelsUrl, errMsg, modelsUrl } from './core.js'
 import { activeEngineId } from './engine/registry.js'
 import { CANCEL_FORCE_FINALIZE_MESSAGE, CANCEL_FORCE_FINALIZE_MS, CANCEL_RETRY_MS, readBody } from './io.js'
 import { extractModels } from './parse.js'
@@ -12,7 +12,7 @@ import { tasks } from './state.js'
 import { tokenTotal } from './token-ledger.js'
 import { claudeCredentialsFromConfig } from './claude-providers.js'
 
-import { ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, bigmodelAuxModelsUrl, errMsg, finalizeTask, loadKeyring, modelsUrl, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, viewStatus } from './index.js'
+import { finalizeTask, loadKeyring, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, viewStatus } from './index.js'
 
 export async function handleModels(req, res) {
   if (activeEngineId() === 'pi') return piModels(req, res)

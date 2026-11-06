@@ -3,14 +3,14 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { CODEX_DIR } from './constants.js'
 import { checkCriteria, collectCurrent, freezeCriteria } from './criteria-snapshot.js'
 import { tasks, REVIEWS_DIR } from './state.js'
-import { send, noteErr, atomicWriteFileSync } from './core.js'
+import { send, noteErr, atomicWriteFileSync, errMsg, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS } from './core.js'
 import { gitPorcelain } from './git.js'
 import { newId, queryParam, readBody } from './io.js'
 import { pruneReviewFiles } from './cleanup.js'
 import { appendReviewIssuesBlock, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson } from './parse.js'
-import { REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_DEFAULT_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, normalizeLedgerEntries, normalizeReply } from './normalize.js'
+import { REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_DEFAULT_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, normalizeIssue, normalizeLedgerEntries, normalizeReply, normalizeResponses } from './normalize.js'
 import { buildReviewContext, buildReviewPrompt, clipText, mergeRoundIntoLedger, readReviewOut, spawnReviewRound } from './review-core.js'
-import { taskWorkdirForEngine, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MAX_ROUNDS, REVIEW_MIN_ROUNDS, checkTokenBudget, ensureGitBaseline, ensureIssueIds, errMsg, finalizeJob, isBlockedVerdict, loadKeyring, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, viewStatus } from './index.js'
+import { taskWorkdirForEngine, checkTokenBudget, ensureGitBaseline, ensureIssueIds, finalizeJob, isBlockedVerdict, loadKeyring, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, viewStatus } from './index.js'
 
 // ── 判据冻结（2026-11-06）──
 // 只冻结：被审 content 的 sha256 + body.files 显式列举的文件。没传 files = 只冻结 content，
@@ -211,11 +211,19 @@ export async function runReview(task, active) {
   const startedAt = Date.now()
   const seenHashes = new Map()   // issuesHash → round，振荡检测用
   let tokensUsed = 0
+  let parseRetried = false   // 本轮是否已因解析失败重试过（每轮最多重试一次，成功解析后复位）
+  // 回合制（2026-11-07）：首轮落盘会话并记下 thread_id，第 2 轮起 `exec resume` 续同一会话。
+  // threadId 解析失败 / resume 失败（退出非 0 且无输出）→ 置空，回退到「新开一轮」，不崩。
+  let threadId = null
+  task.threadId = null
+  task.resumeFallback = false
   // #6：复核窗口的起点快照（null=非 git 仓库/探测失败，收尾时无从比对则静默跳过）。
   task.dirtyAtStart = await gitPorcelain(task.workdir)
   try {
     for (;;) {
       if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
+      // reconcile 判失联并 finalize 后（endedAt 已置）不得再起新轮。
+      if (task.endedAt !== null && task.endedAt !== undefined) break
       const round = task.rounds.length + 1
       if (round > task.maxRounds) break
       task.round = round
@@ -238,12 +246,17 @@ export async function runReview(task, active) {
       const prevIssues = prev && Array.isArray(prev.issues) ? prev.issues : []
       // 回辩通道（稳定 id 版）：reply 条目带稳定 issueId，第 2 轮起 prev 换批后仍对得上
       // 号，故每轮都注入（旧版只注首轮——轮内下标第 2 轮就失配，这是本次修的病根）。
-      const prompt = buildReviewPrompt(task.content, prev, task.reviewContext, task.dialogue === true ? task.reply : undefined)
+      // resume 模式（本轮要续会话）：thread 里已有前几轮记忆，不回灌 prev/reply 两段。
+      const resuming = round > 1 && threadId !== null
+      const basePrompt = buildReviewPrompt(task.content, prev, task.reviewContext, task.dialogue === true ? task.reply : undefined, resuming)
+      const prompt = parseRetried
+        ? `${basePrompt}\n\n【重试说明】上次输出非合法 JSON（或不符合 schema），整轮作废。请重新核查并只输出一个严格符合 schema 的 JSON 对象，不要输出任何额外文字。`
+        : basePrompt
       const outPath = join(CODEX_DIR, `review-${task.id}-r${round}.out`)
       rtOf(task).setOutPath(outPath)
       // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
       rtOf(task).heartbeat()
-      const { child, wait, getUsage } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath })
+      const { child, wait, getUsage, getThreadId } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath, threadId: resuming ? threadId : null })
       rtOf(task).setChild(child)
       // 互审的探活身份：startWatchdog 在首轮 spawn 前就启动（那时 child 还是 null）记不到
       // pid —— 每轮 spawn 后补记；轮间空窗（child 已退、下一轮未起）清掉，
@@ -257,7 +270,7 @@ export async function runReview(task, active) {
       if (roundWallMs > 0) {
         wallTimer = setTimeout(() => {
           task.wallHit = true
-          try { child.kill('SIGKILL') } catch { /* best effort */ }
+          try { child.killGroup('SIGKILL') } catch { /* best effort */ }
         }, roundWallMs)
         if (typeof wallTimer.unref === 'function') wallTimer.unref()
       } else {
@@ -265,20 +278,39 @@ export async function runReview(task, active) {
         // 直接 await wait"等于零兜底 —— 子进程一挂死，硬预算就彻底失效。这里立即按墙钟到点
         // 处理；下面 task.wallHit === true 的分支会正常收尾（stopReason='wallclock'）。
         task.wallHit = true
-        try { child.kill('SIGKILL') } catch { /* best effort */ }
+        try { child.killGroup('SIGKILL') } catch { /* best effort */ }
       }
       const code = await wait
       if (wallTimer !== null) clearTimeout(wallTimer)
       // 本轮 codex 自报用量累加进总账（抽不到记 0 —— 宁可少算也不误停）。
+      // 口径（显式化）：roundTokens = 本轮 turn.completed.usage 的 input+output 自报值，
+      // 逐轮相加进 tokensUsed。resume 轮的 input_tokens 疑似含整段累计上下文（实测 47497 vs
+      // 首轮 18617，未证实），故对 resume 轮标 usageCumulativeSuspected —— 累加值在 resume 下
+      // 可能偏高（更早触发 tokens 预算，偏保守），不得当作精确计费。抽不到记 0 并标 usageUnknown。
       const roundTokens = getUsage()
       tokensUsed += roundTokens
       task.reviewTokens = tokensUsed
       if (roundTokens === 0) task.usageUnknown = true
+      if (resuming) task.usageCumulativeSuspected = true
       rtOf(task).setChild(null)
       rtOf(task).setChildPid(null)
       rtOf(task).setChildStart(null)
       rtOf(task).setExitCode(rtOf(task).isCancelled() ? -1 : code)
       const review = readReviewOut(outPath)
+      // 首轮抓 thread_id；抓不到（旧版 codex / 无 --json 事件）→ 保持 null，后续轮自然新开。
+      if (threadId === null && !resuming) {
+        const got = getThreadId()
+        if (typeof got === 'string' && got !== '') { threadId = got; task.threadId = got }
+      }
+      // resume 失败回退：续会话那轮没产出可解析输出 → 弃用该 thread，同轮号用「新开」重试一次
+      //（不占 parseRetried 名额，且仅在非取消/非墙钟路径上）。
+      if (resuming && review === null && task.wallHit !== true && task.status !== 'cancelled' && !rtOf(task).isCancelled()) {
+        threadId = null
+        task.threadId = null
+        task.resumeFallback = true
+        noteErr('review-resume-fallback', `round ${round} resume 无可解析输出（codex 退出码 ${code}），回退新开一轮`)
+        continue
+      }
       // 墙钟到点被强杀：按 wallclock 正常收尾（而非落进下面的 unparsed 解析失败分支）。
       if (task.wallHit === true) {
         task.stopReason = 'wallclock'
@@ -286,24 +318,37 @@ export async function runReview(task, active) {
         return
       }
       if (task.status === 'cancelled' || rtOf(task).isCancelled()) break
+      if (review === null && !parseRetried) {
+        // 自动重试一次（同一轮号，不推进 rounds）；重试 prompt 带「上次输出非合法 JSON」。
+        parseRetried = true
+        noteErr('review-unparsed-retry', `round ${round} 输出解析失败，自动重试一次（codex 退出码 ${code}）`)
+        continue
+      }
+      parseRetried = false
       if (review === null) {
         task.rounds.push({ round, issues: [], verdict: 'unparsed', raw: '' })
         await finishReview(task, 'error', 'unparsed', code === 0 ? '未能从复核输出解析出 JSON' : `codex 退出码 ${code}`)
         return
       }
+      // normalizeIssue 补 fingerprint（账本归并/谱系依赖）；verified 恒 true（evidence 为必填）。
       const issues = review.findings.map((finding) => ({
-        severity: finding.severity,
-        point: `${finding.file}:${finding.line} ${finding.issue}`,
-        suggestion: finding.evidence,
+        ...normalizeIssue({
+          severity: finding.severity,
+          point: `${finding.file}:${finding.line} ${finding.issue}`,
+          suggestion: finding.evidence,
+        }),
         verified: true,
       }))
-      const parsed = { issues, verdict: review.verdict, responses: [] }
+      const blocked = isBlockedVerdict(review.verdict, issues)
+      const parsed = { issues, verdict: review.verdict, responses: normalizeResponses(review.responses), ...(blocked ? { blocked: true } : {}) }
       // 跨轮 ledger 并账（先并再判收敛）：本轮 issues 先归并（i<N> 沿用/分配）再按
       // responses 做状态迁移，落盘记录与终止判据用的是同一份状态。非回辩调用同样记账
       //（纯留痕，不参与判定）。responses 先过 resolveResponseIds：issueIndex 兼容下标
       // 就地补上账本 id（v1 哈希 id 在落账时经 aliases 命中）。
       const responses = resolveResponseIds(parsed.responses, prevIssues)
       mergeRoundIntoLedger(task, round, parsed.issues, responses)
+      // 假收敛防线：账本里仍有 open/disputed（模型漏列且没撤回）时，空 findings 不算收敛。
+      const ledgerOpen = task.issueLedger.some((e) => e.status === 'open' || e.status === 'disputed')
       // issues 为空 → 本轮即收敛；否则记下本轮结论供下一轮对照。
       task.rounds.push({
         round,
@@ -314,7 +359,7 @@ export async function runReview(task, active) {
         // 看得见是阻断，不得落成 converged。
         verdict: parsed.blocked === true
           ? 'blocked'
-          : (parsed.issues.length === 0
+          : (parsed.issues.length === 0 && !ledgerOpen
             ? 'converged'
             : (parsed.verdict === 'converged' ? 'issues-found' : parsed.verdict)),
         // 回辩轮的逐条裁决：无 responses（旧式输出/非回辩轮）不写该键，轮次形状与旧版一致。
@@ -329,7 +374,7 @@ export async function runReview(task, active) {
         await finishReview(task, 'done', 'blocked')
         return
       }
-      if (parsed.issues.length === 0) {
+      if (parsed.issues.length === 0 && !ledgerOpen) {
         task.stopReason = 'converged'
         await finishReview(task, 'done', 'converged')
         return
@@ -364,6 +409,8 @@ export async function runReview(task, active) {
     task.stopReason = 'cancelled'
     await finishReview(task, 'cancelled', 'cancelled', undefined, false)
   } catch (e) {
+    // 异常路径也要收掉在跑的 child 进程组，不能只落终态。
+    try { rtOf(task).child()?.killGroup?.('SIGKILL') } catch { /* best effort */ }
     // 经 finishReview 收口：重复落定不再重复通知（旧版 catch 里是无条件 notify）。
     await finishReview(task, 'error', 'error', errMsg(e))
   }
@@ -605,11 +652,11 @@ export async function handleReviewCancel(req, res) {
     task.verdict = 'cancelled'
     const child = rtOf(task).child()
     if (child !== null && child !== undefined) {
-      try { child.kill('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
+      try { child.killGroup('SIGTERM') } catch { /* 进程可能刚好自己退出 */ }
       // 同 /task/cancel：codex 偶有 SIGTERM 后残留，3s 兜底 SIGKILL，防子进程泄漏。
       const killTimer = setTimeout(() => {
         try {
-          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+          child.killGroup('SIGKILL')
         } catch { /* best effort */ }
       }, 3000)
       if (typeof killTimer.unref === 'function') killTimer.unref()

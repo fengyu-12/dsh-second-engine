@@ -19,7 +19,7 @@ export const DEFAULT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash']
  */
 export function buildArgs(spec = {}) {
   const args = [
-    '-p', str(spec.prompt),
+    '-p',   // 提示词走 stdin（2026-11-07）：argv 会出现在 /proc/<pid>/cmdline，同仓库 review-core / pi-rpc 早已为此改走 stdin
     '--model', str(spec.model) || 'haiku',
     '--permission-mode', str(spec.permissionMode) || 'acceptEdits',
     '--allowedTools', normalizeTools(spec.allowedTools),

@@ -1,15 +1,14 @@
 // src/pi-panel.js —— Pi 面板 / 渠道 / 桥 / 清理路由（2026-11-03 拆出）
 // import 头由主控预置，Pi 只负责追加函数体。
-import { errMsg, loadKeyring, piHasProvider, piProvidersBag, readPiJson, resolvePiProvider, sendPiWriteError, PI_PROVIDER_ID_RE, PI_CHANNEL_APIS, MCP_NAME_PATTERN } from './index.js'
+import { loadKeyring, engineGateFor } from './index.js'
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { PI_MODELS_PATH, PI_PROVIDERS, invalidatePiModelsCache, piAvailableModels } from './engine/pi-probe.js'
 import { piBridgeStatus, piBridgeUrl, startPiBridge, stopPiBridge } from './engine/pi-bridge.js'
-import { piMcpServers, piWriteJson } from './pi-providers.js'
+import { piMcpServers, piWriteJson, writePiMcp } from './pi-providers.js'
 import { readBody } from './io.js'
-import { send } from './core.js'
-import { countPiJsonl, writePiMcp, engineGateFor } from './index.js'
+import { send, errMsg, piHasProvider, piProvidersBag, readPiJson, resolvePiProvider, sendPiWriteError, PI_PROVIDER_ID_RE, PI_CHANNEL_APIS, MCP_NAME_PATTERN, countPiJsonl } from './core.js'
 
 
 export async function handlePiPanel(_req, res) {

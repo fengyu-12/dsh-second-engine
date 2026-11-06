@@ -1,4 +1,4 @@
-import { send } from './core.js'
+import { send, CONSULT_KEEP_LIMIT, MCP_NAME_PATTERN, MCP_ROUTE_PREFIX, TASK_LIST_LIMIT, WEB_SEARCH_MODES, compareVersions, errMsg } from './core.js'
 import { activeEngineId } from './engine/registry.js'
 import { readHintToggles, writeHintToggles } from './hint-toggles.js'
 import { addClaudeMcp, listClaudeMcp, removeClaudeMcp, toggleClaudeMcp } from './claude-mcp.js'
@@ -7,7 +7,7 @@ import { REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_ROUNDS_CHOICES } fro
 import { handlePiMcpAdd, handlePiMcpDelete, handlePiMcpList, handlePiMcpToggle } from './pi-panel.js'
 import { tasks } from './state.js'
 
-import { CONSULT_KEEP_LIMIT, MCP_NAME_PATTERN, MCP_ROUTE_PREFIX, TASK_LIST_LIMIT, WEB_SEARCH_MODES, addMcpServer, collabStatus, compareVersions, consults, engineView, errMsg, handleConfigSet, handleTaskCreate, latestPluginVersion, listMcpServers, loadKeyring, ownPluginVersion, readWebSearch, removeMcpServer, setMcpServerEnabled, taskSummary, taskView, writeTopLevelString } from './index.js'
+import { addMcpServer, collabStatus, consults, engineView, handleConfigSet, handleTaskCreate, latestPluginVersion, listMcpServers, loadKeyring, ownPluginVersion, readWebSearch, removeMcpServer, setMcpServerEnabled, taskSummary, taskView, writeTopLevelString } from './index.js'
 
 export async function handleTaskGet(req, res) {
   try {

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { canonicalIssueText } from './review-core.js'
 import { WIRE_API } from './constants.js'
 
-export const REVIEW_DEFAULT_ROUNDS = 3
+export const REVIEW_DEFAULT_ROUNDS = 1
 
 export const REVIEW_ROUNDS_CHOICES = [1, 3, 5]
 
