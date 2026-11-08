@@ -40,6 +40,7 @@ import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, readFileSync, renameSync, openSync, createWriteStream } from 'node:fs'
 import { execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
+import { runBoardAutoCleanup } from './board-auto-cleanup.js'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
@@ -212,6 +213,7 @@ const AUTO_CLEANUP_KEEP_DAYS = 7
 const AUTO_CLEANUP_MAX_BYTES = 209715200
 // 进程内句柄：apply 装上、disposer 清掉（同 bridgeServer 的生命周期写法）。
 let autoCleanupTimer = null
+let boardAutoCleanupRunning = false
 
 function stopAutoCleanup() {
   const timer = autoCleanupTimer
@@ -231,6 +233,12 @@ function runAutoCleanup() {
     // B：Codex 运行日志库同口径龄清 + 碎片超阈值才 VACUUM（安全闸见 cleanupCodexLogs）。
     // 不看 sessions 体积门槛 —— 那是 sessions 的事，logs_2.sqlite 的碎片和它无关。
     cleanupCodexLogs(AUTO_CLEANUP_KEEP_DAYS)
+    if (!boardAutoCleanupRunning) {
+      boardAutoCleanupRunning = true
+      void runBoardAutoCleanup({ boardDir: boardDir(), boardScript: BOARD_SCRIPT })
+        .catch(e => console.warn('[second-engine] board auto cleanup:', errMsg(e)))
+        .finally(() => { boardAutoCleanupRunning = false })
+    }
     if (sessionsBytes() <= AUTO_CLEANUP_MAX_BYTES) return
     cleanupSessions(SESSIONS_DIR, Date.now() - AUTO_CLEANUP_KEEP_DAYS * 24 * 60 * 60 * 1000, stats)
   } catch { /* best effort */ }

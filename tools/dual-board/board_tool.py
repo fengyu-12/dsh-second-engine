@@ -777,7 +777,7 @@ def cmd_archive(a) -> None:
 
 
 def cmd_inbox_archive(a) -> None:
-    """把某收件箱里已读的段转档，正文按月切 JSONL，活跃文件只留未读。"""
+    """把已读段及指定日期前的未读段转档。"""
     month = a.month or month_bj()
     path = inbox_path(_roles_for_command(), a.who)
     if not os.path.exists(path):
@@ -792,7 +792,19 @@ def cmd_inbox_archive(a) -> None:
         for i, s in enumerate(starts):
             e = starts[i + 1] if i + 1 < len(starts) else len(text)
             seg = text[s:e]
-            (moved_segs if "[已读]" in seg.splitlines()[0] else keep_segs).append(seg)
+            first = seg.splitlines()[0]
+            expired_unread = False
+            if a.expire_unread_before and "[已读]" not in first:
+                match = re.search(r"\[(\d{2})-(\d{2}) (\d{2}):(\d{2})\]", first)
+                if match:
+                    month_num, day_num, hour, minute = map(int, match.groups())
+                    now = _dt.datetime.now(_dt.timezone.utc)
+                    local = _dt.datetime(now.year, month_num, day_num, hour, minute, tzinfo=_dt.timezone(_dt.timedelta(hours=8)))
+                    if local < _dt.datetime.fromisoformat(a.expire_unread_before): expired_unread = True
+            if "[已读]" in first or expired_unread:
+                if expired_unread: seg = seg.replace(first, first + " [expired-unread]", 1)
+                moved_segs.append(seg)
+            else: keep_segs.append(seg)
         if not moved_segs:
             print("（无已读段可归档）", file=sys.stderr); return
         _append_jsonl(os.path.join(ARCHIVE_DIR, f"inbox-{a.who}-{month}.jsonl"),
@@ -1094,8 +1106,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("who"); sp.add_argument("--match", default=None)
     sp.set_defaults(func=cmd_inbox_read)
 
-    sp = sub.add_parser("inbox-archive", help="已读段转档 archive/inbox-<who>-YYYY-MM.jsonl")
+    sp = sub.add_parser("inbox-archive", help="已读段及过期未读段转档 archive/inbox-<who>-YYYY-MM.jsonl")
     sp.add_argument("who"); sp.add_argument("--month", default=None)
+    sp.add_argument("--expire-unread-before", default=None, help="ISO 时间；早于该时间的未读段标 expired-unread 后归档")
     sp.set_defaults(func=cmd_inbox_archive)
 
     sp = sub.add_parser("archive", help="终结任务转档 archive/tasks-YYYY-MM.jsonl")
