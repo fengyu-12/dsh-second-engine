@@ -12,7 +12,7 @@ description: 操作第二引擎（Codex/Pi/Claude Code，设置页切换）：�
 - **0 入口**：0.1 读取闸门 · 0.2 走哪条通道 · 0.3 三条道并行 · 0.4 API 入口
 - **1 判据**（该不该派）：1.1 什么时候该派它（A/B 两分法）
 - **2 规划**（整条路值不值得走 / 派给谁 / 怎么分工）：2.1 三方评估漏斗 · 2.2 被用户否定时 · 2.3 选引擎 · 2.4 各方边界 · 2.5 多 agent 分工 · 2.6 编排决策：先判是否编排，再建表（开编排时才用） · **2.7 编排硬规则 16 条** · 2.7.1 谁签字 · 2.8 提醒偏好 · 2.9 桥+工单+board 三件套**
-- **3 操作**：3.1 查档位 → 3.2 交接单 → 3.3 核对纪律 → 3.4 工单怎么写 → 3.5 复核 → 3.6 标准流程 → 3.7 执行模式 → 3.8 命令行降级 → 3.9 唤醒层 → 3.10 求助归属 → 3.11 看痕迹 → 3.12 异常速查 → 3.13 降级路径
+- **3 操作**：3.1 查档位 → 3.2 交接单 → 3.3 核对纪律 → 3.4 工单怎么写 → 3.5 复核 → 3.6 标准流程 → 3.7 执行模式 → 3.9 唤醒层 → 3.10 求助归属 → 3.11 看痕迹 → 3.12 异常速查 → 3.13 降级路径
 - **4 档案**：4.1 已迁至 skill `second-engine-dev`（真身 / 加载层 / 发布树落点）· 4.2 dual-board · 4.3 引擎与本机现场（references 索引）
 
 ## 0.1 读取闸门（任务出现 → 必须先读 → 读完带走什么）
@@ -423,10 +423,6 @@ CHECKPOINTS:
 ## 3.7 执行模式：exec / appserver（运行时切换、不需要重启）
 
 `echo appserver > ~/.dsh/second-engine-mode.txt` 切 app-server（多 `progress` 流式事件、`/api/task/cancel` 走 `turn/interrupt`），`echo exec` 切回；优先级 env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 exec。**复核恒走 exec，不支持 appserver。** 验收脚本与协议映射 → `references/ref-dispatch-drill.md`
-
-## 3.8 命令行降级（无插件环境 / 需要交互时）
-
-`codex-env` 进 TUI；手动起时 ⚠️ 别写成 `VAR=key cmd`（会进 argv 被 `ps` 看到）。命令与 resume 姿势 → `references/ref-dispatch-drill.md`
 
 ## 3.9 唤醒层：把消息递进 DSH 会话（实验端点，`POST /api/_exp/wake`，2026-10-30 实测通过）
 
