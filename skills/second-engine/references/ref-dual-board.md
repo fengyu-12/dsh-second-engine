@@ -5,7 +5,7 @@
 
 ## 1. 脚本 / 协议随插件，数据分离
 
-- 脚本与协议：`<插件目录>/tools/dual-board/{board.sh,board_tool.py,dispatch.sh,PROTOCOL.md}`（自定位，`DUAL_BOARD_DIR` 可覆盖数据目录）。
+- 脚本与协议：`~/dsha-second-engine/tools/dual-board/{board.sh,board_tool.py,dispatch.sh,PROTOCOL.md}`（自定位，`DUAL_BOARD_DIR` 可覆盖数据目录）。
 - **运行数据**默认 `~/proj/dual-board/`（Codex 侧登记 `~/proj/AGENTS.md`）：board.json / channel.md / inbox-* / archive / .dispatch。**只放数据，不放脚本**。
 
 ## 2. 写板唯一入口 `board.sh`
@@ -31,7 +31,7 @@ CAS + O_EXCL 锁 + 原子写 + 状态机 + 归档 + 体检全在工具里，**�
 ## 5. 双通道
 
 - **短任务**：`POST /api/task`（ephemeral 零记忆，互审/复核用）。
-- **长任务**：`codex exec` 落盘 + `codex exec resume <完整 36 位 UUID>` 成员会话（一条链绑一个任务，thread id 记看板 `session` 字段，实测跨单记忆保持；API 不支持 resume，长任务用命令行降级姿势手动注入 key）。
+- **长任务**：`codex exec` 落盘 + `codex exec resume <完整 36 位 UUID>` 成员会话（一条链绑一个任务，thread id 记看板 `session` 字段，实测跨单记忆保持；API 不支持 resume，长任务用 CLI 手动注入 key）。
 - 工单三字段 task/context/frame，交付强制四段含【异议位】。
 - 细则读 `PROTOCOL.md` §九（工具化纪律）与 §十一（已知限制）。
 
@@ -45,3 +45,16 @@ CAS + O_EXCL 锁 + 原子写 + 状态机 + 归档 + 体检全在工具里，**�
 
 - `board_tool.py` 的 `CHANNEL` 曾错挂 `dirname(__file__)`，`complete` 的清场全写进插件目录（已改为跟 `BOARD_DIR`）。
 - 面板卡片状态白名单曾漏 `cancelled`，导致「已取消 + 运行中」并存。
+
+## 8. 多桥部署（跨引擎并行，2026-11-04 实测）
+
+只跨引擎多开（Codex + Pi + Claude）；同引擎两桥是同一模型两个上下文，边际收益低。
+
+- **Pi**：`PI_BRIDGE_PORT=8788 node bridge/pi/server.mjs`（插件根下跑）；1 个 node 进程，内部是否再拉 Pi RPC 子进程**未实测个数**
+- **Codex**：`BRIDGE_STATE_DIR=/tmp/bx BRIDGE_PORT=3195 BRIDGE_AS_PORT=3196 ./ctl.sh start`（在 `bridge/web/` 下）；**2 个常驻进程**（app-server + 网页桥）
+- **Claude**：`CLAUDE_BRIDGE_PORT=8789 node bridge/claude/server.mjs`；1 个 node + 内部 1 个常驻 claude 子进程（懒启动）；页面复用 `bridge/web/public/index.html`
+- **后果**：每加一个桥 ≈ 一组端口 + 一份常驻内存；Codex 桥还会拉起完整 app-server（`/api/health` 里 `appServer.connected` 可验）。桥没有 `task.output` ⇒ **必须各自 `board.sh new` 记账**
+- **别共用状态目录**：`.pid` / `.as.pid` / `.token` 固定落在 `BRIDGE_STATE_DIR`，两个实例互相覆盖 ⇒ **一桥一目录**
+- **收尾**：`ctl.sh stop`（同目录同端口）；Pi 桥按**精确 PID** 结束；临时状态目录与日志一并删
+
+实测（2026-11-04）：Codex 桥 3195/3196 = pid 31012(app-server) + 31057(网页桥)，health `ok:true, connected:true`；Pi 8788 = 1 个 node 进程，根路径 HTTP 302。

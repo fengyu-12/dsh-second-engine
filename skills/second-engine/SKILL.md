@@ -24,7 +24,7 @@ description: 操作第二引擎（Codex/Pi/Claude Code，设置页切换）：�
 | 要升级 Codex，或升级后判断插件要不要动 | `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md` | npm 平台包是正选、三条检验的通过判据、只有执行链判不过才动插件 |
 | 要写看板 / 派长任务链 / 查 board 子命令 | `<DSH 技能目录>/second-engine/references/ref-dual-board.md` | `board.sh` 是唯一写入口、出板必须 `--reviewed-by human`、`--workdir` 必须绝对路径 |
 | 要决定派给谁 / 写执行方边界 / 评估编排安全 / 查同类项目 | `<DSH 技能目录>/second-engine/references/ref-dispatch-routing.md` | 路由二分法（我 / 第二引擎；其他执行方看各自 skill）、每单边界写死、隔离实测 4 条 ⇒ 只能「限额+留痕+可回滚」 |
-| 派单核对 / 执行模式切换 / 命令行降级 / 唤醒端点 / 提醒通道 | `<DSH 技能目录>/second-engine/references/ref-dispatch-drill.md` | 能被一条命令验证的描述落笔前先跑过它、复核恒走 exec、`VAR=key cmd` 会进 argv 被 ps 看到、wake 要 `session-<uuid>` 前缀 |
+| 派单核对 / 执行模式切换 / 唤醒端点 / 提醒通道 | `<DSH 技能目录>/second-engine/references/ref-dispatch-drill.md` | 能被一条命令验证的描述落笔前先跑过它、复核恒走 exec、`VAR=key cmd` 会进 argv 被 ps 看到、wake 要 `session-<uuid>` 前缀 |
 | 要操作 Claude Code：路径 / provider / 模型 / 档位 / 桥 / 会话 / 外部事实验收 | `<DSH 技能目录>/second-engine/references/ref-claude-runtime.md` | 顶层 `active` 是 id 不是布尔、`--model/--effort` 改了要重建进程、会话是两层目录、桥 8789 双向 NDJSON |
 | 选 Pi / Codex / Claude Code | `<DSH 技能目录>/second-engine/references/ref-engine-pick.md` | 要「审」/流式进度/web_search 走 Codex、多 provider 并存走 Pi、切完旧单不迁移 |
 

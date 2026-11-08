@@ -7,7 +7,7 @@
 - **派单前逐条复核自己的缺陷描述**。任务单里每条缺陷 = **一条断言**（`文件:行号` + 当前行为），派单前用 `grep` / `sed -n` 实测一遍，与描述不符就**改描述**，不许凭印象写。2026-10-29 两连击实证：① 把活的 `createPiCards`/`PiCleanupCard` 写成死代码（只 `grep -c` 数出现次数、没查调用点），对方核实后才没把 Pi 面板搞崩；② 写「引擎未知时放行」，实际 `activeEngineId()` 读不到就 `return 'codex'`（`registry.js:82-88`）、**永不返回空串**——半句既错又是死代码。**同一类错误两天犯两次，说明缺的是检查点不是态度**。判据：单子里凡是能被一条命令验证的描述，落笔前必须已经跑过那条命令。
 - **workdir 里不能放同名过期副本**。模型会诚实去读 workdir 里能找到的那份，给出「对那份完全正确、对真身全错」的答案。派单前 `find <workdir> -name index.js` 查一遍；发现副本就挪走或改名。
 - **核对它给的行号，先确认为它读的是哪份文件**。拿 A 的行号去比 B，会得出「它在编」的错误结论——实际它读的是旧快照且 6/6 命中。**先问"你读的哪个路径"，再判对错。**
-- **要它精确改代码，路径写到文件级**：`<插件目录>/src/index.js`，别只给 workdir。
+- **要它精确改代码，路径写到文件级**：`~/dsha-second-engine/src/index.js`，别只给 workdir。
 - **采纳它提出的新名词前先 `grep -c`**。合同里塞进 `queued`/`finalizing` 两个状态，代码里 0 命中——凭空放大改造面。**新名词先验证存在性**。
 - **改「取消 / 终局」这类语义，先把所有写点找齐**。exec 走 `child.on('exit')`、appserver 走 `handle.done` reject；只改一条路径等于没改，且要等真实取消才暴露。
 - **删一个副作用前，查它还兼管什么**。`utimesSync(outPath)` 同时喂看门狗和污染 `cleanupLiveFiles` 的 mtime 判据——删掉解耦了两件事，也顺带改了清理行为（这是好事，但要知道）。
@@ -26,17 +26,7 @@
 echo appserver > ~/.dsh/second-engine-mode.txt   # 切 app-server
 echo exec      > ~/.dsh/second-engine-mode.txt   # 切回
 ```
-优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。appserver 协议映射见 `<DSH 技能目录>/skills/second-engine/references/ref-codex-facts.md`。
-
-
-## 3.8 命令行降级（无插件环境 / 需要交互时）
-
-```bash
-codex-env          # 插件提供：自动注入激活提供方 key → 进 TUI（Ctrl+D 或 /quit 退出）
-# 手动（⚠️ 别写成 VAR=key cmd，会进 argv 被 ps 看到）：
-KEY=$(head -1 "<DSH 技能目录>/中转站/当前生效API.txt"); cd ~/proj && env PROVIDER_API_KEY="$KEY" codex exec --skip-git-repo-check -o /tmp/out.txt "工单"
-```
-- 长线程需 resume 时不加 `--ephemeral`（完整 36 位 UUID）；结构化收结果用 `-o <文件>` 或 `--json`。
+优先级：env `SECOND_ENGINE_EXEC_MODE` > 模式文件 > 默认 `exec`。验收：`bash ~/.dsh/scripts/dsh/se-appserver-verify.sh`（流式进度 / 打断 / exec 回归三条判据）。appserver 协议映射见 `<DSH 技能目录>/references/ref-codex-facts.md`。
 
 
 ## 3.9 唤醒层：把消息递进 DSH 会话（实验端点，2026-10-30 实测通过）

@@ -2,10 +2,10 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.166.0`（2026-10-31 升级；回滚物 `<Codex 安装目录>/*.bak-0.165.0`）。三条检验全过：执行链 **5/5** · DSH 依赖点 6/6 全 OK · 工具面当次 9 个（`exec_command` `write_stdin` `request_user_input` `view_image` `multi_agent_v1` `get_goal` `create_goal` `update_goal` `web_search`）—— ⚠️ **未与 0.165 基线逐名比对**（当时没留清单），只证明"面能列出来"。0.165 那轮修过检验脚本判据（`cancelled` 漏算终态，插件 `taskView` 本就当合法终态（搜 `return 'cancelled'` 定位））。
-> **二进制**：`<Codex 安装目录>/codex-aarch64-unknown-linux-musl`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）
-> **升级方式（2026-10-31 实测修订 —— 正选换成 npm 平台包）**：`curl -fL -o pkg.tgz https://registry.npmmirror.com/@openai/codex/-/codex-<版本>-linux-arm64.tgz`，**单文件整包**（0.166.0 = 164,402,913 B，约 3 分钟，字节数校验相符），不走 GitHub release。**release 直连 2026-10-31 实测 75 秒零字节、`ghproxy.net` 同样卡、`ghfast.top` 更早已挂** ⇒ 本机现状是 release 资产走不动，10-17 那条"直连通"已过期（网络会变，但"能通"也要先探再信）。
-> **包内结构与取用**：`vendor/aarch64-unknown-linux-musl/` 内含 `bin/codex`(~277 MB) + `bin/codex-code-mode-host`(~70 MB) + `codex-resources/`(voice host、bwrap、gstreamer 库) + `codex-path/rg`。**只取两个二进制**装进 `<Codex 安装目录>/`，sidecar 必须叫**无后缀** `codex-code-mode-host`；`codex-resources/` 本机当前**未装**（exec / app-server / 代码模式用不到，要 voice 或沙箱资源再补）。替换姿势：`cp -a` 备份 → `cp` 到临时名 → `mv -f` 原子落位 → `codex --version` 复核。
+> **当前版本**：`0.167.0`（2026-11-07 升级；**无回滚物** —— 0.166 备份已删，回退须重下 113 MB）。三关检验全过：`exec` exit 0 · `app-server` initialize 回包 · **工具真执行**（`command_execution` 实跑 `cat`）。⚠️ 0.167 在本机有 **sidecar 路径回归**（见 §6.1），升级后 §4 第 7 条必须查 `/.l2s/`，只验 `--version` 会假绿。
+> **二进制**：`<Codex 安装目录>/codex`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）；sidecar 两处硬链缺一即废 —— `<Codex 安装目录>/codex-code-mode-host` + **`/.l2s/codex-code-mode-host`**（0.167 实际读后者）。
+> **升级方式（2026-11-07 实测修订 —— GitHub release 直连又通了）**：`curl -fL -o pkg.tgz https://github.com/openai/codex/releases/download/rust-v<版本>/codex-package-aarch64-unknown-linux-musl.tar.gz`（0.167.0 = 187,844,332 B / 4 分 4 秒 ≈ 749 KB/s），**同时下 `codex-package_SHA256SUMS` 逐字节校验**（该 SUMS 只覆盖 `codex-package-*`，不覆盖单件 `codex-*`）。备选：npmmirror 平台包（0.166.0 = 164,402,913 B ≈ 3 分钟）。⚠️ 源可达性会变：10-31 记「release 走不动」、11-07 实测 749 KB/s ⇒ 每次先探再信。
+> **包内结构与取用**：整包 `codex-package` = `bin/codex`(~267 MB) + `bin/codex-code-mode-host`(~69 MB) + `bin/codex-exec-server`(67 MB) + `codex-path/rg`(4.4 MB) + `codex-resources/{bwrap,voice}`(53 MB)。**2026-11-07 实测只留前两个二进制**：删掉 exec-server / rg / bwrap / voice 后 `exec` 与 `app-server` 均正常（second-engine 源码对它们 0 引用、系统已有 `/usr/bin/rg`、proot 无 bwrap 沙箱）⇒ 最终占用 335 MB。替换姿势：旧件留档 → `ln` 硬链落位 → `codex --version` **外加一次工具调用**复核（仅验版本会漏掉 sidecar 断链，2026-11-07 就这么假绿过一次）。
 
 ---
 
@@ -79,11 +79,18 @@ codex remote-control | exec-server | cloud | sandbox | debug   # 0.163 面里已
 
 ---
 
-## 3. Codex 现版本功能（`0.166.0` · 2026-10-31 本机实测拉取）
+## 3. Codex 现版本功能（`0.167.0` · 2026-11-07 本机实测拉取）
 
 > **维护方式：主 AI 自己拉 · 不留存历史版本** —— 不逐版累积（没完没了、永远追着上游跑）。每次升级后重新拉一遍**整节覆盖**，只留**当下版本的具体变更与修复**。
 >
-> ⚠️ **本版变更日志无可用来源**（2026-10-31 实测三个源）：`mintlify.com/openai/codex/llms.txt` → **Page gone**；GitHub release 直连 → 不通（已多次复现）；`registry.npmmirror.com` 包 metadata → **无 changelog 字段**。⇒ **本节不含 0.164–0.166 的新增/修复明细**，只有本机实测的命令面与约束。**不要凭记忆补写变更项。**
+> **变更来源（2026-11-07 打通）**：`api.github.com/repos/openai/codex/releases/tags/rust-v<版本>` 的 `body` 就是完整 changelog（0.167.0 = 11,566 字，含 New Features / Bug Fixes / Changelog 三段）。10-31 那条「无从取得」是因为当时 release 直连不通，不是上游没有。
+
+**0.167.0 变更（官方 body 归纳，只列与本机相关的）**
+
+- **TUI 侧新增（非交互 `exec` 用不上）**：`codex agents --no-daemon` 命令中心与未读标记；会话选择器跨后端切换且保留草稿；终端本地图片预览；`/experimental` 系统代理；审批时内联展开 patch。API key / 云 provider 收进 "Sign in another way"，`gcp_setup_wizard` 可配 Vertex AI。
+- **修复**：换 model provider 后已保存会话仍可见（不能 resume 时也能读 transcript 转新会话）；`Ctrl+L` 清屏保留历史；网络审批提示随请求结束关闭、同端点串行。
+- **与本机相关**：`#58399` Linux musl 构建减少 jemalloc arena ⇒ 降低对话卸载后的空闲内存；`#58343` keyring 不可读时保留 fallback token 刷新；`#58404` 修「无可用 usage 时的上下文 token 估算」。
+- ⚠️ 官方 changelog 里**没有任何一条**提到 sidecar 查找路径变化 —— §6.1 那条回归由 proot 触发，不要指望上游修。
 
 **命令面（`codex --help` 实测，供速查）**
 
@@ -125,14 +132,20 @@ codex features list | grep -E 'removed'            # 3. 有哪些被移除（老
 codex doctor                                       # 4. 环境体检（连通性/auth/sandbox/记忆库）
 grep -nE '^\[' ~/.codex/config.toml                # 5. ★配置段是否完整
 curl -s "$DSH_WEB_URL/second-engine/api/version"   # 6. 插件侧版本核对
-ls -l <Codex 安装目录>/codex-code-mode-host             # 7. ★sidecar 是否在位（换源重装/升级后必查，见 §6）
+ls -l <Codex 安装目录>/codex-code-mode-host /.l2s/codex-code-mode-host   # 7. ★sidecar 两处硬链都要在（0.167 读 /.l2s，见 §6.1）
 grep -n 'model_context_window\|model_max_output_tokens' ~/.codex/config.toml  # 8. 模型元数据是否写入（见 §7）
-ls -l <Codex 安装目录>/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下）
+ls -l <Codex 安装目录>/*.bak-*                          # 9. ★回滚物是否在位（升级前必须留下；2026-11-07 这轮没留，回退要重下）
+# 10. ★★唯一能证明工具链没断的判据（第 1、7 条过了也可能假绿）
+echo 'TOKEN='$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n') > /tmp/probe.txt
+codex exec --skip-git-repo-check --json 'Use your shell tool to run: cat /tmp/probe.txt'
+#     通过 = 输出含 item.type=command_execution 且 aggregated_output 命中该串
+#     失败 = item.type 只有 error/reasoning/agent_message，没有 command_execution
+#            （此时 exit 仍为 0、回答看似正确 —— 2026-11-07 就因此误判「不是必需」）
 ```
 
 ### ★ 第 5 条是 2026-10-02 事故换来的
 
-第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`~/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
+第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`/root/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
 
 修复：`src/index.js` 新增 `extractPreservedSections()`，用的是**黑名单**——只排除模板自有的
 `[model_providers.*]` 与 `[memories]`，**其余段一律原样保留**（2026-10-02；最初写成白名单，当天改成黑名单）。
@@ -157,10 +170,13 @@ ls -l <Codex 安装目录>/*.bak-*                          # 9. ★回滚物是
 `src/index.js` **没有热加载**。改完不重启，进程里跑的仍是旧代码——2026-10-02 实测：
 改完插件但不重启，切提供方照样丢配置段。**顺序：改插件 → 重启 Web → 再验证**，不能省。
 
-### 5.3 `codex exec` 疑似不触发记忆流水线（未确证）
+### 5.3 记忆流水线：触发已通、phase2 卡死、现默认关闭（2026-11-07 实测）
 
-配好 `[memories]` 模型后，经插件下发工单（内部走 `codex exec`）触发过 Codex 启动，`jobs` 表**毫无变化**
-→ 记忆流水线没被触发。**推测**它只在交互式/长驻模式启动时跑，**尚未确证**。
+**旧结论作废**：2026-10-03 记的「`exec` 不触发、jobs 表毫无变化」已不成立 —— 2026-11-07 实测 `jobs` 56 行（done 43 / error 11 / running 2），当天一次 `exec` 的 thread 在 jobs 里有对应的 `memory_consolidate_global`。
+
+**真实形态**：`~/.codex/memories/` 是个 **git 仓库**。stage1 把会话抽成摘要（写 `raw_memories.md` + `rollout_summaries/`），phase2 整合成 `MEMORY.md`（任务组）+ `memory_summary.md`（用户画像）+ `phase2_workspace_diff.md`。**stage1 在跑、phase2 卡死** —— `MEMORY.md` 停在 2026-10-31，整合 job 长期 `running`；11 条 error 里 2 条是 `Missing environment variable: ZILUO_API_KEY`（内部二次调用拿不到插件注入的 key）、5 条是旧 provider 的 503、4 条 `No such file or directory`。
+
+**现决定：关闭**（`codex features disable memories` —— 只删 `[features]` 里 `memories = true` 一行，`[memories]` 的模型配置与全部历史记忆文件保留）。实测关闭后跑一次 `exec`：jobs 56→56，**无新增**，即每张工单不再多花两次模型调用。恢复：`codex features enable memories`。注：Claude Code 侧有对等能力（auto memory，`~/.claude/projects/<proj>/memory/`），不受此影响。
 
 ---
 
@@ -199,6 +215,31 @@ chmod +x <Codex 安装目录>/codex-code-mode-host
 
 **验收判据（接任何新 provider/模型必做）**：让它"建一个文件并运行"，**看文件真不真落盘**——别信回复像不像。回复正确但目录是空的 = 工具链断了。（2026-10-04 为此白烧约 2.7 万 token。）
 
+### 6.1 0.167 在 proot 下的路径回归（2026-11-07 实测 · 本机专属）
+
+**现象**：sidecar 就在 `<Codex 安装目录>/codex-code-mode-host`、与主二进制同级，整包也齐全，但每条 `exec` 输出仍带一条：
+
+```text
+Code Mode is unavailable because failed to spawn code-mode host
+/.l2s/codex-code-mode-host: host executable was not found
+```
+
+**后果**：模型照常回话（exit 0，答案常常还是对的），但**工具一个都执行不了**。判据只看 JSON：`item.type` 只有 `error` / `reasoning` / `agent_message`，**没有 `command_execution`**。本次实测模型自述「shell 工具连续两次启动失败」。
+
+**根因判定（本机实测，非官方说明）**：0.167 在 proot 里把自身可执行目录解析成 **`/.l2s`**，于是去 `/.l2s/codex-code-mode-host` 找 sidecar。对照实测：**0.166 用同一份 config、同一个 sidecar 位置工具正常**（`command_execution` 实跑 `/bin/bash -lc 'cat note.txt'` 并拿到随机串）⇒ 属 0.167 引入、proot 触发的回归。
+
+**已试无效**（别再重复）：`CODEX_CLI_PATH=<Codex 安装目录>/0.167.0/bin/codex`（仍找 `/.l2s`）；主二进制与 sidecar 平级放 `<Codex 安装目录>/`（仍找 `/.l2s`）。官方 changelog 里无任何相关条目。
+
+**修复（唯一有效，已验证）**：
+
+```bash
+ln -f <Codex 安装目录>/codex-code-mode-host /.l2s/codex-code-mode-host
+```
+
+修好后同一次 `exec`：error 项消失，出现 `command_execution`（实跑 `cat note.txt` 成功）。
+
+**代价与兜底**：`/.l2s/` 是 **DSH 自己的临时回填区** —— 2026-11-07 实测约 6000 个条目：**3218 个符号链接**（指向 `/data/user/0/dsh.android.client/files/linux/ubuntu/.l2s/`）+ **3219 个 `.l2s..MEMORY.md.backfill-*.tmp0001` 中间物**，我们的 sidecar 硬链就混在里面。⇒ **DSH 大版本升级或清理时极可能整目录被扫掉**，届时 sidecar 消失、工具立刻全废**且不报错**（exit 0、答案照常）。掉了一条命令补回（见上），但**不会自己恢复** ⇒ §4 第 7 条定期查；**DSH 升级后第一件事就是补它**（当前 DSH `0.2.1-rc.2`，上游正式版已到 `0.2.2`，跨版升级必查）。
+
 ---
 
 ## 7. 模型元数据：为什么会出现 `Model metadata ... not found`（2026-10-17 实测）
@@ -232,14 +273,14 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 | 配置 | `config.toml` | 1.2 K | `model_provider` / `model` / `sandbox_mode` / `web_search` / `[mcp_servers.*]`。**不手改** —— 插件切 active 时重写它 |
 | | `config.toml.bak-*` ×7 | 各 ~450 B | 历史备份（`-20261001` `-pre-memories` `-pre-switch` `-ma2` `-recplug` `-before-ma2-recplug` `-se`） |
 | | `keyring.json` | 1.4 K | 多提供方与 key。**不手改** |
-| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `~/proj/AGENTS.md` 同源的那份） |
+| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `/root/proj/AGENTS.md` 同源的那份） |
 | 状态库 | **`logs_2.sqlite`** | **41 M** | 运行日志 —— **整个目录最大的一块**（能否清**未验证**） |
 | | `thread_history_1.sqlite` (+`-wal` 248 K) | 15 M | 线程历史 |
 | | `state_5.sqlite` (+`-shm`) | 573 K | 主状态；`state_5.sqlite.bak-20261003-pre-hue` ×3 ≈ 800 K 是升级前备份 |
 | | `queue_1` / `goals_1` / `memories_1.sqlite` | 41 K / 32 K / 44 K | 队列 / 目标 / 记忆 |
 | 内容 | **`sessions/`** | 16 M | 会话 rollout —— 落盘路径与读法见附A.1 |
 | | **`task-*.out.live` ×~100** | **~10 M** | **second-engine 每个工单的原始输出**；清理走 `POST /second-engine/api/cleanup`（按 mtime）。**2026-10-26 复核：现 14 个 / ~595 KB**（2026-10-25 起 `finalizeJob` 统一删 `.out`/`.live`，积压已消化） |
-| | `skills/` | 630 K | Codex 侧技能（`<本机私有技能>` 在此） |
+| | `skills/` | 630 K | Codex 侧技能（`relay-probe` 在此） |
 | | `memories/` / `archived_sessions/` | 189 K / 空 | 记忆 / 已归档会话 |
 | 运行时 | `.tmp/` | **102 M** | `plugins/` 缓存 + `git-XXXXXX/`（**裸仓库**，只有 `HEAD`/`objects`/`refs`，各 15 K） |
 | | `shell_snapshots/` | 3.5 K | **exec 模式**工单会建 |
@@ -345,23 +386,23 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 ```
 -c model_provider=relay -c model="<模型名>" \
 -c 'model_providers.relay.name="relay"' \
--c 'model_providers.relay.base_url="<你的中转站 base_url>"' \
+-c 'model_providers.relay.base_url="https://laneai.dev/v1"' \
 -c 'model_providers.relay.wire_api="responses"' \
 -c 'model_providers.relay.env_key="RELAY_API_KEY"'
 ```
 
 ## 附D. 2026-09-25 新增能力（第二引擎侧，已实测）
 
-> **2026-10-26 复核**：① **<本机退役管线> 管线已退役**——`~/proj/<本机退役管线>/` 不存在，原件在 `<DSH 数据目录>/refs/retired-proj-20261015/<本机退役管线>`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `<本机私有记录>` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
+> **2026-10-26 复核**：① **relay-forge 管线已退役**——`/root/proj/relay-forge/` 不存在，原件在 `/root/.dsh/refs/retired-proj-20261015/relay-forge`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `/root/proj/共同工作区/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
 
 ### 中转站算力：探测与并发咨询
 
-- **技能 `<本机私有技能>`**（Codex 侧 `~/.codex/skills/<本机私有技能>/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`<DSH 技能目录>/relay-forensics`），此处不重复。
-- **管线 `~/proj/<本机退役管线>/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
+- **技能 `relay-probe`**（Codex 侧 `~/.codex/skills/relay-probe/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`/root/.dsh/skills/relay-forensics`），此处不重复。
+- **管线 `/root/proj/relay-forge/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
   模型发 `tool_calls` → `forge.py` 本地 `fetch_url` → 回灌。铁律：产出只落 `out/<时间戳>/`，
   **绝不自动改目标文件**；要"整文件重写"会得 0 字符，只喂"定位锚点 → 替换为"的补丁。
 
-### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `~/proj/backup/`）
+### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `/root/proj/backup/`）
 
 - 会话列表**搜索框**（`Ctrl+K` 唤起）、**会话 ID 芯片**（点一下复制完整 36 位 ID，显示只给前 8 位）、
   **深浅主题切换**（浅色为默认，选择存 localStorage）、被占用时**显示写锁持有者**
