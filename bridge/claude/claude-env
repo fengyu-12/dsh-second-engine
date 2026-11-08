@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Claude Code terminal launcher for the second-engine bridge.
+set -euo pipefail
+
+usage() {
+  cat <<'TXT'
+用法：claude-env [-h|--help] [-c] [-r] [-u|--url] [Claude 参数...]
+  无参数       注入第二引擎凭据并启动 Claude Code TUI
+  -c           继续最近会话（claude --continue）
+  -r           选择并恢复会话（claude --resume）
+  -u, --url    只打印 Claude 桥网址，不启动 TUI
+  其他参数     原样传给 claude，例如 -p "提示" 或 --model 模型名
+
+环境变量：ANTHROPIC_*、CLAUDE_PROVIDERS_FILE、SECOND_ENGINE_WORKDIR、CLAUDE_BIN
+TXT
+}
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  -u|--url)
+    printf 'http://127.0.0.1:%s\n' "${CLAUDE_BRIDGE_PORT:-8789}"
+    printf 'Claude 桥需另起运行。\n'
+    exit 0
+    ;;
+esac
+
+ARGS=()
+case "${1:-}" in
+  -c) ARGS=(--continue); shift ;;
+  -r) ARGS=(--resume); shift ;;
+esac
+ARGS+=("$@")
+
+CLAUDE_BIN=${CLAUDE_BIN:-claude}
+WORKDIR=${SECOND_ENGINE_WORKDIR:-$HOME/claude-workspace}
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+if [ -z "${ANTHROPIC_BASE_URL:-}" ] || [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  eval "$(python3 - "${CLAUDE_PROVIDERS_FILE:-$HOME/.dsh/second-engine/claude-providers.json}" "$HOME/.claude/settings.json" "$HOME/.codex/keyring.json" "${ANTHROPIC_BASE_URL:-}" "${ANTHROPIC_AUTH_TOKEN:-}" "${ANTHROPIC_MODEL:-}" "${ARGS[@]}" <<'PY'
+import json, os, shlex, sys
+
+provider_file, settings_file, keyring_file, env_url, env_token, env_model, *args = sys.argv[1:]
+values = {}
+model = ''
+
+def read_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+
+def pair(url, token):
+    return isinstance(url, str) and url != '' and isinstance(token, str) and token != ''
+
+if pair(env_url, env_token):
+    values = {'ANTHROPIC_BASE_URL': env_url, 'ANTHROPIC_AUTH_TOKEN': env_token}
+else:
+    settings = read_json(settings_file)
+    env = settings.get('env', {}) if isinstance(settings, dict) else {}
+    if isinstance(env, dict) and pair(env.get('ANTHROPIC_BASE_URL'), env.get('ANTHROPIC_AUTH_TOKEN')):
+        values = {'ANTHROPIC_BASE_URL': env['ANTHROPIC_BASE_URL'], 'ANTHROPIC_AUTH_TOKEN': env['ANTHROPIC_AUTH_TOKEN']}
+    else:
+        doc = read_json(provider_file)
+        providers = doc.get('providers', []) if isinstance(doc, dict) else []
+        active = doc.get('active') if isinstance(doc, dict) else None
+        provider = next((p for p in providers if isinstance(p, dict) and p.get('id') == active), None)
+        if provider and pair(provider.get('baseUrl'), provider.get('apiKey')):
+            values = {'ANTHROPIC_BASE_URL': provider['baseUrl'], 'ANTHROPIC_AUTH_TOKEN': provider['apiKey']}
+            model = provider.get('model', '') if isinstance(provider.get('model'), str) else ''
+        else:
+            ring = read_json(keyring_file)
+            providers = ring.get('providers', []) if isinstance(ring, dict) else []
+            ds = next((p for p in providers if isinstance(p, dict) and p.get('id') == 'deepseek'), None)
+            if ds and isinstance(ds.get('apiKey'), str) and ds['apiKey']:
+                values = {'ANTHROPIC_BASE_URL': 'https://api.deepseek.com/anthropic', 'ANTHROPIC_AUTH_TOKEN': ds['apiKey']}
+
+if not values:
+    print("echo 'Claude 未配置凭据。请设置 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN，或配置 ~/.claude/settings.json、~/.dsh/second-engine/claude-providers.json、~/.codex/keyring.json'; exit 1")
+    raise SystemExit
+
+# Explicitly set environment values win independently, including partial overrides.
+if env_url:
+    values.pop('ANTHROPIC_BASE_URL', None)
+if env_token:
+    values.pop('ANTHROPIC_AUTH_TOKEN', None)
+if model and not env_model and '--model' not in args:
+    values['ANTHROPIC_MODEL'] = model
+for name, value in values.items():
+    print('export %s=%s' % (name, shlex.quote(value)))
+PY
+  )"
+fi
+
+exec "$CLAUDE_BIN" "${ARGS[@]}"
