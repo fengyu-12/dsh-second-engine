@@ -393,6 +393,37 @@ curl -s -X POST "$W/second-engine/api/task" \
   **不要自己写 `sleep`+`curl` 轮询**。
 - **复核接力**：`POST /api/review` 可带 `"prev":"<上一轮复核id>"`——首轮自动附上一轮未决问题对照。
 
+## 终端启动器：codex-env / claude-env / pi
+
+网页能做的，终端也能做。三个引擎的终端入口不同，装法都在 `bridge/install.sh`：
+
+```bash
+bash bridge/install.sh --with-codex-env --with-claude-env
+```
+
+| 命令 | 作用 | 装法 |
+|---|---|---|
+| `codex-env` | 开新会话并挂到网页桥的会话所有者（终端 + 网页共享同一条） | `--with-codex-env` |
+| `claude-env` | 注入凭据后进 Claude Code TUI | `--with-claude-env` |
+| `pi` | 直接用，无需启动器（凭据在 `~/.pi/agent/models.json`） | 随 Pi 自带 |
+
+常用参数（三者都有 `-h` 看完整用法）：
+
+- `codex-env`：`-s` 独立会话（网页看不见）· `-r` 续最近 · `-a` 弹会话选择器 · `-u` 只打印桥网址
+- `claude-env`：`-c` 继续最近会话 · `-r` 选择并恢复 · `-u` 只打印 Claude 桥网址（8789）
+- `pi`：`-c` 继续当前目录最近会话 · `-r` 选择并恢复
+
+### 会话在哪
+
+- **Codex**：终端与网页桥共享同一批会话（owner 模式），终端里开的会话网页几秒内出现，两边可同时发。
+- **Claude**：`claude-env` 只负责凭据与启动，终端会话与网页桥**不共享**；要接着上次的聊，用 `-c`。
+- **Pi**：终端与网页桥写同一个 `~/.pi/agent/sessions/--<cwd 编码>--/` 目录，但**不是同一进程实时共享**；在同一目录下 `pi -c` 能续到桥里聊过的会话。
+
+### 首次启动注意
+
+- Pi 首次会下载 `fd` 到 `~/.pi/agent/bin`，属正常依赖。
+- Claude 首次只需选一次主题，不是登录。
+
 ## 两种执行模式怎么选（2026-09-27 起）
 
 工单支持两种执行模式，**切换不需要重启**：
