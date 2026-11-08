@@ -407,6 +407,13 @@ bash bridge/install.sh --with-codex-env --with-claude-env
 | `claude-env` | 注入凭据后进 Claude Code TUI | `--with-claude-env` |
 | `pi` | 直接用，无需启动器（凭据在 `~/.pi/agent/models.json`） | 随 Pi 自带 |
 
+Pi 不需要启动器，装好直接敲：
+
+```bash
+pi        # 进 TUI
+pi -c     # 续当前目录最近一次会话
+```
+
 常用参数（三者都有 `-h` 看完整用法）：
 
 - `codex-env`：`-s` 独立会话（网页看不见）· `-r` 续最近 · `-a` 弹会话选择器 · `-u` 只打印桥网址
