@@ -49,6 +49,12 @@ export function normalizeTaskRequest(body, defaults = {}) {
     acceptance: Array.isArray(body.acceptance)
       ? body.acceptance.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
       : (typeof body.acceptance === 'string' && body.acceptance.trim() !== '' ? body.acceptance.trim() : undefined),
+    // 2026-11-10：Claude 工单可选工具白名单。不传 = 由 claude-args 的 DEFAULT_ALLOWED_TOOLS
+    // 兜底（Read/Write/Edit/Bash），所以默认行为不变；传了才按单次生效。
+    // 只做结构归一，范围校验在 handleTaskCreate（非法值当场 400，不静默吞掉）。
+    allowedTools: Array.isArray(body.allowedTools)
+      ? body.allowedTools.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
+      : undefined,
   }
 }
 

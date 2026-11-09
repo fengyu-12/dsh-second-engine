@@ -20,10 +20,15 @@ function within(root, paths) {
 async function commitBeforeDelete(root, relPaths, date) {
   const paths = within(root, relPaths)
   if (!paths.length) throw new Error('refusing paths outside repository')
-  await execFileAsync('git', ['-C', root, 'add', '--', ...paths], { timeout: 30000 })
+  // 2026-11-10：显式带身份。本机 /root/proj 未配 git 全局身份，缺这组参数时 commit 报
+  // `Author identity unknown`，而 commit 失败会抛错、跳过后面的 unlink ⇒ archive 永远删不掉
+  // （实测 auto-cleanup.last.json 里 3 条 delete 全因此失败）。用 -c 传、不写全局配置，
+  // 避免污染本机其它 repo。
+  const identity = ['-c', 'user.name=board-cleanup', '-c', 'user.email=board-cleanup@localhost']
+  await execFileAsync('git', ['-C', root, ...identity, 'add', '--', ...paths], { timeout: 30000 })
   // 带 pathspec 的 commit：只提交这些路径，**不会**把索引里其它已暂存内容一起提交。
   // （2026-11-07 修：原写法是裸 commit，工作树里有别人 staged 的改动时会被裹进这次清理提交。）
-  await execFileAsync('git', ['-C', root, 'commit', '--allow-empty', '-m', `board: auto-cleanup before prune ${date}`, '--', ...paths], { timeout: 30000 })
+  await execFileAsync('git', ['-C', root, ...identity, 'commit', '--allow-empty', '-m', `board: auto-cleanup before prune ${date}`, '--', ...paths], { timeout: 30000 })
 }
 async function attempt(summary, label, action) {
   try { await action(); summary.actions.push(label) }

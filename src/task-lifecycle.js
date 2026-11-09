@@ -244,7 +244,7 @@ function claudeDefaultModel() {
 }
 
 /** Claude Code 的按引擎启动（形状照 startPiTask；差异只在凭证来源与 runtime 的 done() 调用）。 */
-export function startClaudeTask({ res, id, outPath, workdir, prompt, model, boardId }) {
+export function startClaudeTask({ res, id, outPath, workdir, prompt, model, allowedTools, boardId }) {
   const cred = claudeCredentials()
   if (cred === null) {
     return send(res, {
@@ -284,6 +284,9 @@ export function startClaudeTask({ res, id, outPath, workdir, prompt, model, boar
         workdir,
         outPath,
         model: (typeof model === 'string' && model !== '') ? model : claudeDefaultModel(),
+        // 2026-11-10：透传给 buildArgs（claude-runtime.js 把整个 spec 交给 buildArgs，
+        // 后者 normalizeTools 在缺省时回退 DEFAULT_ALLOWED_TOOLS）。
+        allowedTools: Array.isArray(allowedTools) && allowedTools.length > 0 ? allowedTools : undefined,
         env: {
           ANTHROPIC_BASE_URL: cred.baseUrl,
           ANTHROPIC_AUTH_TOKEN: cred.token,
