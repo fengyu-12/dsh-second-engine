@@ -14,11 +14,13 @@ export function projectBoard(board) {
   }))
   const done = (task) => task.status === 'completed' || task.status === 'abandoned'
   const dependent = (task) => Boolean(task.blocked_by?.length)
+  // 有意对齐 board.sh ready：仅 completed 满足依赖，pending/blocked 前置齐全即可开工。
+  const completed = new Set(tasks.filter((task) => task.status === 'completed').map((task) => task.id))
   // 派生集合只放 id，避免让调用方误把集合当作另一份可写任务真值。
   return {
     ok: true,
     board: { revision: board?.revision ?? 0, tasks },
-    ready: tasks.filter((t) => t.status === 'pending' && !dependent(t)).map((t) => t.id),
+    ready: tasks.filter((t) => ['pending', 'blocked'].includes(t.status) && (t.blocked_by || []).every((id) => completed.has(id))).map((t) => t.id),
     blocked: tasks.filter((t) => !done(t) && (t.status === 'blocked' || dependent(t))).map((t) => t.id),
     done: tasks.filter(done).map((t) => t.id),
   }

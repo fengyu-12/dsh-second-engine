@@ -435,6 +435,10 @@ def cmd_complete(a) -> None:
                       [dict(t, recorded_at=now_utc())])
         # v1.3 §12.1：完成即出板，板上只留在办/挂起；§12.4：channel 只留窗口
         data["tasks"] = [x for x in data["tasks"] if x.get("id") != a.id]
+        # 有意对齐 board.sh ready：终态出板须移除依赖引用，否则依赖方永久卡住。
+        for dependent_task in data["tasks"]:
+            if a.id in (dependent_task.get("blocked_by") or []):
+                dependent_task["blocked_by"] = [b for b in dependent_task["blocked_by"] if b != a.id]
         commit(data, f"{a.id} 完成（目的达成）· 出板")
         save_board(data)
         _channel_note(f"{a.id} ✔ 目的达成：{summary}")
