@@ -82,6 +82,7 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 - **交活一律走 `dispatch.sh`**：自动注入收件箱未读段、附协作纪律、在交付**前**记基线 commit 与工作区脏快照到 `.dispatch/<task id>.base`；交付后用 `board.sh scope-check <id>` 机械校验写范围越界。
 - **看板**：`board.json` —— 状态 `pending / in_progress / blocked / completed / abandoned`（**无 reopen**，completed 不可复改）；工单三字段：`task`（用户原话，不可变）/ `context`（DSH 侧 agent 解读）/ `frame`（质疑前提是分内事，由工具自动写入）。
 - **收件箱**：`inbox-codex.md` / `inbox-lead.md` 双向留言（经 `board.sh inbox-append`），已读标注 + 按月 JSONL 转档（`archive/`）；交付必含四段：交付 / **异议位** / 下一步建议 / 自验。
+- **只读投影端点 `GET /api/board`**（2026-11-10 起）：把 `board.json` 投影成 `{ok,board:{revision,tasks},ready,blocked,done}`，**纯读、不写板**；`ready/blocked/done` 是任务 id 数组，供悬浮球与外部面板直接消费，不必自己解析板子。派生规则：`ready`=pending 且无 `blocked_by`；`blocked`=status 为 blocked 或依赖未完成；`done`=completed/abandoned。任务对象里的 `engine` 已做回退填充（`tasks[].engine` 为空时取 `roles[owner].engine`），所以调用方不需要再查 roles 才能分组。板文件路径按 `DUAL_BOARD_DIR` → `~/proj/dual-board` 解析；文件缺失/解析失败回 404 而不是 500（原子写入下会重读一次）。悬浮球中段在此基础上按 codex / claude code / pi 分组，**只在有 running 任务时出现**，且过滤掉 `engine=dsh` 与 `owner=lead`。
 - **可开工引导 `board.sh ready`**（v1.4 起）：只读列出「前置已满足」的下一步，与 `claim` 的依赖门互补（claim 是拒绝、ready 是引导；空态退出码 0）。
 - **过程级检索 `trace_search.py`**（v1.4 起）：`list` / `search` / `get` 三档，在历史会话 rollout 里按关键词找**过程证据**（不只找结论），`--exclude-session` 可排除自己。
 - **双通道**：短任务走 `/api/task`（ephemeral 零记忆，保互审独立性）；长任务 `codex exec resume <thread_id>` 成员会话（一条链绑一个任务，看板 `session` 字段登记，收工归档）。
@@ -391,6 +392,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 - **工单是异步的**：`POST /api/task` 拿到 `{id}` 就可以走人，**完成经 App 通知提醒**；等结果用
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
+- **按单次工单开工具（`allowedTools`，2026-11-10 起）**：`POST /api/task` 的 body 可加 `"allowedTools":["Read","Write","Edit","Bash","WebSearch"]`，**只对这一单生效**；不传仍是默认四件套 `Read/Write/Edit/Bash`，形状不对（非字符串数组）当场 400。目前只有 **Claude 引擎**消费该字段（Claude 有 `--allowedTools` 这个 CLI 面），Codex/Pi 忽略它。用途：默认不给 `WebSearch`，需要联网的工单显式开，避免所有工单都带搜索能力（中转不支持时会每次报错）。
 - **复核接力**：`POST /api/review` 可带 `"prev":"<上一轮复核id>"`——首轮自动附上一轮未决问题对照。
 
 ## 终端启动器：codex-env / claude-env / pi
@@ -455,13 +457,12 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.1.1）
+## 支持能力一览（v4.2.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **4.1.1 Claude 终端启动器 + 账本自动清理** | ✅ 4.1.1 | ① **新增 `claude-env` 终端启动器**（`bridge/claude/claude-env`）：按四级优先级注入 `ANTHROPIC_*`（环境变量 → `~/.claude/settings.json` → `claude-providers.json` → keyring deepseek 兜底）后进 TUI，支持 `-c` 续最近 / `-r` 选会话 / `-u` 打印桥网址；`install.sh` 新增 `--with-claude-env` ② **README 新增「终端启动器」章节**：codex-env / claude-env / pi 三引擎启动方式、会话共享边界、首次启动注意 ③ **dual-board 账本自动清理**（`src/board-auto-cleanup.js`）：复用 6 小时 tick，`audit/*` 30 天、`inbox-*` 已读归档 / 未读 7 天标 `expired-unread`、`channel.md` 先归档后裁剪，删除前必先 `git commit <paths>`；`board_tool.py inbox-archive` 新增 `--expire-unread-before` ④ **skill 精简**：删除「命令行降级」节（终端用法归 README），闸门表与 refs 同步清理 |
-| **4.1.0 孤儿进程兜底 + 复核回合制 + 回归网** | ✅ 4.1.0 | ① **孤儿进程兜底**：`spawnLimited` 加 `detached:true` + `killGroup`（进程组回收，连孙进程一起）；`process.on('exit')` + SIGTERM/SIGINT 钩子清组；killGroup 失败落审计；补三个漏洞（reconcile 判失联后仍起新轮 / 异常路径不杀 child / 取消无强制 finalize） ② **复核改回合制**：`REVIEW_DEFAULT_ROUNDS` 3→1；首轮去 `--ephemeral`，第 2 轮起 `exec resume <threadId>` 续同一会话（不再回灌 prev/reply），resume 失败回退新开；用量优先取 `turn.completed.usage`（resume 轮标疑似累计） ③ **回归网**：smoke 第 11 段（blocked / responses / 严格 schema 三条断言，做过反证：删枚举即变红）；`npm test` 接入（18 用例，含 `probe-task-lost` 失联检测 4 案）；JS 侧 `/proc` 端口兜底 ④ **`tools/engine-audit.sh`**：新引擎接入 12 项机械检查，`codex\|pi\|claude` 三引擎全绿 ⑤ **结构债**：反向 import 9→6（`index.js` −275 行、`core.js` +310 行），剩余 6 处全为运行时绑定 ⑥ **skill**：503→491 行，去重（能力契约单源化到 §2.5、并发规则两处改指针），分工按引擎契约重写、不写死模型分数 |
-| **4.0.0 第三引擎 Claude Code + 桥与复核增强** | ✅ 4.0.0 | ① **接入 Claude Code 作第三引擎**：`ENGINES` 加 `claude`（Anthropic 血统），`claude -p` 双向 NDJSON 常驻，桥端口 8789；`registry` / 三处引擎白名单 / 工作区 `~/claude-workspace` / 知识层 `CLAUDE.md` 全部对齐 ② **桥**：新增 `POST /api/bridge/session`（`new` / `switch`，不用编一条假消息就能切会话）；三家桥把思考统一转成 `act` 条目并带 `full`，前端点一下展开全文；Pi 桥补齐**会话历史**（`/api/threads` 读 `~/.pi/agent/sessions`、`/api/transcript?id=`、`switch_session` 切过去继续聊）；新增 **Pi 皮肤**（浅色青 / 深色紫）③ **复核**：判据冻结 + stale（`/api/review` 可带 `files`，复核期间被审文件变了就不发布旧结论）；输出改严格 JSON（`verdict` + `findings[{severity,file,line,issue,evidence}]`，不合 schema 判无效复核）；派活前置校验（`timeoutMs` / `acceptance` 非法当场 400）④ **修三个真 bug**：切会话时 `stdin.end()` 之后再写导致 `ERR_STREAM_WRITE_AFTER_END` **把整座桥带走**（现在写前检查 `writable`，且桥的 stderr 落 `claude-bridge.log`、异常打 `[fatal]` 栈）；派单默认 `workdir` 按 **active 引擎** 算而不是任务引擎（active=claude 时派 pi 单会落进 `~/claude-workspace`）；桥崩溃零日志（原来 `stdio:'ignore'`）⑤ **MCP**：Claude 的 MCP 走 `--mcp-config`，设置页可增删（停用搬到旁路文件，不动启用清单） |
+| **4.2.0 看板投影端点 + 悬浮球活动任务区** | ✅ 4.2.0 | ① **只读 `GET /api/board`**（`src/board-project.js`）：把 `board.json` 投影成 `{ok,board:{revision,tasks},ready,blocked,done}`，`ready/blocked/done` 为任务 id 数组；`tasks[].engine` 为空时按 `roles[owner].engine` 回退填充（实测 T5 的 `engine:null` 被还原成 `codex`）；路径按 `DUAL_BOARD_DIR` → `~/proj/dual-board` 解析，文件缺失/解析失败回 404 不 500，解析失败重读一次兜原子替换 ② **悬浮球活动任务区**（`lib/client.js`）：只在「长任务配合」档位出现，切回普通复核/协作提议即恢复原三块；三引擎改独立胶囊（flex-wrap + gap），该组有 `running/in_progress` 胶囊亮绿边框 + 呼吸圆点 + 光晕脉冲（纯 CSS，只动 opacity/transform/box-shadow，带 `prefers-reduced-motion` 降级），过滤 `engine=dsh` 与 `owner=lead`；工单区改 `listOnly`（只留标题 + 反馈列表，去掉输入区） ③ **`/api/task` 支持 `allowedTools`**：按单次工单临时开 Claude 工具（如 `WebSearch`），不传仍默认 `Read/Write/Edit/Bash`，形状不对当场 400；实测带 `WebSearch` 派单返回真实来源链接，不带时仍按默认四工具 ④ **`board.sh --engine` 补 `claude`**：原先 choices 只有 dsh/codex/pi，claude 引擎的板任务建不出来（`DEFAULT_ROLES` 本来就有 claude） ⑤ **修 `board-auto-cleanup` 的 git 身份缺失**：`/root/proj` 无全局身份时 commit 报 `Author identity unknown`，commit 失败会跳过后面的 unlink ⇒ archive 永远删不掉；改为 `git -c user.name/user.email` 传入，不污染全局配置 ⑥ **smoke 新增断言**：`lib/client.js` 的 `boardGroups` 必须等于 `ENGINES` 键集合，加引擎时浮球静默漏显示会被拦住 |
+
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
