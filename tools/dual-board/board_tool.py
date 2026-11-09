@@ -1040,7 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--task", required=True); sp.add_argument("--context", default="")
     sp.add_argument("--scope", default=""); sp.add_argument("--blocked", default="")
     sp.add_argument("--acceptance", default=""); sp.add_argument("--session", default=None)
-    sp.add_argument("--engine", choices=["dsh", "codex", "pi"], default=None)
+    sp.add_argument("--engine", choices=["dsh", "codex", "pi", "claude"], default=None)
     add_cas(sp); sp.set_defaults(func=cmd_new)
 
     sp = sub.add_parser("claim", help="认领（设 owner + in_progress）")
@@ -1075,7 +1075,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set", help="更新字段 key=value")
     sp.add_argument("id"); sp.add_argument("pairs", nargs="+"); add_cas(sp)
     sp.set_defaults(func=cmd_set)
-    sp = sub.add_parser("roles", help="角色管理：show / set <role> --engine <dsh|codex|pi> [--inbox <file>]")
+    sp = sub.add_parser("roles", help="角色管理：show / set <role> --engine <dsh|codex|pi|claude> [--inbox <file>]")
     sp.add_argument("action", choices=["show", "set"])
     sp.add_argument("role", nargs="?", default=None)
     sp.add_argument("--engine", default=None)
