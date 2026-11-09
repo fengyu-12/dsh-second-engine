@@ -40,6 +40,7 @@ import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, appendFileSync, readFileSync, renameSync, openSync, createWriteStream } from 'node:fs'
 import { execFile, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
+import { handleBoard } from './board-project.js'
 import { runBoardAutoCleanup } from './board-auto-cleanup.js'
 import { registerBridgeRoutes } from './bridge-routes.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
@@ -1788,6 +1789,12 @@ export async function handleTaskCreate(req, res) {
       && !(Array.isArray(body.acceptance) && body.acceptance.every((x) => typeof x === 'string'))) {
       return send(res, { ok: false, error: 'acceptance 必须是字符串或字符串数组' }, 400)
     }
+    // 2026-11-10：allowedTools 只对 Claude 工单生效（Claude 有 --allowedTools 这个 CLI 面）。
+    // 明确传了但形状不对 → 400，不静默回退；不传 → 走默认四件套。
+    if (body.allowedTools !== undefined
+      && !(Array.isArray(body.allowedTools) && body.allowedTools.every((x) => typeof x === 'string' && x.trim() !== ''))) {
+      return send(res, { ok: false, error: 'allowedTools 必须是非空字符串组成的数组' }, 400)
+    }
     if (!existsSync(workdir)) {
       // 2026-11-05 用户裁定：**不自动创建**。工作区由使用者手动建立，
       // README「装之前要准备什么」里写明。插件只检查、不代建 —— 避免替人
@@ -1845,6 +1852,9 @@ export async function handleTaskCreate(req, res) {
         workdir,
         prompt,
         model: typeof body.model === 'string' ? body.model : undefined,
+        // 2026-11-10：按单次工单临时授权的工具（如 WebSearch）。不传 = undefined，
+        // claude-args 的 normalizeTools 回退默认四件套，全局白名单不变。
+        allowedTools: request.allowedTools,
       })
     }
 
@@ -2627,6 +2637,7 @@ export function apply(ctx) {
       // prefix：'prefix' 同时命中 /mcp 与 /mcp/<name>，DELETE 的名字从 URL 尾巴取。
       { kind: 'prefix', method: 'GET|POST|DELETE', path: '/second-engine/api/mcp', desc: 'GET 全部 [mcp_servers.*] 段；POST 新增 { name, url }（重名 409）或 /<name> 启用禁用 { enabled }；DELETE /<name> 删段（404）', handler: handleMcpRoot },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/_meta', desc: '路由自描述：遍历本注册表生成 {method,path,desc} 清单', handler: handleApiMeta },
+      { kind: 'exact', method: 'GET', path: '/second-engine/api/board', desc: '只读任务看板；ready/blocked/done 为任务 id 数组', handler: handleBoard },
     ]
     // GET /_meta（2026-10-26）：SKILL.md 不再手抄路由表，调用方以此端点自取；与其它 /api/* 同暴露面。
     function handleApiMeta(req, res) {
