@@ -1,11 +1,11 @@
 # 双引擎协作看板协议 v1.4（2026-10-14）
 
-> **v1.4 修订（2026-10-14，双方确认）**：新增 `board.sh ready`（只读列出「前置已满足、现在可开工」的下一步，§九.7）与 `trace_search.py` 过程级检索（§十三）；脚本唯一真身在插件 `tools/dual-board/`；`~/proj/dual-board/` **只放数据**（board.json / channel.md / inbox / archive），旧副本已于 2026-10-28 删除。提案：`proposals/proposal-v1.4-lead-20261014.md`。
+> **v1.4 修订（2026-10-14，双方确认）**：新增 `board.sh ready`（只读列出「前置已满足、现在可开工」的下一步，§九.7）与 `trace_search.py` 过程级检索（§十三）；脚本唯一真身在插件 `tools/dual-board/`；`~/proj/dual-board/` **只放数据**（board.json / channel.md / inbox / archive），旧副本已于 2026-10-28 删除。提案文件已归档（2026-11-10 清理，`proposals/` 目录按需重建）。
 
 > **v1.3 修订（用户裁定 A/B/C1）**：`board.json` 与 `channel.md` 是**工作窗口**（完成即清）、不是档案库；「归档」一词改指**待续**（还要继续），不再指已完成；完成判据 = **最初目的达成**；清空看板保留单调 `revision`。全文见 **§十二**。
 
 > 设计来源：DSH 官方"智能体团队"插件（任务看板/消息互通/写范围/CAS）+ 待办总清单第 4 条（挑水桶模型、三字段工单、异议位）。两执行方：**lead**（DSH 主 AI）与 **codex**（第二引擎）。
-> **v1.2 修订**：采纳 codex《v1.2 修订提案》六项（`proposals/v1.2-codex.md`），lead 对三处分歧裁决如下 —— ①**采纳**去掉 `reopen`（completed 不可复改，出问题开新任务引用旧任务）②**采纳** JSONL 按月归档 ③**不采纳**"inbox 标题改 UTC"，人类入口保留北京时（机器字段仍全 UTC，见 §十）。
+> **v1.2 修订**：采纳 codex《v1.2 修订提案》六项（提案文件已归档），lead 对三处分歧裁决如下 —— ①**采纳**去掉 `reopen`（completed 不可复改，出问题开新任务引用旧任务）②**采纳** JSONL 按月归档 ③**不采纳**"inbox 标题改 UTC"，人类入口保留北京时（机器字段仍全 UTC，见 §十）。
 > v1.1 修订：新增双通道与会话管理（§八）；修复首跑四条异议——CAS 加锁、收件箱标注权、scope 最小化。
 > **v1.2 核心变化：写板从"靠自觉的纪律"变成"唯一工具入口"** —— 见 §九。
 
@@ -21,7 +21,7 @@
 | `channel.md` | 实时流水（append-only，一行一事件） | 双方直写，禁改历史（§九.5） |
 | `archive/` | 归档区：`tasks-YYYY-MM.jsonl`、`inbox-<who>-YYYY-MM.jsonl` | 只经 `board.sh archive` 追加 |
 | `.dispatch/` | 派单基线记录 `<task id>.base`（JSON：commit/workdir/scopes） | 只经 `dispatch.sh` 写 |
-| `proposals/` | 协议修订提案（提案不改正文） | 双方可写 |
+| `proposals/` | 协议修订提案（提案不改正文）；**当前目录不存在**，需提新提案时再建 | 双方可写 |
 | `trace_search.py` | 跨会话过程检索（只读）：list / search / get（§十三） | 双方可执行 |
 | `PROTOCOL.md` | 本协议 | 双方提议 → 对方确认后改 |
 
