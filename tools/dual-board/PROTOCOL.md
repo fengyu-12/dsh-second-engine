@@ -65,7 +65,7 @@ pending ──claim──> in_progress ──complete──> completed（终态�
 
 **写范围**：只许改 `write_scopes` 列出的路径，lead 派单时按单最小化，不许用整仓范围省事。没有列出 = 只读。v1.2 起由 §九.4 的 `scope-check` 机械校验。
 
-**依赖**：`blocked_by` 里的任务没到 completed，本任务不得开工（`board.sh claim` 会拒绝，退出码 4）。
+**依赖**：`blocked_by` 里的任务没到「已了结」（completed ∪ abandoned），本任务不得开工（`board.sh claim` 会拒绝，退出码 4）。⚠️ `abandoned` 不算完成但**解锁依赖方**（2026-11-10 方案 B）：`claim`/`ready` 放行，stderr 告警，缺前置产出的风险由派单方承担。
 
 ## 三、消息互通（两个收件箱）
 
