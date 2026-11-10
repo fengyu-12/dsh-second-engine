@@ -120,7 +120,7 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 2026-10-31：发布包按 package.json.files 打包，不含开发件（selftest / smoke 自身 /
   # lint 配置 / 回归脚本 / pi-cards 留档）。装发布包后加载层必然缺它们 ⇒ 不纳入三方比对，
   # 否则「正确安装发布包」会把 smoke 判红。
-  DYNAMIC=$(git -C "$ROOT" ls-files 2>/dev/null | grep -E '\.(js|mjs|cjs)$' | grep -vE '^(selftest-block\.mjs|tools/smoke\.sh|tools/lint-undef\.config\.mjs|tools/message-role-regression\.mjs|lib/pi-cards\.js)$' | grep -v '^tests/')
+  DYNAMIC=$(git -C "$ROOT" ls-files 2>/dev/null | grep -E '\.(js|mjs|cjs)$' | grep -vE '^(selftest-block\.mjs|tools/smoke\.sh|tools/lint-undef\.config\.mjs|tools/message-role-regression\.mjs|lib/pi-cards\.js|tools/dep-graph\.mjs|test/.*)$' | grep -v '^tests/')
   # 发布树有权不含的开发件（仍与生效层比对，缺了不算失败）
   # smoke.sh 自己与 eslint 配置只对「改插件的人」有意义，下游拿到没有用处 → 不进发布包（2026-10-29 定）
   PUB_OPTIONAL=" selftest-block.mjs tools/smoke.sh tools/lint-undef.config.mjs "

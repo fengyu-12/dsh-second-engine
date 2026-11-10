@@ -30,7 +30,7 @@
   "manager": "pnpm",
   "managerVersion": "not-executed",
   "integrity": "actual file tree SHA-256 and native pnpm lockfile",
-  "runtimeDsh": "0.2.1-rc.2",
+  "runtimeDsh": "0.2.2-rc.1",
   "authorClaims": {
     "_note": "version 2026-11-01 手工对齐 package.json；manifest/tree/lock hash 未重算（本机无读取方，且本文件不在 package.json files 白名单内、不入包）"
   }
