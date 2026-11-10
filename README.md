@@ -392,6 +392,7 @@ curl -s -X POST "$W/second-engine/api/task" \
 - **工单是异步的**：`POST /api/task` 拿到 `{id}` 就可以走人，**完成经 App 通知提醒**；等结果用
   `tools/wait-task.sh <id> [轮询间隔=5] [总超时=600]` 放进**后台 job**（完成通知自动唤醒等待者，退出码 `0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时`），
   **不要自己写 `sleep`+`curl` 轮询**。
+- **派单前机械校验（2026-11-10 起）**：`bash tools/dispatch-check.sh --engine codex --mode task --prompt "…"` 只读拉 `/api/status`，一条命令答出「当前档位 / 该走哪条通道 / prompt 缺哪句（协作提议档的 `LONGSESSION:`）/ 该引擎会不会判空产出」；有 error 时退出码 1。只读、不派单、不切档；`--json` 给机器读，`--status-json` 可离线注入状态。
 - **按单次工单开工具（`allowedTools`，2026-11-10 起）**：`POST /api/task` 的 body 可加 `"allowedTools":["Read","Write","Edit","Bash","WebSearch"]`，**只对这一单生效**；不传仍是默认四件套 `Read/Write/Edit/Bash`，形状不对（非字符串数组）当场 400。目前只有 **Claude 引擎**消费该字段（Claude 有 `--allowedTools` 这个 CLI 面），Codex/Pi 忽略它。用途：默认不给 `WebSearch`，需要联网的工单显式开，避免所有工单都带搜索能力（中转不支持时会每次报错）。
 - **复核接力**：`POST /api/review` 可带 `"prev":"<上一轮复核id>"`——首轮自动附上一轮未决问题对照。
 
