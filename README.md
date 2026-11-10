@@ -471,10 +471,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.2.1）
+## 支持能力一览（v4.2.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **4.2.2 兼容声明对齐 + 回执误判修复** | ✅ 4.2.2 | ① `engines.dsh` 放宽为 `>=0.2.1-alpha.5 \|\| >=0.2.2-0`：0.2.2 的预发布版原本落在范围外，装不上只能靠 profile 精确豁免 ② mood-watch 回执校验改取「最后一条 user 之后」全部 assistant 段拼接，修掉一轮多段回复时误判「未交回执」导致的重复提醒；按 Codex 复核补 `role` 过滤（`tool` 消息里的 `[MW_ACK]` 曾被当成回执）③ README 新增「DSH 版本要求」段；新增 `tools/release-check.sh` 校验「及更早版本」分界线 / 能力表标题 / tag 三处对齐（分界线靠人记必失真：4.2.1 发布时还停在 3.8.5） |
 | **4.2.1 派单前机械校验 + board 两条护栏** | ✅ 4.2.1 | ① **新增 `tools/dispatch-check.sh`（103 行）+ 13 用例**：只读拉 `/api/status`，一条命令答出「当前档位 / 该走哪条通道 / prompt 缺哪句（协作提议档的 `LONGSESSION:`）/ 该引擎会不会判空产出」，有 error 退出码 1；`--json` 机器读、`--status-json` 离线注入；禁写词表刻意不含「只读」（真实工单里太常见会误报） ② **`board.sh new` 两条机械护栏**：`write_scopes` 与未了结任务求交 ⇒ exit 7（`--allow-overlap` 跳过并告警）；`blocked_by` 不存在 / 自依赖 / 间接环 ⇒ exit 4（迭代 DFS，审计 `completed` 允许作依赖）；新增 7 用例，`test_board_tool` 50 → 57 全绿 ③ **abandon 解锁依赖方（方案 B）**：`board_tool.py` 新增 `abandoned_ids` / `dependency_state`，`check_deps` 拆开 missing（仍 exit 4）与 abandoned（放行 + stderr 告警）；`ready --json` 增 `abandoned_deps`、文本加 `[dep-abandoned:…]`；`src/board-project.js` 的 ready 依赖集合改为 completed ∪ abandoned —— 放弃不再是死锁，但也不伪装成完成 ④ **skill §3.1 去重**：删三档对照表与查档位 curl，改为指针到 `dispatch-check.sh`（规则只留脚本一处）；5 处桥端口与 1 处行号引用改语义指向 ⑤ **补回缺失的 `references/ref-claude-runtime.md`**（SKILL.md 已引用，实体与发布树此前都没有） ⑥ **核实 Codex 成败判定**：无「外部产物」校验，只看 `exitCode`（0→done，其余→error），仅 `engine==='claude'` 走 `verifyClaudeEffect` |
 
 
