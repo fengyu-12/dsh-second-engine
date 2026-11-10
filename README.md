@@ -458,11 +458,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.2.0）
+## 支持能力一览（v4.2.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **4.2.0 看板投影端点 + 悬浮球活动任务区** | ✅ 4.2.0 | ① **只读 `GET /api/board`**（`src/board-project.js`）：把 `board.json` 投影成 `{ok,board:{revision,tasks},ready,blocked,done}`，`ready/blocked/done` 为任务 id 数组；`tasks[].engine` 为空时按 `roles[owner].engine` 回退填充（实测 T5 的 `engine:null` 被还原成 `codex`）；路径按 `DUAL_BOARD_DIR` → `~/proj/dual-board` 解析，文件缺失/解析失败回 404 不 500，解析失败重读一次兜原子替换 ② **悬浮球活动任务区**（`lib/client.js`）：只在「长任务配合」档位出现，切回普通复核/协作提议即恢复原三块；三引擎改独立胶囊（flex-wrap + gap），该组有 `running/in_progress` 胶囊亮绿边框 + 呼吸圆点 + 光晕脉冲（纯 CSS，只动 opacity/transform/box-shadow，带 `prefers-reduced-motion` 降级），过滤 `engine=dsh` 与 `owner=lead`；工单区改 `listOnly`（只留标题 + 反馈列表，去掉输入区） ③ **`/api/task` 支持 `allowedTools`**：按单次工单临时开 Claude 工具（如 `WebSearch`），不传仍默认 `Read/Write/Edit/Bash`，形状不对当场 400；实测带 `WebSearch` 派单返回真实来源链接，不带时仍按默认四工具 ④ **`board.sh --engine` 补 `claude`**：原先 choices 只有 dsh/codex/pi，claude 引擎的板任务建不出来（`DEFAULT_ROLES` 本来就有 claude） ⑤ **修 `board-auto-cleanup` 的 git 身份缺失**：`/root/proj` 无全局身份时 commit 报 `Author identity unknown`，commit 失败会跳过后面的 unlink ⇒ archive 永远删不掉；改为 `git -c user.name/user.email` 传入，不污染全局配置 ⑥ **smoke 新增断言**：`lib/client.js` 的 `boardGroups` 必须等于 `ENGINES` 键集合，加引擎时浮球静默漏显示会被拦住 ⑦ **修依赖解锁的两处不一致**：`board.sh ready` 与 `/api/board` 的 ready 曾给出不同答案 —— `src/board-project.js` 改为同口径（`blocked_by` 每一项都须在已完成集合里，`pending`/`blocked` 都可 ready）；`cmd_complete` 出板时同步摘掉其它任务 `blocked_by` 里指向本任务的 id，否则依赖方永久卡住。对照实验：T1 出板后 T2 的 `blocked_by` 变空、两侧 ready 都给 `["T2"]` |
+| **4.2.1 派单前机械校验 + board 两条护栏** | ✅ 4.2.1 | ① **新增 `tools/dispatch-check.sh`（103 行）+ 13 用例**：只读拉 `/api/status`，一条命令答出「当前档位 / 该走哪条通道 / prompt 缺哪句（协作提议档的 `LONGSESSION:`）/ 该引擎会不会判空产出」，有 error 退出码 1；`--json` 机器读、`--status-json` 离线注入；禁写词表刻意不含「只读」（真实工单里太常见会误报） ② **`board.sh new` 两条机械护栏**：`write_scopes` 与未了结任务求交 ⇒ exit 7（`--allow-overlap` 跳过并告警）；`blocked_by` 不存在 / 自依赖 / 间接环 ⇒ exit 4（迭代 DFS，审计 `completed` 允许作依赖）；新增 7 用例，`test_board_tool` 50 → 57 全绿 ③ **abandon 解锁依赖方（方案 B）**：`board_tool.py` 新增 `abandoned_ids` / `dependency_state`，`check_deps` 拆开 missing（仍 exit 4）与 abandoned（放行 + stderr 告警）；`ready --json` 增 `abandoned_deps`、文本加 `[dep-abandoned:…]`；`src/board-project.js` 的 ready 依赖集合改为 completed ∪ abandoned —— 放弃不再是死锁，但也不伪装成完成 ④ **skill §3.1 去重**：删三档对照表与查档位 curl，改为指针到 `dispatch-check.sh`（规则只留脚本一处）；5 处桥端口与 1 处行号引用改语义指向 ⑤ **补回缺失的 `references/ref-claude-runtime.md`**（SKILL.md 已引用，实体与发布树此前都没有） ⑥ **核实 Codex 成败判定**：无「外部产物」校验，只看 `exitCode`（0→done，其余→error），仅 `engine==='claude'` 走 `verifyClaudeEffect` |
 
 
 > 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
