@@ -211,6 +211,19 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 
 ## 装之前要准备什么
 
+### DSH 版本要求
+
+本插件的兼容范围以 `package.json` 的 `engines.dsh` 为准：**`>=0.2.1-alpha.5 || >=0.2.2-0`**
+（DSH 0.2.1 起，含 0.2.2 的预发布版）。声明范围外的版本，plugin manager 会在启动时判为不兼容、
+不加载该插件，并在启动诊断里报出包名与版本。
+
+确需在其他版本试跑，用**精确豁免**（只对该插件版本 + 该 DSH 版本生效，升级不继承）：
+
+```sh
+dsh plugin --profile web allow-version dsh-second-engine@<插件版本> --dsh-version <当前 DSH 版本> --accept-risk
+```
+
+
 ### 工作区目录（**必须手动创建**）
 
 插件**不会**自动创建工作区。首次派单前按引擎建好：
@@ -465,7 +478,7 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 | **4.2.1 派单前机械校验 + board 两条护栏** | ✅ 4.2.1 | ① **新增 `tools/dispatch-check.sh`（103 行）+ 13 用例**：只读拉 `/api/status`，一条命令答出「当前档位 / 该走哪条通道 / prompt 缺哪句（协作提议档的 `LONGSESSION:`）/ 该引擎会不会判空产出」，有 error 退出码 1；`--json` 机器读、`--status-json` 离线注入；禁写词表刻意不含「只读」（真实工单里太常见会误报） ② **`board.sh new` 两条机械护栏**：`write_scopes` 与未了结任务求交 ⇒ exit 7（`--allow-overlap` 跳过并告警）；`blocked_by` 不存在 / 自依赖 / 间接环 ⇒ exit 4（迭代 DFS，审计 `completed` 允许作依赖）；新增 7 用例，`test_board_tool` 50 → 57 全绿 ③ **abandon 解锁依赖方（方案 B）**：`board_tool.py` 新增 `abandoned_ids` / `dependency_state`，`check_deps` 拆开 missing（仍 exit 4）与 abandoned（放行 + stderr 告警）；`ready --json` 增 `abandoned_deps`、文本加 `[dep-abandoned:…]`；`src/board-project.js` 的 ready 依赖集合改为 completed ∪ abandoned —— 放弃不再是死锁，但也不伪装成完成 ④ **skill §3.1 去重**：删三档对照表与查档位 curl，改为指针到 `dispatch-check.sh`（规则只留脚本一处）；5 处桥端口与 1 处行号引用改语义指向 ⑤ **补回缺失的 `references/ref-claude-runtime.md`**（SKILL.md 已引用，实体与发布树此前都没有） ⑥ **核实 Codex 成败判定**：无「外部产物」校验，只看 `exitCode`（0→done，其余→error），仅 `engine==='claude'` 走 `verifyClaudeEffect` |
 
 
-> 3.8.5 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+> 4.2.1 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## Codex 升到 0.166.0 之后
 
