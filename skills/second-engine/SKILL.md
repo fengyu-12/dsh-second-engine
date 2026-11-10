@@ -19,13 +19,13 @@ description: 操作第二引擎（Codex/Pi/Claude Code，设置页切换）：�
 
 | 任务出现时 | 必须先读（绝对路径） | 带走什么结论 |
 |---|---|---|
-| 要操作 Pi：路径 / 事件格式 / 桥 / 新建与切换会话 / 能力契约 / 清理 / 版本 | `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md` | Pi 会话落在 `<cwd>` 分区、桥端口 8788、`agent_settled` 才是终点、成败只认 `stopReason=stop` |
+| 要操作 Pi：路径 / 事件格式 / 桥 / 新建与切换会话 / 能力契约 / 清理 / 版本 | `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md` | Pi 会话落在 `<cwd>` 分区、桥端口见该 ref、`agent_settled` 才是终点、成败只认 `stopReason=stop` |
 | 要查 Codex 现场：keyring / wireApi / CODEX_HOME / CLI / 凭证 / 中转站 | `<DSH 技能目录>/second-engine/references/ref-codex-facts.md` | config.toml 由 keyring 生成（别手改）、wireApi 判据、key 不进 argv |
 | 要升级 Codex，或升级后判断插件要不要动 | `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md` | npm 平台包是正选、三条检验的通过判据、只有执行链判不过才动插件 |
 | 要写看板 / 派长任务链 / 查 board 子命令 | `<DSH 技能目录>/second-engine/references/ref-dual-board.md` | `board.sh` 是唯一写入口、出板必须 `--reviewed-by human`、`--workdir` 必须绝对路径 |
 | 要决定派给谁 / 写执行方边界 / 评估编排安全 / 查同类项目 | `<DSH 技能目录>/second-engine/references/ref-dispatch-routing.md` | 路由二分法（我 / 第二引擎；其他执行方看各自 skill）、每单边界写死、隔离实测 4 条 ⇒ 只能「限额+留痕+可回滚」 |
 | 派单核对 / 执行模式切换 / 唤醒端点 / 提醒通道 | `<DSH 技能目录>/second-engine/references/ref-dispatch-drill.md` | 能被一条命令验证的描述落笔前先跑过它、复核恒走 exec、`VAR=key cmd` 会进 argv 被 ps 看到、wake 要 `session-<uuid>` 前缀 |
-| 要操作 Claude Code：路径 / provider / 模型 / 档位 / 桥 / 会话 / 外部事实验收 | `<DSH 技能目录>/second-engine/references/ref-claude-runtime.md` | 顶层 `active` 是 id 不是布尔、`--model/--effort` 改了要重建进程、会话是两层目录、桥 8789 双向 NDJSON |
+| 要操作 Claude Code：路径 / provider / 模型 / 档位 / 桥 / 会话 / 外部事实验收 | `<DSH 技能目录>/second-engine/references/ref-claude-runtime.md` | 顶层 `active` 是 id 不是布尔、`--model/--effort` 改了要重建进程、会话是两层目录、桥（端口见该 ref）双向 NDJSON |
 | 选 Pi / Codex / Claude Code | `<DSH 技能目录>/second-engine/references/ref-engine-pick.md` | 要「审」/流式进度/web_search 走 Codex、多 provider 并存走 Pi、切完旧单不迁移 |
 
 ---
@@ -253,7 +253,7 @@ curl -s -X POST "$W/second-engine/api/task" -H 'Content-Type: application/json' 
 7. 只凭 `.done`、`/api/send` 的 `end`、或 agent 自报 **不得收工**；自报**不能单独**作证据，必须补一份独立证据。
 8. **Codex 在干活**：`status=running` 且 `liveBytes` 增长；`exitCode` 有值才落定。
 9. **Pi 在干活**：会话 jsonl 事件数在涨；末条 `stopReason` = `stop` 成功 / `error` 跑挂 / `aborted` 取消。**判 Pi 在不在干活不看 `ps`**（改看会话事件）；查并发叠跑仍看 `ps`（见 3.12）。
-   ⚠️ **只对桥/CLI 成立**：`/api/task` 派单走 `--mode rpc --no-session`（`pi-rpc-runtime.js:536`），**不写会话文件**——`~/.pi/agent/sessions` 下实测零文件。派单通道别去找 jsonl（也没有 `liveBytes`），只看 `status` 与 `output` 有无内容。
+   ⚠️ **只对桥/CLI 成立**：`/api/task` 派单走 `--mode rpc --no-session`（`pi-rpc-runtime.js` 里搜 `--mode rpc --no-session`），**不写会话文件**——`~/.pi/agent/sessions` 下实测零文件。派单通道别去找 jsonl（也没有 `liveBytes`），只看 `status` 与 `output` 有无内容。
 10. 合并到**最终树**后再跑同一组测试（验收对象是合入后的树，不是 agent 副本）。
 11. 失败最多**返工两轮**；第三轮改拆单 / `block` / 主 AI 接手。
 12. 验收后清标记与临时目录；下一单开工前拒绝残留。
@@ -289,7 +289,7 @@ bash tools/dual-board/board.sh claim T1 --owner lead    # claim 时自动记 bas
 
 # ② 派单（二选一，按需）
 #   a) 短工单 → POST /second-engine/api/task（面板可见、拿 task.output）
-#   b) 长交互 → 起 Web 桥（Pi 8788 / Codex 3095），POST /api/send
+#   b) 长交互 → 起 Web 桥（端口见各自启动脚本），POST /api/send
 #   ★ 工单末尾统一加一句：
 #     「做完后执行 board.sh complete T1 --result "<改了什么 + 自测命令与输出>"」
 
@@ -311,7 +311,7 @@ bash tools/dual-board/accept.sh T1 --test "python3 -m unittest discover -s tests
 
 ### 桥与工单可以同时
 
-- active 引擎只决定 `/api/task` 派给谁；桥是独立进程（Codex 3095 / Pi 8788 / Claude 8789），互不挤占
+- active 引擎只决定 `/api/task` 派给谁；桥是独立进程（各自端口不同，见启动脚本 / ref），互不挤占
 - 所以「桥跑长任务 + 工单跑短任务」是合法的并行姿势
 - 但**同一 agent 同一会话只跑一单**；换主题：Pi 桥走 `new_session`、Claude 桥重建进程、Codex 桥走 `thread/start`（三家 2026-11-06 对齐，都不必重启桥）。若自己起 `pi --mode rpc` 或走 CLI，可直接 `new_session` / `--session-id` 切会话，不必重启进程（详见 `references/ref-pi-runtime.md §11`）
 - 两条通道各自记账：`board.sh new` 两个任务，各自 `claim --owner`
@@ -320,34 +320,30 @@ bash tools/dual-board/accept.sh T1 --test "python3 -m unittest discover -s tests
 
 **只跨引擎多开**（Codex + Pi + Claude；同引擎两桥边际收益低）。**桥没有 `task.output` ⇒ 必须各自 `board.sh new` 记账**；`BRIDGE_STATE_DIR` **一桥一目录**（`.pid`/`.as.pid`/`.token` 会互相覆盖）；收尾 `ctl.sh stop` + Pi 桥按精确 PID 结束。三条启动命令、端口组合与进程数实测 → `references/ref-dual-board.md` §8。
 
-## 3.1 派单前：查档位与发法（2026-10-25 定 · 责任在主 AI 不在 Codex）
+## 3.1 派单前：先跑机械校验（2026-11-10 起）
 
-**同一张工单，三档三种发法。** 主 AI 没有推送通道，档位只能自己查，别凭上一轮印象：
+**责任在主 AI 不在 Codex**：主 AI 没有推送通道，档位只能自己查。**先跑这条**（只读、不派单、不切档）：
 
 ```bash
-curl -s "$DSH_WEB_URL/second-engine/api/status" | python3 -c "import sys,json;print(json.load(sys.stdin)['collab'])"
+bash tools/dispatch-check.sh --engine <codex|pi|claude> --mode <task|review|longtask> --prompt-file <单文件>
 ```
 
-同一个回包也带 `engine.active`（当前引擎）；切引擎用 `POST /api/config {"engine":"codex"}`，见 §0.4。拿到 `preset` 就照下面表格发。**查不到（接口挂、字段缺）一律按 `review` 兜底**，不猜。
+它读真实 `/api/status`，一次给出「当前档位 / 该走哪条通道 / prompt 缺哪句 / 该引擎会不会判空产出」，有 error 退出码 1。
+**三档对照与 R1–R9 规则只在脚本里，本 skill 不复述** —— 文档和脚本讲同一件事，两份必然漂移。接口查不到时脚本按 `review` 兜底。
+⚠️ 脚本只管机械项；「切档是用户裁决」「独立复核照样走单次工单」这类判断仍在本 skill（§2.2 / §2.3）。
 
-**collab 两位**（一切现状以 `collab` 字段为准，本节不复述代码行为；优先级链 env `SECOND_ENGINE_VOICE`/`SECOND_ENGINE_LONGTASK` > `~/.dsh/second-engine-collab.txt` > 默认，逐位独立）：
-- **位 1 `voice`**：`on` = `~/.codex/AGENTS.md` 有「主动开口」段（允许它推荐自己）；`off` = 无。
-- **位 2 `longtask`**：`auto` = 分阶段任务直接开长会话 + dual-board；`manual` = 升级走漏斗三判据。**只影响主 AI 派单，不写进 AGENTS.md**。
-- 预设：`review`(off/manual) / `propose`(on/manual) / `longtask`(on/auto) / `custom`(off/auto，只能显式两位表达)。
-- **切档是用户裁决，主 AI 不擅自 POST `/api/config`**；`voice=on` 是**许可不是分支**（独立复核照样走单次工单）。拨档（UI 未上线前）：
-  `curl -s -X POST "$DSH_WEB_URL/second-engine/api/config" -H 'Content-Type: application/json' -d '{"preset":"…"}'`（回包 collab + `agentsWritten:true` 表示 AGENTS.md 已同步，仅 voice 档有段）
+**collab 两位**（脚本会打出值，含义在这里）：
+- `voice`：`on` = `~/.codex/AGENTS.md` 有「主动开口」段（允许它推荐自己）；`off` = 无。
+- `longtask`：`auto` = 分阶段任务直接开长会话 + dual-board；`manual` = 升级走漏斗三判据。只影响主 AI 派单，不写进 AGENTS.md。
+- 优先级链：env `SECOND_ENGINE_VOICE` / `SECOND_ENGINE_LONGTASK` > `~/.dsh/second-engine-collab.txt` > 默认，逐位独立。预设：`review`(off/manual) / `propose`(on/manual) / `longtask`(on/auto) / `custom`(off/auto)。
+- **切档是用户裁决**，主 AI 不擅自 `POST /api/config`；`voice=on` 是**许可不是分支**（独立复核照样走单次工单）。
+
+**长任务档的落法**（脚本只给通道名，细节留这里）：`codex exec`（**不带** `--ephemeral`，手动注入 provider key）拿 thread id → `codex exec resume <完整 36 位 UUID>`；thread id 记 dual-board 的 `session` 字段。
+- 长会话不走 API 的原因：`POST /api/task` 固定 `--ephemeral` 不支持 resume；协议层虽有 `thread/resume` 但插件未暴露 ⇒ 只能 CLI 降级。
+- ⚠️ **8 位前缀会静默新建会话**：resume 必须给完整 36 位 UUID（`codex delete` 无 TTY 要 `--force`，同样要完整 UUID）。
+- `voice=on` 的 AGENTS.md 段保留，但触发由主 AI 在 prompt 里给，不靠教义自觉。
 
 **别指望 Codex 自己判断「何时该提议、何时该拉长」**——实测三次它都不遵守 AGENTS.md 里的业务策略指令（评估工单 / 简单工单 / 手动加「必须表态」全都不写），而格式指令（文件首行 `MARKER-OK`）照做 ⇒ **要它做什么，就在这次工单里说，别放全局教义**。
-
-| 模式 | 主 AI 派单时怎么做 |
-|---|---|
-| **普通复核（review）** | 一次性工单；不要求表态，也不要求提议 |
-| **协作提议（propose）** | 一次性工单 + **prompt 里明确要求**：「交付末尾给一行 `LONGSESSION: yes/no`；若 yes，说明你愿意接哪部分」。要提议就直接问，不等它自觉 |
-| **长任务配合（longtask）** | **不派工单**：`codex exec`（**不带** `--ephemeral`，手动注入 provider key）拿 thread id → `codex exec resume <完整 36 位 UUID>` 直接长会话；thread id 记 dual-board 的 `session` 字段 |
-
-- 长会话不走 API 的原因：`POST /api/task` 固定 `--ephemeral` 不支持 resume；协议层虽有 `thread/resume` 但插件未暴露 ⇒ 只能 CLI 降级。
-- ⚠️ **8 位前缀会静默新建会话**：resume 必须给完整 36 位 UUID（`codex delete` 无 TTY 要 `--force` 且同样要完整 UUID）。
-- `voice=on` 的 AGENTS.md 段保留（允许它主动接管），但触发由主 AI 在 prompt 里给，不靠教义自觉。
 
 ## 3.2 派单前：落交接单三行（黄灯协议，2026-10-31 立）
 
@@ -480,8 +476,8 @@ bash <插件目录>/tools/dual-board/dispatch.sh --help # 派单前注入未读�
 
 ## 4.3 引擎与本机现场（要细节就读 references）
 
-- **Pi**：路径对照、装法与工作区、事件格式（`agent_settled` / `stopReason` 白名单）、桥端口 8788 与 pid 读法、前端 NDJSON 契约、后端新建/切换会话（`new_session`/`switch_session`）、`capabilities` 单点定义与四个判据坑、AGENTS.md 双写、版本检查、模型真源优先序 → **要 Pi 的路径 / 事件格式 / 桥 / 能力契约 / 清理目标 / 版本检查时，读 `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md`**
+- **Pi**：路径对照、装法与工作区、事件格式（`agent_settled` / `stopReason` 白名单）、桥端口与 pid 读法、前端 NDJSON 契约、后端新建/切换会话（`new_session`/`switch_session`）、`capabilities` 单点定义与四个判据坑、AGENTS.md 双写、版本检查、模型真源优先序 → **要 Pi 的路径 / 事件格式 / 桥 / 能力契约 / 清理目标 / 版本检查时，读 `<DSH 技能目录>/second-engine/references/ref-pi-runtime.md`**
 - **Codex**：二进制与沙箱、keyring 与 config.toml 生成、🔴 wireApi 选法、`~/.codex` 现场查（工单 `.out.live` / rollout）、CLI 面与探针、凭证安全、中转站参数、智谱端点、`~/.codex` 目录维护 → **要 Codex 的路径 / keyring / wireApi / CODEX_HOME / CLI 现场 / 凭证 / 中转站时，读 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`**
 - **升级**：npm 平台包正选姿势、原子替换与回滚、升级后三条检验（只有执行链判不过才动插件）、🔴 升级后维护旧结论 → **要升级或升级后判断插件要不要改时，读 `<DSH 技能目录>/second-engine/references/ref-codex-upgrade.md`**
-- **Claude Code**：二进制与版本、provider 存储（顶层 `active` 是 id）、模型文件与切换、`--effort`、会话落盘两层目录、桥 8789 双向 NDJSON、新会话/续接、外部事实验收 → **要 Claude 的路径 / provider / 模型 / 档位 / 桥 / 会话 / 验收时，读 `<DSH 技能目录>/second-engine/references/ref-claude-runtime.md`**
+- **Claude Code**：二进制与版本、provider 存储（顶层 `active` 是 id）、模型文件与切换、`--effort`、会话落盘两层目录、桥（端口见该 ref）双向 NDJSON、新会话/续接、外部事实验收 → **要 Claude 的路径 / provider / 模型 / 档位 / 桥 / 会话 / 验收时，读 `<DSH 技能目录>/second-engine/references/ref-claude-runtime.md`**
 - **版本敏感结论**：版本号、feature 开关、CLI 面、逐版实测一律查 `<本机功能核对表>`，本文件与 references 都不记现状。
