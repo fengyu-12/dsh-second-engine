@@ -237,11 +237,36 @@ def completed_ids(data: dict) -> set:
     return ids
 
 
-def check_deps(data: dict, task: dict) -> None:
+def abandoned_ids(data: dict) -> set:
+    """已放弃的 id 集合（只看板）。abandon 是终态但不出板（只有 complete 出板），
+    所以不读审计——审计目录只有 completed-*.jsonl。
+    """
+    return {t["id"] for t in data["tasks"] if t.get("status") == "abandoned"}
+
+
+def dependency_state(data: dict, task: dict) -> tuple[list, list]:
+    """把 blocked_by 的不满足项拆成两类。
+
+    2026-11-10 定（方案 B）：abandon 是「放弃」不是「完成」，但它解锁依赖方。
+    否则依赖一个被放弃的任务会永久卡在 blocked。
+    返回 (missing, abandoned)：
+      - missing   仍然阻塞（退出码 4）
+      - abandoned 放行，但调用方必须显式提示——这一环是断的，下游开工可能缺前置产出
+    """
     done = completed_ids(data)
-    missing = [b for b in task.get("blocked_by") or [] if b not in done]
+    gone = abandoned_ids(data)
+    deps = task.get("blocked_by") or []
+    missing = [b for b in deps if b not in done and b not in gone]
+    abandoned = [b for b in deps if b in gone and b not in done]
+    return missing, abandoned
+
+
+def check_deps(data: dict, task: dict) -> None:
+    missing, abandoned = dependency_state(data, task)
     if missing:
         die(4, f"依赖未完成：{', '.join(missing)}")
+    if abandoned:
+        print(f"warn: 依赖已放弃，按约定解锁：{', '.join(abandoned)}", file=sys.stderr)
 
 
 def commit(data: dict, entry: str) -> None:
@@ -561,37 +586,40 @@ def cmd_failure(a) -> None:
 
 
 def cmd_ready(a) -> None:
-    """列出现在可以开工的任务：status ∈ {pending, blocked} 且 blocked_by 全部 completed。
+    """列出现在可以开工的任务：status ∈ {pending, blocked} 且 blocked_by 全部已了结（completed ∪ abandoned）。
+
+    abandon 是放弃不是完成，但解锁依赖方，并显式标出缺失前置产出的风险。
 
     与 cmd_claim 的状态门对齐（claim 接受 pending|blocked）：blocked 是「挂起待续」（协议 §12.1），
     前置齐了就该能被派，不能从 ready 里无声消失。
     只读：不加锁、不写盘、不改 revision、无任何副作用。
-    依赖判定复用既有 done/missing 语义（与 check_deps 一致）。
+    依赖判定复用 dependency_state（与 check_deps 一致）。
     """
     data = load_board()
-    done = completed_ids(data)
     ready, blocked = [], []
     for t in data["tasks"]:
         if t.get("status") not in ("pending", "blocked"):
             continue
-        missing = [b for b in t.get("blocked_by") or [] if b not in done]
-        (blocked if missing else ready).append((t, missing))
+        missing, abandoned = dependency_state(data, t)
+        (blocked if missing else ready).append((t, missing, abandoned))
 
     if getattr(a, "json", False):
         print(json.dumps({
             "revision": data.get("revision"),
             "ready": [{"id": t.get("id"), "subject": t.get("subject", ""),
-                       "blocked_by": t.get("blocked_by") or [], "owner": t.get("owner") or ""}
-                      for t, _ in ready],
+                       "blocked_by": t.get("blocked_by") or [], "owner": t.get("owner") or "",
+                       "abandoned_deps": abandoned}
+                      for t, _, abandoned in ready],
             "blocked": [{"id": t.get("id"), "subject": t.get("subject", ""), "missing": miss}
-                        for t, miss in blocked],
+                        for t, miss, _ in blocked],
         }, ensure_ascii=False, indent=2))
         return
 
-    for t, _ in ready:
-        print("%-10s %-40s blocked_by=%-20s owner=%s" % (
+    for t, _, abandoned in ready:
+        suffix = f" [dep-abandoned:{','.join(abandoned)}]" if abandoned else ""
+        print("%-10s %-40s blocked_by=%-20s owner=%s%s" % (
             t.get("id", "-"), (t.get("subject") or "")[:40],
-            ",".join(t.get("blocked_by") or []) or "-", t.get("owner") or "-"))
+            ",".join(t.get("blocked_by") or []) or "-", t.get("owner") or "-", suffix))
     print("ready: %d / blocked: %d / tasks: %d / revision: %s" % (
         len(ready), len(blocked), len(data["tasks"]), data.get("revision")))
 
