@@ -343,6 +343,40 @@ def cmd_new(a) -> None:
             "createdAt": now_utc(),
             "updated_at": now_utc(),
         })
+        # 写域按声明字符串精确求交；终态任务不再占用。
+        if a.allow_overlap:
+            print("warn: --allow-overlap 已跳过写域重叠检查", file=sys.stderr)
+        elif task["write_scopes"]:
+            scopes = set(task["write_scopes"])
+            for existing in data["tasks"]:
+                if existing.get("status") in TERMINAL:
+                    continue
+                overlap = sorted(scopes & set(existing.get("write_scopes", [])))
+                if overlap:
+                    die(7, f"写域重叠：{', '.join(overlap)} 已被 {existing['id']} 占用"
+                           "（并行会互相覆盖；确需并行请加 --allow-overlap）")
+
+        # 审计中的完成任务允许作为依赖；自依赖优先报环而非不存在。
+        tasks = {t["id"]: t for t in data["tasks"]}
+        if a.id in task["blocked_by"]:
+            die(4, f"依赖成环：{a.id} → {a.id}")
+        if task["blocked_by"]:
+            done = completed_ids(data)
+            for bid in task["blocked_by"]:
+                if bid not in tasks and bid not in done:
+                    die(4, f"依赖不存在：{bid}")
+            # 迭代 DFS 避免长依赖链触及递归上限；visited 防止旧环无限遍历。
+            visited = set()
+            stack = [(bid, [a.id, bid]) for bid in task["blocked_by"]]
+            while stack:
+                bid, path = stack.pop()
+                if bid == a.id:
+                    die(4, f"依赖成环：{' → '.join(path)}")
+                if bid in visited:
+                    continue
+                visited.add(bid)
+                for dep in tasks.get(bid, {}).get("blocked_by", []):
+                    stack.append((dep, path + [dep]))
         data["tasks"].append(task)
         commit(data, f"新建 {a.id}")
         save_board(data)
@@ -1071,6 +1105,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id"); sp.add_argument("--subject", required=True)
     sp.add_argument("--task", required=True); sp.add_argument("--context", default="")
     sp.add_argument("--scope", default=""); sp.add_argument("--blocked", default="")
+    sp.add_argument("--allow-overlap", action="store_true", help="跳过写域重叠检查（告警）")
     sp.add_argument("--acceptance", default=""); sp.add_argument("--session", default=None)
     sp.add_argument("--engine", choices=["dsh", "codex", "pi", "claude"], default=None)
     add_cas(sp); sp.set_defaults(func=cmd_new)
