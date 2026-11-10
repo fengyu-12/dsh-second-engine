@@ -372,6 +372,36 @@ export function assistantText(message) {
   return typeof c === 'string' ? c : ''
 }
 
+/**
+ * 取「目标轮」的助手文本：最后一条 user 之后的所有 assistant 段，按顺序拼接。
+ * 为什么不是「最后一条 assistant」：一轮多段回复时回执常写在前段，只取末段会判成「未交回执」，
+ * 用户端就看到重复提醒（2026-11-09 / 2026-11-11 两次复发）。拼接后既含本轮全部段落，也不含历史轮。
+ * 兜底：末条 user 之后没有 assistant（模型未回）时退回最后一条 assistant，避免把「没回」误判成「交了空回执」。
+ */
+export function currentTurnAssistantText(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return ''
+  let start = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'user') { start = i + 1; break }
+  }
+  const parts = []
+  for (let i = start; i < messages.length; i++) {
+    // assistantText() 不校验角色：必须自己过滤，否则 tool/system 消息里的 [MW_ACK] 会被当成回执。
+    if (!messages[i] || messages[i].role !== 'assistant') continue
+    const t = assistantText(messages[i])
+    if (t !== '') parts.push(t)
+  }
+  if (parts.length === 0) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (!messages[i] || messages[i].role !== 'assistant') continue
+      const t = assistantText(messages[i])
+      if (t !== '') return t
+    }
+    return ''
+  }
+  return parts.join('\n')
+}
+
 /* ------------------------------------------------------------------ *
  * ③ 状态迁移（纯函数）
  * ------------------------------------------------------------------ */

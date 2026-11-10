@@ -64,7 +64,7 @@ export { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PA
 export { writePiMcp } from './pi-providers.js'
 import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, POLICY_WATCH_DELIVERY_COOLDOWN_MS, POLICY_WATCH_FRESH_MS } from './policy-watch.js'
 import { diagnoseMood, lastUserText, buildMoodMessage, MOOD_COOLDOWN_MS } from './mood-watch.js'
-import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending } from './mood-watch-state.js'
+import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending, currentTurnAssistantText } from './mood-watch-state.js'
 import { readHintToggles } from './hint-toggles.js'
 import { tasks, TASK_KEEP_LIMIT } from './state.js'
 import { resolveCodexBinary } from './review-core.js'
@@ -288,20 +288,6 @@ function presetProviders() {
 // 段边界判定见 stripManagedSection 的三级降级。
 // mood-watch 状态机：每会话一个 JSON（事件 ID / 待回执 / 待确认清单）
 const MOOD_STATE_DIR = join(homedir(), '.dsh', 'second-engine', 'mood-state')
-
-// 取最后一条助手文本：状态机用它判断上一轮有没有交回执
-function lastAssistantText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    if (!m || m.role !== 'assistant') continue
-    // content 可能是字符串，也可能是 [{type:'text',text}] 数组（用户消息那边已兼容两种）
-    if (typeof m.content === 'string') { if (m.content) return m.content; continue }
-    const blocks = Array.isArray(m.content) ? m.content : []
-    const text = blocks.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
-    if (text) return text
-  }
-  return ''
-}
 
 const AGENTS_MARK = '<!-- dsh-second-engine:v2 -->'
 const AGENTS_END = '<!-- /dsh-second-engine:v2 -->'
@@ -2501,7 +2487,7 @@ export function apply(ctx) {
         const stepped = stepTurn(prevState, {
           sessionId,
           anchorText: lastUserText(decision.messages),
-          replyText: lastAssistantText(decision.messages),
+          replyText: currentTurnAssistantText(decision.messages),
           hit,
           buildMessage: buildMoodMessage,
         })

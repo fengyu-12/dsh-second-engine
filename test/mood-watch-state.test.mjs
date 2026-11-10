@@ -8,7 +8,7 @@ import { diagnoseMood, lastUserText, buildMoodMessage } from '../src/mood-watch.
 import {
   stepTurn, loadState, saveState, parseAcknowledgement, verifyAcknowledgement,
   normalizeVerdict, anchorFingerprint, buildPendingReminder, shouldRemindPending,
-  MW_MISSING_LIMIT,
+  currentTurnAssistantText, MW_MISSING_LIMIT,
 } from '../src/mood-watch-state.js'
 
 /* ---- 样例语料 ---------------------------------------------------- *
@@ -296,4 +296,53 @@ test('回执校验用事件自己的原话当锚，不受本轮新消息影响',
   })
   assert.equal(r2.actions.verified.length, 1, '回执应被识别')
   assert.equal(r2.state.consecutiveMissing, 0)
+})
+
+/* ---- currentTurnAssistantText：回执写在前段也要认（2026-11-11） ---------- *
+ * 回归：一轮多段回复时只取最后一条 assistant，回执写在第一段 ⇒ 判「未交回执」，
+ * 用户端看到重复提醒。新实现取「最后一条 user 之后」的全部 assistant 段拼接。 */
+test('currentTurnAssistantText：多段回复里回执写在第一段也算交回执', () => {
+  const messages = [
+    { role: 'user', content: '继续' },
+    { role: 'assistant', content: goodReply('mw-abc') },
+    { role: 'assistant', content: '接下来我按计划继续跑测试。' },
+  ]
+  const reply = currentTurnAssistantText(messages)
+  assert.ok(reply.includes('[MW_ACK]'))
+  const ack = parseAcknowledgement(reply)
+  assert.notEqual(ack, null, '拼接后的本轮文本里应能解析出 [MW_ACK] 回执')
+  assert.equal(ack.eventId, 'mw-abc')
+})
+
+test('currentTurnAssistantText：不含历史轮，历史里的回执不算本轮', () => {
+  const messages = [
+    { role: 'assistant', content: goodReply('mw-old') },
+    { role: 'user', content: '继续' },
+    { role: 'assistant', content: '这一轮只说了计划，没有回执。' },
+  ]
+  const reply = currentTurnAssistantText(messages)
+  assert.ok(reply.includes('没有回执'))
+  assert.ok(!reply.includes('[MW_ACK]'))
+  assert.equal(parseAcknowledgement(reply), null)
+})
+
+test('currentTurnAssistantText：末条 user 之后无 assistant 时回退最后一条', () => {
+  const messages = [
+    { role: 'assistant', content: '上一轮的回复。' },
+    { role: 'user', content: '（插件注入的提醒）' },
+  ]
+  assert.equal(currentTurnAssistantText(messages), '上一轮的回复。')
+  assert.equal(currentTurnAssistantText([]), '')
+  assert.equal(currentTurnAssistantText(undefined), '')
+})
+
+test('currentTurnAssistantText：工具消息里的回执不算助手回执（角色过滤）', () => {
+  const messages = [
+    { role: 'user', content: '继续' },
+    { role: 'tool', content: '[MW_ACK] event=mw-fake' },
+    { role: 'assistant', content: '本轮没有提交回执' },
+  ]
+  const reply = currentTurnAssistantText(messages)
+  assert.equal(reply, '本轮没有提交回执')
+  assert.equal(parseAcknowledgement(reply), null)
 })
