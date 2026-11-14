@@ -10,7 +10,12 @@ const boardDir = () => process.env.DUAL_BOARD_DIR || join(homedir(), 'proj', 'du
 // 只投影不改原板：旧任务没有 engine，必须借角色配置还原归属供 UI 分组。
 export function projectBoard(board) {
   const tasks = (Array.isArray(board?.tasks) ? board.tasks : []).map((task) => ({
-    ...task, engine: task.engine || board?.roles?.[task.owner]?.engine || null,
+    ...task,
+    status: task.status === 'in_progress' && task.owner &&
+      (!Number.isFinite(Date.parse(task.heartbeat_at)) || !(task.lease_seconds > 0) ||
+       Date.now() >= Date.parse(task.heartbeat_at) + task.lease_seconds * 1000)
+      ? 'stale' : task.status,
+    engine: task.engine || board?.roles?.[task.owner]?.engine || null,
   }))
   const done = (task) => task.status === 'completed' || task.status === 'abandoned'
   const dependent = (task) => Boolean(task.blocked_by?.length)
@@ -23,6 +28,7 @@ export function projectBoard(board) {
     board: { revision: board?.revision ?? 0, tasks },
     ready: tasks.filter((t) => ['pending', 'blocked'].includes(t.status) && (t.blocked_by || []).every((id) => resolved.has(id))).map((t) => t.id),
     blocked: tasks.filter((t) => !done(t) && (t.status === 'blocked' || dependent(t))).map((t) => t.id),
+    stale: tasks.filter((t) => t.status === 'stale').map((t) => t.id),
     done: tasks.filter(done).map((t) => t.id),
   }
 }

@@ -382,6 +382,59 @@ def cmd_new(a) -> None:
         save_board(data)
 
 
+def renew_lease(t, seconds=None, new=False):
+    seconds = seconds if seconds is not None else t.get("lease_seconds", 300)
+    if not isinstance(seconds, int) or seconds <= 0:
+        die(2, "lease_seconds 必须是正整数")
+    stamp = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    if new:
+        t["claimed_at"] = stamp
+        # Claim timestamp is also a generation token: old waiters cannot renew a takeover.
+        t["child_pid"] = None
+        t["child_start"] = None
+    t["heartbeat_at"] = stamp
+    t["lease_seconds"] = seconds
+
+
+def cmd_touch(a):
+    with _Lock():
+        data = load_board()
+        check_cas(data, a.expect)
+        t = find_task(data, a.id)
+        if t.get("status") != "in_progress" or t.get("owner") != a.owner or t.get("claimed_at") != a.claimed_at:
+            die(5, "租约 owner/generation 不匹配或任务非运行中")
+        renew_lease(t)
+        t["updated_at"] = now_utc()
+        commit(data, f"{a.id} 活动续租")
+        save_board(data)
+
+
+def cmd_reclaim(a):
+    with _Lock():
+        data = load_board()
+        check_cas(data, a.expect)
+        t = find_task(data, a.id)
+        if not role_exists(load_roles(data), a.owner):
+            die(5, f"角色不存在：{a.owner}")
+        try:
+            stamp = _dt.datetime.fromisoformat(t["heartbeat_at"].replace("Z", "+00:00"))
+            expired = (_dt.datetime.now(_dt.timezone.utc) - stamp).total_seconds() >= t["lease_seconds"]
+        except (KeyError, ValueError, TypeError):
+            die(5, "无有效租约，不能自动回收")
+        if t.get("status") != "in_progress" or not t.get("owner") or not expired:
+            die(5, "只可回收持 owner 且已过期的运行中租约")
+        if not a.reason.strip():
+            die(2, "回收原因不能为空")
+        t.setdefault("lease_history", []).append({"at": now_utc(), "owner": t["owner"],
+            "claimed_at": t.get("claimed_at"), "heartbeat_at": t["heartbeat_at"],
+            "reason": a.reason, "new_owner": a.owner})
+        renew_lease(t, a.lease_seconds, new=True)
+        t["owner"] = a.owner
+        t["updated_at"] = now_utc()
+        commit(data, f"{a.id} 租约回收 by {a.owner}: {a.reason}")
+        save_board(data)
+
+
 def cmd_claim(a) -> None:
     with _Lock():
         data = load_board()
@@ -424,6 +477,7 @@ def cmd_claim(a) -> None:
                     t["_base_snapshot"] = snapshot
                 else:
                     print("warn: 非 git workdir 且无 write_scopes，未记录基线", file=sys.stderr)
+        renew_lease(t, a.lease_seconds, new=True)
         t["owner"] = a.owner
         t["status"] = "in_progress"
         t["updated_at"] = now_utc()
@@ -1112,7 +1166,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("claim", help="认领（设 owner + in_progress）")
     sp.add_argument("id"); sp.add_argument("--owner", required=True)
+    sp.add_argument("--lease-seconds", type=int, default=300)
     add_cas(sp); sp.set_defaults(func=cmd_claim)
+
+    sp = sub.add_parser("touch", help="凭活动证据续租")
+    sp.add_argument("id"); sp.add_argument("--owner", required=True)
+    sp.add_argument("--claimed-at", required=True)
+    add_cas(sp); sp.set_defaults(func=cmd_touch)
+
+    sp = sub.add_parser("reclaim", help="独立回收过期租约，不增加 attempts")
+    sp.add_argument("id"); sp.add_argument("--owner", required=True)
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--lease-seconds", type=int, default=None)
+    add_cas(sp); sp.set_defaults(func=cmd_reclaim)
 
     sp = sub.add_parser("complete", help="完成（目的达成 → 出板；v1.3）")
     sp.add_argument("id"); sp.add_argument("--owner")
