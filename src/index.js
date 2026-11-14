@@ -807,6 +807,8 @@ function requestedBoardId(body) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 export async function persistBoardChild(task) {
+  // Standalone API jobs have no board identity; guessing an ID could write another task.
+  // dispatch must pass boardId explicitly to enable process persistence.
   if (!task.boardId) {
     console.warn(`[second-engine] board pid skipped: task ${task.id} has no board-id`)
     return

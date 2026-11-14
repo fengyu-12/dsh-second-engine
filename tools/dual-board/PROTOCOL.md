@@ -273,3 +273,17 @@ board.sh scope-check <task id> --workdir <dir>
 - 新任务 `attempts=0`；`block` 与重新 `claim` 同一 id 各加 1。达到 2 后 `complete` 拒绝，退出码 3，提示拆小任务或交主 AI；返工上限为两轮。
 - 合并前运行 `accept.sh <id> [--test "命令"]`，按序校验：任务存在且非终态（失败 4）；存在基线（缺失 2）；变更均在 scope（越界 2）；至少有一处变更（空交付 1）；必须提供成功测试命令（缺失/失败 1，失败回显末 30 行）。
 - 全部通过打印 `ACCEPT OK <id> files=N` 并退出 0；验收脚本不调用 `complete`，验收与落板分离。
+
+### Attempt 租约（T1）
+
+claim 写 claimed_at、heartbeat_at、lease_seconds（默认 300 秒）。运行中的 owner
+必须凭活动证据调用 touch；过期仅在投影层派生 stale，不修改原板状态。
+reclaim <id> --reason ... --owner <role> 仅接管过期租约，保留 attempts，
+追加 lease_history 审计并刷新租约；不经 block/claim 返工路径。
+
+旧运行中任务无有效租约也投影为 stale；旧任务不支持自动 reclaim。
+touch <id> --owner <role> --claimed-at <generation> 要求原 claim 的时间戳，
+防止旧等待器为已接管任务续租；回收清除旧 child_pid/child_start。
+dispatch 支持 --board/--board-id 或 DUAL_BOARD_ID；缺失时 warn。
+wait-task.sh <runtime-id> [interval] [timeout] [board-id]（或 DUAL_BOARD_ID）
+仅在 status/liveBytes/output 长度/lastActivityAt 变化时续租，轮询间隔应小于租期。

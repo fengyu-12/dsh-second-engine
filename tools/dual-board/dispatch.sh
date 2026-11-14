@@ -217,13 +217,15 @@ def write_base(task_id, commit, workdir, scopes, dirty, hashes):
         json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def dispatch_task(prompt, workdir, scopes, force=False):
+def dispatch_task(prompt, workdir, scopes, force=False, board_id=None):
     # 基线必须在派单之前取：派单后 codex 可能已开始改文件
     commit = baseline_commit(workdir)
     dirty = dirty_paths(workdir)
     hashes = snapshot_scope_hashes(workdir, scopes)
+    if not board_id:
+        print("warn: 缺 boardId，Node 将跳过 persistBoardChild，无法关联看板进程", file=sys.stderr)
     body = json.dumps(
-        {"prompt": prompt, "workdir": str(workdir), "ephemeral": True},
+        {"prompt": prompt, "workdir": str(workdir), "ephemeral": True, **({"boardId": board_id} if board_id else {})},
         ensure_ascii=False,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -308,7 +310,7 @@ def main():
     parser.add_argument("--self-test", default="")
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--board-id", default=None,
+    parser.add_argument("--board-id", "--board", default=os.environ.get("DUAL_BOARD_ID"),
                         help="看板任务 id（如 T5）：写一份 <board-id>.base 别名，"
                              "让 scope-check 能按看板 id 找到基线（v1.3）")
     parser.add_argument("--force", action="store_true",
@@ -366,7 +368,7 @@ def main():
             if existing_base.exists() or existing_base.is_symlink():
                 print("该任务已派过，重复派单请加 --force", file=sys.stderr)
                 return 2
-        task_id, commit = dispatch_task(prompt, args.workdir, scopes, args.force)
+        task_id, commit = dispatch_task(prompt, args.workdir, scopes, args.force, args.board_id)
         update_failure(args.board_id)
         # P0：归档必须在派单成功之后 —— 否则派单失败会静默吞掉收件箱未读段
         auto_archive()

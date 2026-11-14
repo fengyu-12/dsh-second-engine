@@ -6,6 +6,16 @@ ID="$1"; IV="${2:-5}"; TOTAL="${3:-600}"
 [[ "$ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "无效 id" >&2; exit 1; }
 [[ "$IV" =~ ^[0-9]+$ ]] || { echo "间隔必须是整数秒" >&2; exit 1; }
 START=$(date +%s); FAILS=0; LASTHB=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOARD_ID="${DUAL_BOARD_ID:-${4:-}}"; LEASE_OWNER=""; LEASE_GENERATION=""; PREVIOUS=""
+# Capture generation once; never adopt a replacement lease after reclaim.
+if [ -n "$BOARD_ID" ]; then
+  LEASE=$(bash "$SCRIPT_DIR/dual-board/board.sh" show "$BOARD_ID" --json | python3 -c '
+import json,sys
+x=json.load(sys.stdin)["tasks"][0]
+print(x.get("owner") or "", x.get("claimed_at") or "")') || exit 3
+  read -r LEASE_OWNER LEASE_GENERATION <<< "$LEASE"
+fi
 # Web 地址：与 dispatch.sh 共用 tools/web-base.sh（优先宿主 --port，不写死 3080）
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/web-base.sh"
 W=$(se_web_base)
@@ -23,6 +33,15 @@ while :; do
 import json,sys
 try: print(json.load(sys.stdin).get('task',{}).get('status','?'))
 except Exception: print('PARSE_ERR')" 2>/dev/null)
+    # Renew on observed progress only. Unchanged "running" is not liveness evidence.
+    ACTIVITY=$(printf '%s' "$BODY" | python3 -c '
+import json,sys
+x=json.load(sys.stdin).get("task",{})
+print(json.dumps([x.get("status"),x.get("liveBytes",0),len(x.get("output") or ""),x.get("lastActivityAt")],separators=(",",":")))')
+    if [ -n "$BOARD_ID" ] && [ -n "$LEASE_GENERATION" ] && [ "$ACTIVITY" != "$PREVIOUS" ] && [[ "$S" != done && "$S" != error && "$S" != cancelled ]]; then
+      bash "$SCRIPT_DIR/dual-board/board.sh" touch "$BOARD_ID" --owner "$LEASE_OWNER" --claimed-at "$LEASE_GENERATION" >&2 || echo "warn: 活动续租失败（可能已回收）" >&2
+    fi
+    PREVIOUS="$ACTIVITY"
     case "$S" in
       done)            echo "$ID done"; exit 0 ;;
       error|cancelled) echo "$ID $S" >&2; exit 2 ;;
