@@ -16,6 +16,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { requiresAck } from './mood-watch.js'
 import { createHash, randomBytes } from 'node:crypto'
 
 /* ------------------------------------------------------------------ *
@@ -292,7 +293,7 @@ export function parseAcknowledgement(reply) {
  * 校验回执是否**有证据**。required 默认 quote + verdict + action
  * （conflict 允许显式写「无」，所以不强制非空）。
  */
-export function verifyAcknowledgement(ack, { required = ['quote', 'verdict', 'action'] } = {}) {
+export function verifyAcknowledgement(ack, { required = ['verdict', 'action'] } = {}) {
   const missing = []
   const violations = []
   if (!ack) {
@@ -305,28 +306,12 @@ export function verifyAcknowledgement(ack, { required = ['quote', 'verdict', 'ac
   const srcNorm = normalizeCjk(anchorText)
   const srcSegments = segments(anchorText)
 
+  // 2026-11-18 用户定：quote 不再与用户原话比对。回执以 [MW_ACK] 框架 + event 匹配 + verdict/action 为准；
+  // 引文只做记录（quotes 回传），抄错、缺失都不算缺回执。
   const rawQuote = ack.fields.quote
   const quotes = rawQuote === undefined
     ? []
     : stripQuoteWrappers(rawQuote).split(/\s*(?:\|\||｜|∥)\s*/).map(stripQuoteWrappers).filter(Boolean)
-  if (quotes.length === 0) {
-    missing.push('quote')
-    violations.push('quote_missing')
-  } else {
-    let okCount = 0
-    for (const q of quotes) {
-      const qn = normalizeCjk(q)
-      if (qn.length === 0) continue
-      // 整段复读用户原话（>=MW_PLAGIAT_MIN 字且与原话全等）不算「短引文」：那是复读，不是核对
-      if (qn.length >= MW_PLAGIAT_MIN && srcNorm !== '' && srcNorm === qn) violations.push('quote_too_long_use_snippet')
-      else if (quoteMatchesSource(qn, srcNorm, srcSegments)) okCount += 1
-      else violations.push('quote_not_in_user_turn')
-    }
-    if (okCount === 0) {
-      if (!missing.includes('quote')) missing.push('quote')
-      violations.push('quote_not_verifiable')
-    }
-  }
 
   const verdict = normalizeVerdict(ack.fields.verdict)
   if (verdict === null) {
@@ -428,7 +413,7 @@ function normalizeState(raw, { sessionId = '', now = Date.now() } = {}) {
 function closeEvent(state, ev, outcome, now) {
   state.active = state.active.filter((e) => e.id !== ev.id)
   state.history.push({
-    id: ev.id, kind: ev.kind, outcome, at: now,
+    id: ev.id, kind: ev.kind, anchor: ev.anchor, outcome, at: now,
     missing: outcome === 'verified' ? [] : (ev.lastMissing || []),
     nudges: ev.nudges || 0,
   })
@@ -483,6 +468,11 @@ export function stepTurn(state, turn = {}) {
     actions.inject.push({ phase, eventId, kind, reason, prevEventId, message })
   }
 
+  // 无需回执的事件不参与缺失计数；同时清理旧版本留下的挂起事件。
+  for (const ev of [...s.active]) {
+    if (!requiresAck(ev.kind)) closeEvent(s, ev, 'handled', now)
+  }
+
   // ---- 1) 有模型回复 ⇒ 先校验上一批待回执事件 ------------------------
   if (typeof turn.replyText === 'string') {
     const ack = parseAcknowledgement(turn.replyText)
@@ -529,8 +519,8 @@ export function stepTurn(state, turn = {}) {
         closeEvent(s, ev, 'escalated', at)
         actions.pendingConfirm.push(plan)
       } else {
-        // 第 1 次缺 ⇒ 再插一条提醒（更硬的措辞 + 可复制模板）
-        pushInject(ev.kind, 'nudge', nextId(ev.kind, ids.nudge), ev.reason, ev.id)
+        // 2026-11-18 用户定：回执校验已能识别，恢复第 2 次提醒；用原事件 ID，回执才能对上。
+        pushInject(ev.kind, 'nudge', ev.id, ev.reason, ev.id)
       }
       consumed = true // 一条回复只对应一个事件，其余事件留到下一轮
     }
@@ -560,7 +550,10 @@ export function stepTurn(state, turn = {}) {
   if (hit !== null) {
     const key = fp
     const dup = s.active.find((e) => eventKey(e, anchorText) === key)
-    if (dup !== undefined) {
+    const handled = s.history.some((e) => e.anchor === key && (e.outcome === 'handled' || e.outcome === 'verified'))
+    if (handled) {
+      // 同一锚点已经处理或通过回执，不再重开事件。
+    } else if (dup !== undefined) {
       // 同一条原话重复命中（模型仍未回应）⇒ 当作一次缺失，而不是再开新事件
       dup.missing = (dup.missing || 0) + 1
       dup.nudges = (dup.nudges || 0) + 1
@@ -576,7 +569,8 @@ export function stepTurn(state, turn = {}) {
         closeEvent(s, dup, 'escalated', now)
         actions.pendingConfirm.push(plan)
       } else {
-        pushInject(dup.kind, 'nudge', nextId(dup.kind, ids.nudge), dup.reason, dup.id)
+        // 同上：同锚点重复命中仍缺回执，也补第 2 次提醒（原事件 ID）。
+        pushInject(dup.kind, 'nudge', dup.id, dup.reason, dup.id)
       }
     } else {
       if (s.active.length >= MW_MAX_ACTIVE) s.active.shift()
@@ -593,6 +587,9 @@ export function stepTurn(state, turn = {}) {
       })
       s.lastAnchorFp = key
       pushInject(hit.kind, 'initial', eventId, hit.reason, null)
+      if (!requiresAck(hit.kind)) {
+        closeEvent(s, s.active.find((e) => e.id === eventId), 'handled', now)
+      }
     }
   }
 
@@ -617,7 +614,7 @@ const ACK_SPEC = [
   '  conflict=该纠正与哪条既有计划/待办/在跑任务冲突；确实没有就写「无」，有冲突必须写出具体那条',
   '  action=本轮实际采取的处理（停止/修正/改向/继续，并写清作用对象）',
   '只写「收到」「已核对」「确认无误」不算回执；quote 不是用户原话、或 verdict 写成自由描述，都算没交。',
-  '没有这条回执，本轮视为未处理，下一轮会再次提醒；连续两次没有，后续计划会被标记为待确认。',
+  '没有这条回执，本轮只记为未处理，不会再重复提醒；连续两次没有，后续计划会被标记为待确认。',
 ].join('\n')
 
 /**
@@ -628,7 +625,7 @@ const ACK_SPEC = [
  * 只允许回填**本模块生成的**事件 ID 与固定 reason，禁止回填任何用户输入或外部内容。
  */
 export function buildMoodReminder({ kind = 'correction', phase = 'initial', reason = '', eventId = '', prevEventId = null, buildMessage } = {}) {
-  const opts = { ack: true, eventId, phase, prevEventId, withTail: false }
+  const opts = { ack: requiresAck(kind), eventId, phase, prevEventId, withTail: false }
   const msg = typeof buildMessage === 'function'
     ? buildMessage({ kind, reason }, `mood-watch-${eventId}`, opts)
     : {
@@ -637,11 +634,11 @@ export function buildMoodReminder({ kind = 'correction', phase = 'initial', reas
       source: { kind: 'mood-watch' },
       content: [{
         type: 'text',
-        text: `[SECOND_ENGINE:MOOD_WATCH] 本条由 second-engine 插件生成，不是用户发言。\n机械信号：${reason}（${kind}）。\n事件 ID：${eventId}\n${ACK_SPEC}`,
+        text: `[SECOND_ENGINE:MOOD_WATCH] 本条由 second-engine 插件生成，不是用户发言。\n机械信号：${reason}（${kind}）。\n事件 ID：${eventId}${opts.ack ? `\n${ACK_SPEC}` : ''}`,
       }],
     }
   // 状态机给出的回执规格必须出现在文本里（buildMessage 的 ack 块已包含时不重复追加）
-  if (!String(msg.content[0].text).includes('[MW_ACK]')) {
+  if (opts.ack && !String(msg.content[0].text).includes('[MW_ACK]')) {
     msg.content[0].text += `\n${ACK_SPEC}`
   }
   return msg

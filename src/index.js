@@ -1,3 +1,4 @@
+import { completeNativeJob } from './native-completion.js'
 import { spawnLimited, finishSpawnAudit } from './process-safety.js'
 import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 // dsh-second-engine —— DeepSeek Harness 的 Codex 二元引擎插件。
@@ -43,6 +44,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { handleBoard } from './board-project.js'
 import { runBoardAutoCleanup } from './board-auto-cleanup.js'
 import { registerBridgeRoutes } from './bridge-routes.js'
+import { registerNativeTools } from './native-tools.js'
 import { normalizeTaskRequest, buildReport, publishTaskReport } from './engine/task-port.js'
 import { engineOf, activeEngineId, ENGINES, engineList, setActiveEngineId, cleanupTarget } from './engine/registry.js'
 import { piProbe, piAvailableModels } from './engine/pi-probe.js'
@@ -64,12 +66,12 @@ export { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PA
 export { writePiMcp } from './pi-providers.js'
 import { policyWatchPending, policyWatchDelivered, startPolicyWatch, loadPolicyWatchState, persistPolicyWatchState, POLICY_WATCH_DELIVERY_COOLDOWN_MS, POLICY_WATCH_FRESH_MS } from './policy-watch.js'
 import { diagnoseMood, lastUserText, buildMoodMessage, MOOD_COOLDOWN_MS } from './mood-watch.js'
-import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending, currentTurnAssistantText } from './mood-watch-state.js'
+import { loadState, saveState, stepTurn, buildPendingReminder, shouldRemindPending } from './mood-watch-state.js'
 import { readHintToggles } from './hint-toggles.js'
 import { tasks, TASK_KEEP_LIMIT } from './state.js'
 import { resolveCodexBinary } from './review-core.js'
 import { cleanupReviewFiles, handleReviewsList, handleReviewCreate, handleReviewCancel } from './review-handlers.js'
-import { execMode } from './pi-misc.js'
+import { execMode, keyConfigured as keyConfiguredLocal } from './pi-misc.js'
 import { piRuntimeModel, piWriteJson, piProviderModel, writePiMcp } from './pi-providers.js'
 import { handlePiPanel, handlePiChannelCreate, handlePiModelSet, handlePiBridge, handlePiCleanup, handlePiChannelDelete } from './pi-panel.js'
 import { handleClaudeCleanup } from './engine/claude-cleanup.js'
@@ -89,6 +91,9 @@ import { WATCHDOG_STALL_MS } from './engine/runtime.js'
 if (process.env.DSH_WEB_URL) process.env.BRIDGE_HOST_API_URL = process.env.DSH_WEB_URL
 
 export const name = 'second-engine'
+// 2026-11-18：原生工具需要 tools 服务；cordis 访问未声明服务会抛
+// `cannot get property "tools" without inject`（实测 lastErrors）。
+export const inject = ['settings', 'tools']
 
 // mood-watch 冷却：每会话上次提醒时间，防刷屏（2026-11-02）
 const moodWatchLastAt = new Map()
@@ -175,7 +180,9 @@ export const consults = []
 // 只存内存，不落盘、不进 taskView —— 引擎事件可能含模型/工具正文，不往 ERR_LOG（/status
 // 会回显最近 10 条）那种对外通道里放。
 
-const NOTIFY_URL = 'http://127.0.0.1:3090/app/notify'
+// 桥端口随 App 侧变化（2026-11 实测 3091，旧常量 3090 已无人监听）；给环境变量留口。
+const NOTIFY_PORT = process.env.DSH_BRIDGE_PORT || '3091'
+const NOTIFY_URL = `http://127.0.0.1:${NOTIFY_PORT}/app/notify`
 const NOTIFY_TOKEN_PATH = process.env.DSH_BRIDGE_TOKEN_PATH || join(process.env.DSH_HOME || join(process.env.HOME || '/root', '.dsh'), '.bridge_token')
 const NOTIFY_TIMEOUT_MS = 3000
 
@@ -1093,7 +1100,7 @@ export async function writeCodexConfig(provider) {
   return envKey
 }
 
-async function activeEngineModel(id) {
+async function activeEngineModel(id, localOnly = false) {
   if (id === 'claude') {
     // Claude 不读 keyring：模型来自设置页写入的 claude-model.txt，缺省 haiku。
     // 不修这里的话「当前模型」永远显示 Codex 的 active provider model（实测过 gpt-6.1-sol）。
@@ -1111,7 +1118,7 @@ async function activeEngineModel(id) {
       return { providerId: doc.active, model: p?.model || '', fallback: false, source: 'keyring' }
     } catch { return { providerId: '', model: '', fallback: false, source: 'none' } }
   }
-  const runtime = await piRuntimeModel()
+  const runtime = localOnly ? null : await piRuntimeModel()
   if (runtime !== null) return runtime
   const hit = resolvePiProvider()
   if (hit !== null) return { providerId: hit.id, model: hit.model, fallback: true, source: 'config' }
@@ -1138,7 +1145,13 @@ function dirBytes(root) {
 }
 
 /** 当前引擎的探测 + 能力（status/config 共用，别写两份）。 */
-export async function engineView() {
+export async function engineView({ localOnly = false } = {}) {
+  if (localOnly) {
+    const { collectLocalEngines } = await import('./native-status-service.js')
+    return collectLocalEngines({ active: activeEngineId(), list: engineList(),
+      model: id => activeEngineModel(id, true), codexBinary: resolveCodexBinary,
+      codexConfigured: () => keyConfiguredLocal() })
+  }
   const active = activeEngineId()
   const caps = ENGINES[active] !== undefined ? ENGINES[active].capabilities : null
   // cleanup.bytes = **当前引擎自己**的会话目录大小。顶层 sessionsBytes 恒指 ~/.codex/sessions，
@@ -1623,6 +1636,8 @@ export function finalizeJob(task, exitCode, status, extra) {
   task.endedAt = Date.now()
   finishSpawnAudit(rtOf(task).child(), exitCode, rtOf(task).child()?.signalCode, new Date(task.endedAt).toISOString())
   accountJob(task)
+  // Defer until finalizeTask/finalizeReview finish their synchronous adjustments.
+  queueMicrotask(() => completeNativeJob(task))
   return true
 }
 
@@ -1652,20 +1667,19 @@ function clearCancelTimers(task) {
   task.cancelTimers = null
 }
 
-// 完成/停滞通知：走本机 3090 桥的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
+// 完成/停滞通知：走本机桥（端口见 NOTIFY_PORT，默认 3091）的 /app/notify（token 鉴权）。3 秒超时，任何失败静默忽略。
 export function notify(text, title = '第二引擎') {
   return new Promise((resolve) => { try {
     let token = ''
     try { token = readFileSync(NOTIFY_TOKEN_PATH, 'utf8').trim() } catch { resolve(false); return }
     if (token === '') { resolve(false); return }
-    const url = `${NOTIFY_URL}?token=${encodeURIComponent(token)}`
-      + `&title=${encodeURIComponent(title)}`
+    const url = `${NOTIFY_URL}?title=${encodeURIComponent(title)}`
       + `&text=${encodeURIComponent(text)}`
-    const req = http.get(url, (resp) => {
+    const req = http.get(url, { headers: { 'X-Token': token } }, (resp) => {
       let body = ''
       resp.setEncoding('utf8')
       resp.on('data', (chunk) => { body += chunk })
-      resp.on('end', () => { try { const parsed = JSON.parse(body); const result = typeof parsed.result === 'string' ? parsed.result : ''; if (/UNAUTHORIZED/i.test(result)) resolve(false); else if (/FOREGROUND_SKIP/i.test(result)) resolve(true); else resolve(/ok/i.test(result)) } catch { resolve(false) } })
+      resp.on('end', () => { try { const parsed = JSON.parse(body); const result = typeof parsed.result === 'string' ? parsed.result.trim() : ''; if (/UNAUTHORIZED/i.test(result)) resolve(false); else if (/FOREGROUND_SKIP/i.test(result)) resolve(true); else if (/^\[?OK(?:\s|:|]|$)/i.test(result)) resolve(true); else resolve(false) } catch { resolve(false) } })
       resp.on('error', () => resolve(false))
     })
     req.setTimeout(NOTIFY_TIMEOUT_MS, () => { try { req.destroy() } catch { /* best effort */ } })
@@ -1759,7 +1773,14 @@ function projectProgress(list) {
 export async function handleTaskCreate(req, res) {
   try {
     if (!checkTokenBudget(res)) return
-    const body = await readBody(req)
+    return await createTask(await readBody(req), res, true)
+  } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// Shared in-process entry; res is a result sink, not necessarily an HTTP response.
+export async function createTask(body, res, budgetChecked = false, onTaskId) {
+  try {
+    if (!budgetChecked && !checkTokenBudget(res)) return
     const boardId = requestedBoardId(body)
     const engine = activeEngineId()
     // 默认 workdir 必须按**任务指定的引擎**算，不是按 active 算（2026-11-06 实测 bug：
@@ -1816,6 +1837,7 @@ export async function handleTaskCreate(req, res) {
         }
       }
       const piId = newId()
+      onTaskId?.(piId)
       return startPiTask({
         res,
         id: piId,
@@ -1832,6 +1854,7 @@ export async function handleTaskCreate(req, res) {
     // 同样必须放在 loadKeyring 之前。
     if (engineId === 'claude') {
       const claudeId = newId()
+      onTaskId?.(claudeId)
       return startClaudeTask({
         res,
         id: claudeId,
@@ -1851,6 +1874,7 @@ export async function handleTaskCreate(req, res) {
     if (active === undefined) return send(res, { ok: false, error: '没有可用的 active 提供方' }, 400)
 
     const id = newId()
+    onTaskId?.(id)
     const outPath = join(CODEX_DIR, `task-${id}.out`)
     if (execMode() === 'appserver') {
       startAppServerTask({
@@ -2426,10 +2450,25 @@ export async function latestPluginVersion() {
 }
 
 export function apply(ctx) {
+  try { registerNativeTools(ctx) } catch (e) { noteErr('native-tools', e) }
   loadPolicyWatchState()
+  // Post-commit assistant finals, isolated by full session id; consumed at next mood check.
+  const moodWatchReplies = new Map()
   ctx.on('session/event', async (session, event) => {
-    if (event?.type !== 'turn/end') return
     const sessionId = session?.id
+    if (event?.type === 'assistant/message') {
+      if (typeof sessionId !== 'string' || !sessionId) return
+      const content = event?.data?.message?.content
+      const text = Array.isArray(content)
+        ? content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('')
+        : ''
+      // Refresh insertion order on overwrite; even empty finals replace stale ACKs.
+      moodWatchReplies.delete(sessionId)
+      moodWatchReplies.set(sessionId, text)
+      while (moodWatchReplies.size > MOOD_KEEP_LIMIT) moodWatchReplies.delete(moodWatchReplies.keys().next().value)
+      return
+    }
+    if (event?.type !== 'turn/end') return
     const hintToggles = readHintToggles()
     if (hintToggles.mechanical && typeof sessionId === 'string' && sessionId) startPolicyWatch(sessionId)
     // 用户打断的机械标记（2026-11-02 实测）：turn/end.reason = {kind:'aborted', reason:{kind:'user'}}。
@@ -2483,13 +2522,16 @@ export function apply(ctx) {
         const withinCooldown = nowMs - (moodWatchLastAt.get(sessionId) || 0) < MOOD_COOLDOWN_MS
         const hit = rawHit !== null && !withinCooldown ? rawHit : null
         // 2026-11-06：改走回执校验状态机（Z1）。命中 → 注入带事件 ID 的提醒；
-        // 下一轮看模型回复里有没有 [MW_ACK] 可校验回执；缺 ⇒ 再提醒；连续 2 次缺 ⇒ 标待确认。
+        // 下一轮看缓存最终回复里有没有 [MW_ACK]；A 方案缺回执不再提醒，连续 2 次缺 ⇒ 标待确认。
         const statePath = join(MOOD_STATE_DIR, `${sessionId}.json`)
         const prevState = loadState(statePath, { sessionId })
+        const replyText = moodWatchReplies.get(sessionId) ?? ''
+        moodWatchReplies.delete(sessionId)
+        // Empty fallback is checked as missing ACK and recorded by stepTurn, never verified.
         const stepped = stepTurn(prevState, {
           sessionId,
           anchorText: lastUserText(decision.messages),
-          replyText: currentTurnAssistantText(decision.messages),
+          replyText,
           hit,
           buildMessage: buildMoodMessage,
         })

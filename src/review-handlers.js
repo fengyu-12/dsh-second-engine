@@ -118,6 +118,7 @@ export function reviewRecord(task) {
   return {
     id: task.id,
     kind: 'review',
+    ...(task.nativeContent === true ? { content: task.content } : {}),
     status: viewStatus(task),
     verdict: typeof task.verdict === 'string' ? task.verdict : '',
     stopReason: typeof task.stopReason === 'string' ? task.stopReason : '',
@@ -419,7 +420,15 @@ export async function runReview(task, active) {
 export async function handleReviewCreate(req, res) {
   try {
     if (!checkTokenBudget(res)) return
-    const body = await readBody(req)
+    return await createReview(await readBody(req), res, { budgetChecked: true })
+  }
+  catch (e) { send(res, { ok: false, error: errMsg(e) }) }
+}
+
+// Shared lifecycle entry point; HTTP and native callers use identical validation.
+export async function createReview(body, res, { budgetChecked = false, persistContent = false } = {}) {
+  try {
+    if (!budgetChecked && !checkTokenBudget(res)) return
     const content = typeof body.content === 'string' ? body.content.trim() : ''
     if (content === '') return send(res, { ok: false, error: 'content 不能为空' }, 400)
     const doc = loadKeyring()
@@ -592,6 +601,7 @@ export async function handleReviewCreate(req, res) {
       verdict: '',
       error: '',
       content,
+      ...(persistContent ? { nativeContent: true } : {}),
       // ① 接力链：谱系（prevId 进 taskView 与落盘记录）+ 首轮对照种子。
       prevId,
       prevSeed,
@@ -636,9 +646,13 @@ export async function handleReviewCreate(req, res) {
 }
 
 export async function handleReviewCancel(req, res) {
+  const body = await readBody(req)
+  return cancelReview(typeof body.id === 'string' ? body.id.trim() : '', res)
+}
+
+// Shared in-process cancellation; preserves the existing lifecycle and timers.
+export async function cancelReview(id, res) {
   try {
-    const body = await readBody(req)
-    const id = typeof body.id === 'string' ? body.id.trim() : ''
     if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
     const task = tasks.get(id)
     if (task === undefined) return send(res, { ok: false, error: `未找到任务 '${id}'` }, 404)

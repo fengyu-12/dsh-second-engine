@@ -471,14 +471,14 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.2.3）
+## 支持能力一览（v4.3.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **4.2.3 attempt 租约/心跳** | ✅ 4.2.3 | ① **claim 写租约**：`claimed_at`/`heartbeat_at`/`lease_seconds`（默认 300s）；`touch` 凭活动续租（`claimed_at` 作 generation，防旧等待器为已接管任务续租）；`reclaim` 独立回收过期租约，**不增 attempts**，记 `lease_history` 并清旧 `child_pid` ② **只读投影派生 `stale`**：`GET /api/board` 增加 `stale` 数组，原板状态不变；无 `heartbeat_at` 的旧 `in_progress` 任务也投影为 stale ③ **dispatch 传 boardId**：`--board` / `--board-id` / `DUAL_BOARD_ID`，缺省告警（此前 Node 侧因缺 boardId 直接跳过 `persistBoardChild`）④ **wait-task 续租**：仅 `status` / `liveBytes` / `output` 长度 / `lastActivityAt` 变化时续租，轮询间隔应小于租期 ⑤ 新增 `tests/board-lease.mjs`（5 用例），`test_board_tool` 57 / `test_dispatch` 56 全绿 |
+| **4.3.0 原生工具 + 通知修复 + 回执闭环** | ✅ 4.3.0 | ① **九个 DSH 原生工具**：`task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status`（裸定义 + `inject=['settings','tools']`）；修 createTask 误报 `EXECUTION_FAILED`（detached async 与 capture 抢跑）与 `job_get` review 空 output（按 kind 拼 `{verdict,rounds,issues}`）② **完成通知修复**：写死 3090 改为 `DSH_BRIDGE_PORT`（默认 3091）、token 从 query 改 `X-Token` 头、回执首段精确匹配 ③ **mood-watch 回执闭环**：监听 `session/event` 的 `assistant/message` 缓存最终回复（每会话 1 条、总 50、消费一次）；`quote` 退出判定（只认 `[MW_ACK]` 框架 + event/verdict/action）；恢复缺回执第 2 次提醒（同事件 ID）④ **bridge Web**：DOM/数据分离、围栏代码块、流式节流、回车发送/移动端焦点/元数据分离；后端 transcript 补 `ts`（UTC ISO，协议核对单位、缺时间不伪造）⑤ **skill 拆卷**：HTTP 兜底收进 `references/ref-http-api.md`、机械量收进 `ref-fallback-measures.md`；派单纪律补「具名风险 / 报告只当待查声明 / 接口类失败路径验收」 |
 
 
-> 4.2.2 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+> 4.2.3 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## Codex 升到 0.166.0 之后
 

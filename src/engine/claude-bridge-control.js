@@ -90,6 +90,13 @@ export function autoStartIfEnabled() {
   return startClaudeBridge()
 }
 
+// Native control clears intent without trusting the legacy PID file for signalling.
+export function disableClaudeBridgeRecovery() {
+  try { unlinkSync(ENABLED_PATH) } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+}
+
 export function stopClaudeBridge() {
   const pid = readPid()
   if (!alive(pid)) {

@@ -2,7 +2,7 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.167.0`（2026-11-07 升级；**无回滚物** —— 0.166 备份已删，回退须重下 113 MB）。三关检验全过：`exec` exit 0 · `app-server` initialize 回包 · **工具真执行**（`command_execution` 实跑 `cat`）。⚠️ 0.167 在本机有 **sidecar 路径回归**（见 §6.1），升级后 §4 第 7 条必须查 `/.l2s/`，只验 `--version` 会假绿。
+> **当前版本**：`0.169.0`（2026-11-14 升级；**有回滚物** —— `<Codex 安装目录>/codex.bak-0.167.1` 与 `codex-code-mode-host.bak-0.167.1`）。三关检验：工具面 **9 条**（exec_command / write_stdin / request_user_input / view_image / multi_agent_v1 / get_goal / create_goal / update_goal / web_search）· 执行链 **5/5**（appserver+流式进度 / cancel 真打断无残留 / exec 回归）· `dsh-dep-check` 全 OK。⚠️ **升级窗口**（2026-11-14 实测）：替换二进制期间在跑或新派的任务会 **exit 127**（当时 active 被切到 claude，撞上 npm 换件窗口）；升级前查 `active` 与在跑任务、升级后把 active 切回 codex。⚠️ 0.167 的 **sidecar 路径回归**（§6.1）在 0.169 **未复验**；本周实测 sidecar 两处硬链仍在用（`<Codex 安装目录>/codex-code-mode-host` + `/.l2s/`）。
 > **二进制**：`<Codex 安装目录>/codex`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）；sidecar 两处硬链缺一即废 —— `<Codex 安装目录>/codex-code-mode-host` + **`/.l2s/codex-code-mode-host`**（0.167 实际读后者）。
 > **升级方式（2026-11-07 实测修订 —— GitHub release 直连又通了）**：`curl -fL -o pkg.tgz https://github.com/openai/codex/releases/download/rust-v<版本>/codex-package-aarch64-unknown-linux-musl.tar.gz`（0.167.0 = 187,844,332 B / 4 分 4 秒 ≈ 749 KB/s），**同时下 `codex-package_SHA256SUMS` 逐字节校验**（该 SUMS 只覆盖 `codex-package-*`，不覆盖单件 `codex-*`）。备选：npmmirror 平台包（0.166.0 = 164,402,913 B ≈ 3 分钟）。⚠️ 源可达性会变：10-31 记「release 走不动」、11-07 实测 749 KB/s ⇒ 每次先探再信。
 > **包内结构与取用**：整包 `codex-package` = `bin/codex`(~267 MB) + `bin/codex-code-mode-host`(~69 MB) + `bin/codex-exec-server`(67 MB) + `codex-path/rg`(4.4 MB) + `codex-resources/{bwrap,voice}`(53 MB)。**2026-11-07 实测只留前两个二进制**：删掉 exec-server / rg / bwrap / voice 后 `exec` 与 `app-server` 均正常（second-engine 源码对它们 0 引用、系统已有 `/usr/bin/rg`、proot 无 bwrap 沙箱）⇒ 最终占用 335 MB。替换姿势：旧件留档 → `ln` 硬链落位 → `codex --version` **外加一次工具调用**复核（仅验版本会漏掉 sidecar 断链，2026-11-07 就这么假绿过一次）。
@@ -79,13 +79,20 @@ codex remote-control | exec-server | cloud | sandbox | debug   # 0.163 面里已
 
 ---
 
-## 3. Codex 现版本功能（`0.167.0` · 2026-11-07 本机实测拉取）
+## 3. Codex 现版本功能（`0.169.0` · 2026-11-14 本机实测拉取）
 
 > **维护方式：主 AI 自己拉 · 不留存历史版本** —— 不逐版累积（没完没了、永远追着上游跑）。每次升级后重新拉一遍**整节覆盖**，只留**当下版本的具体变更与修复**。
 >
 > **变更来源（2026-11-07 打通）**：`api.github.com/repos/openai/codex/releases/tags/rust-v<版本>` 的 `body` 就是完整 changelog（0.167.0 = 11,566 字，含 New Features / Bug Fixes / Changelog 三段）。10-31 那条「无从取得」是因为当时 release 直连不通，不是上游没有。
 
-**0.167.0 变更（官方 body 归纳，只列与本机相关的）**
+**0.168.0 / 0.169.0 变更（官方 release body 归纳，只列与本机相关的；0.167 明细已随整节覆盖移除）**
+
+- **0.169 与本机相关**：`codex exec` 在**不可信目录**默认禁用项目配置与 MCP servers（即使 `--sandbox workspace-write`），需 `--trust` 显式保存项目信任（行为边界变化，我们的 workdir 固定 `/root/proj` 与插件实体，升级后执行链 5/5 通过说明本机未触发，但记一笔）；**中断的 turn 现在干净关闭**，延迟 abort / 文件审批取消不再打断后续 turn（与我们 cancel 判据直接相关）；app-server 支持 `model/list` 选择已配置 provider、gateway 授权不改默认 provider。TUI 侧（多 side-chat 标签、折叠 turn、终端内编辑自定义 provider、诊断 ZIP）非交互用不上。
+- **安全含义（2026-11-14 用户指出，补记）：这是收益不是缺陷** —— 不可信目录默认禁用项目配置与 MCP，等于给"新建/外来目录"加了一道默认收窄，配合我们固定的 `approval_policy=never` + `danger-full-access` 组合（本身风险高），这层收窄有价值；派单默认 `/root/proj` 是 trusted，不受影响。⚠️ **未验证**：项目级 `AGENTS.md` 是否随 "project configuration" 一并被禁用（changelog 只写 config 与 MCP；用户级 `~/.codex/AGENTS.md` 始终读）。要定死需在 untrusted 目录放一份 AGENTS.md 派单实测；未验前按"可能被禁"处理，别依赖外来目录的项目级指令。
+- **0.168 与本机相关**：app-server 新增 **model provider discovery + 配置写入**；`features.multi_agent` 被显式配置时警告并指向 `agents.enabled`（与工具面 `multi_agent_v1` 对应）；TUI 侧会话列表/模型 provider 浏览、图片生成动画、音频录制等（用不上）。
+- ⚠️ 0.167 的 sidecar 路径回归在 0.169 **未复验**（见 §6.1），下次升级后必须查 `/.l2s/`。
+
+**0.167.0 变更（历史，已随整节覆盖移除前留档一句）**
 
 - **TUI 侧新增（非交互 `exec` 用不上）**：`codex agents --no-daemon` 命令中心与未读标记；会话选择器跨后端切换且保留草稿；终端本地图片预览；`/experimental` 系统代理；审批时内联展开 patch。API key / 云 provider 收进 "Sign in another way"，`gcp_setup_wizard` 可配 Vertex AI。
 - **修复**：换 model provider 后已保存会话仍可见（不能 resume 时也能读 transcript 转新会话）；`Ctrl+L` 清屏保留历史；网络审批提示随请求结束关闭、同端点串行。

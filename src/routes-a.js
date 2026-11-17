@@ -10,8 +10,15 @@ import { resolveCodexBinary } from './review-core.js'
 import { existsSync } from 'node:fs'
 import { collabStatus, engineView, loadKeyring, maskKey, providerView, writeCodexConfig } from './index.js'
 
+// Shared status source: localOnly bypasses Pi RPC/probes and all remote checks.
+export async function statusSnapshot({ localOnly = false } = {}) {
+  const engine = await engineView({ localOnly })
+  return { engine, lastErrors: ERR_LOG.slice(-10) }
+}
+
 export async function handleStatus(_req, res) {
   try {
+    const snapshot = await statusSnapshot()
     send(res, {
       ok: true,
       codexBinary: existsSync(resolveCodexBinary()),
@@ -21,11 +28,11 @@ export async function handleStatus(_req, res) {
       keyConfigured: keyConfigured(),
       sessionsBytes: sessionsBytesCached(),
       // D（2026-10-25）：最近 10 条吞错留痕（已脱敏）——「配置没写进去」类问题从这里查。
-      lastErrors: ERR_LOG.slice(-10),
+      lastErrors: snapshot.lastErrors,
       // 协作两位 + 派生预设（主 AI 派单前查这里；preset 派生点在 collabPreset）。
       collab: collabStatus(),
       // P4.3/P4.5：当前引擎 + 能力 + 探测 + 实际模型（面板据此条件渲染）。
-      engine: await engineView(),
+      engine: snapshot.engine,
     })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }

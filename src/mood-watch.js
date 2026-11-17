@@ -18,6 +18,16 @@ const POINTER = new RegExp(String.raw`(你|刚才|之前|上面|上一轮|又)`)
 const UNRESOLVED = new RegExp(String.raw`还是没(?:有)?(?:修好|修复好|解决|完成|改好|弄好|搞定)`)
 export const MOOD_COOLDOWN_MS = 120 * 1000
 
+// 2026-11-18：只有 stop / correction 要求回执。
+// 这两类对应可验证的动作（停手、改向）；supplement（补充信息）和 reject（否决既有方案）
+// 只是让模型照常处理，再要求回执就等于把正常对话也变成待办，回执本身成了噪音。
+export const ACK_KINDS = new Set(['stop', 'correction'])
+export function requiresAck(kind) {
+  const k = typeof kind === 'string' && kind !== '' ? kind : 'correction'
+  // 未知 kind 走 correction 文案（见 buildMoodMessage 的兜底）⇒ 同样要求回执
+  return ACK_KINDS.has(k) || (k !== 'supplement' && k !== 'reject')
+}
+
 /** 命中返回 { kind, reason }，否则 null。纯函数，便于单测。 */
 export function diagnoseMood(text) {
   if (typeof text !== 'string') return null
@@ -67,7 +77,7 @@ const ACK_REQUIREMENT = [
   '  conflict=该纠正与哪条既有计划/待办/在跑任务冲突；确实没有写 none，有冲突必须写出具体那条',
   '  action=本轮实际采取的处理（停止/修正/改向/继续，并写清作用对象）',
   '只写「收到」「已核对」「确认无误」不算回执；quote 不是用户原话、或 verdict 写成自由描述，都算没交。',
-  '没有这条回执，本轮视为未处理，下一轮会再次提醒；连续两次没有，后续计划会被标记为待确认。',
+  '没有这条回执，本轮只记为未处理，不会再重复提醒；连续两次没有，后续计划会被标记为待确认。',
 ].join('\n')
 
 /**

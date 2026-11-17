@@ -1,6 +1,6 @@
 # ref · Codex 升级姿势 + 升级后破坏性检验
 
-> 入口：`SKILL.md`「要升级 Codex 二进制，或升级后判断插件要不要改时」。逐版实测记录查 `<本机功能核对表>`。
+> 入口：`SKILL.md`「要升级 Codex 二进制，或升级后判断插件要不要改时」。逐版实测记录查 `Codex功能表.md`。
 
 ## 1. 升级姿势（2026-10-31 实测修订 —— 正选已换，别再按 release 直连试）
 
@@ -14,9 +14,17 @@ pkg/package/vendor/aarch64-unknown-linux-musl/bin/codex --version   # 先验活�
 
 vendor 里有 `bin/codex` + `bin/codex-code-mode-host`（**须与主二进制同目录、无后缀命名**）+ `codex-resources/`（voice host / bwrap / gstreamer 库，本机当前**不装**，exec 与 app-server 用不到）+ `codex-path/rg`（PATH 已有 `/usr/bin/rg`，免装）。
 
-**只取两个二进制**：`cp -a` 备份旧版到 `<Codex 安装目录>/*.bak-<旧版>` → `cp` 到临时名再 `mv -f` 原子替换 → `codex --version` 复核；回滚＝把 `.bak-<旧版>` 换回。
+**只取两个二进制**：`cp -a` 备份旧版到 `/root/codex/*.bak-<旧版>` → `cp` 到临时名再 `mv -f` 原子替换 → `codex --version` 复核；回滚＝把 `.bak-<旧版>` 换回。
 
 ⚠️ **GitHub release 资产不要当正选**：2026-10-31 实测主二进制与 sidecar **直连 75 秒零字节**、`ghproxy.net` 同样卡（`ghfast.top` 更早已挂）。release 不通时**不要在它上面反复换镜像耗着**，直接走 npm 平台包。⚠️ 也别用"多文件并行各走一个镜像"解——包只有一个文件，两路并行是浪费带宽，取先完成的那路即可。
+
+### 1.1 升级窗口约束（2026-11-14 实测踩到）
+
+- **替换二进制期间不要派单**：node 侧任务正在跑、或旧进程加载中时替换 `codex`，任务会以 **exit 127（command not found）** 结束，且插件不区分"引擎不可用"与"任务失败"。
+- **升级前先确认 active 引擎与在跑任务**：`GET /api/status` 看 active，`GET /api/tasks?limit=5` 看有没有 running；有就等它落定或取消。
+- **升级后把 active 切回 codex**（若它是原 active）：`POST /api/config {"engine":"codex"}`。2026-11-14 事故链 = 升级瞬间 active=claude + 任务走 claude → exit 127 → 面板显示"Claude 不在 PATH"（实际是瞬时窗口）。
+- **工具面基线（0.169.0）**：`se-tool-probe.mjs` 输出 9 条 = exec_command / write_stdin / request_user_input / view_image / multi_agent_v1 / get_goal / create_goal / update_goal / web_search。
+- **工单级 engine 才是并行钥匙**：active 只决定"不带 engine 的工单"；同一秒可连发不同 `engine` 的 `/api/task`，互不影响。**复核恒走 codex**（review 链路不跟 active 走）。
 
 ## 2. 每次升级后跑三条检验 —— 判据与处置固定
 
@@ -32,9 +40,9 @@ vendor 里有 `bin/codex` + `bin/codex-code-mode-host`（**须与主二进制同
 
 ⚠️ 探针数量会变（曾 3 条增至 6 条），按脚本当次输出比对，别照旧数字核。
 
-## 3. 🔴 升级后第一件事：维护旧结论
+## 3. 🔴 升级后第一件事：维护旧结论（本机私有判据 · 勿同步发布树）
 
-真正的腐化源是"旧结论还挂在新版本号旁边"。每次升级后回扫 `SKILL.md` 与 `<本机功能核对表>` 的**状态性结论**（开关态、能力对照、扩展表、CLI 面），逐条二选一：
+真正的腐化源是"旧结论还挂在新版本号旁边"。每次升级后回扫 `SKILL.md` 与 `Codex功能表.md` 的**状态性结论**（开关态、能力对照、扩展表、CLI 面），逐条二选一：
 
 - **① 已复验 → 改成新版本 + 新日期**
 - **② 没验 → 明确标「<旧版本> 观察，未复验」**

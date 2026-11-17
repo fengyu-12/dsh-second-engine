@@ -119,7 +119,29 @@ function toIso(seconds) {
 }
 
 // codex 的 ThreadItem → 网页的 entry
-function itemToEntry(item) {
+function entryTimestamp(...sources) {
+  for (const source of sources) {
+    // Protocol lifecycle fields have explicit units; never substitute wall-clock time.
+    for (const [key, scale] of [['startedAtMs', 1], ['completedAtMs', 1],
+      ['createdAt', 1000], ['startedAt', 1000], ['ts', 1], ['timestamp', 1]]) {
+      const value = source?.[key];
+      const ms = typeof value === 'number' ? value * scale
+        : (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+          ? Date.parse(value) : NaN);
+      if (Number.isFinite(ms) && Math.abs(ms) <= 8.64e15) return new Date(ms).toISOString();
+    }
+  }
+  return null;
+}
+
+function itemToEntry(item, ...timeSources) {
+  const entry = itemPayloadToEntry(item);
+  if (!entry) return null;
+  const ts = entryTimestamp(item, ...timeSources);
+  return ts === null ? entry : { ...entry, ts };
+}
+
+function itemPayloadToEntry(item) {
   if (!item || typeof item !== 'object') return null;
   switch (item.type) {
     case 'userMessage': {
@@ -829,12 +851,26 @@ const server = createServer(async (req, res) => {
       if (!id) return json(res, 400, { error: '缺少 id' });
       try {
         const entries = [];
+        let thread;
+        let readTimes = false;
+        const turns = new Map();
         let cursor = null;
         for (let page = 0; page < 20; page++) {
           const r = await as.call('thread/items/list', { threadId: id, limit: 500, cursor, sortDirection: 'asc' });
           // 列表里的元素是 {turnId, item}，通知里是直接的 item —— 两种都吃
           for (const row of r.data || []) {
-            const entry = itemToEntry(row?.item ?? row);
+            const item = row?.item ?? row;
+            // Read fallback metadata at most once, and only if item/row times are absent.
+            if (!readTimes && entryTimestamp(item, row) === null) {
+              readTimes = true;
+              try {
+                thread = (await as.call('thread/read', { threadId: id, includeTurns: true }, 10000)).thread;
+                for (const turn of thread?.turns || []) turns.set(turn.id, turn);
+              } catch {
+                // Missing historical metadata must not hide otherwise readable items.
+              }
+            }
+            const entry = itemToEntry(item, row, turns.get(row?.turnId), thread);
             if (entry) entries.push(entry);
           }
           cursor = r.nextCursor || null;

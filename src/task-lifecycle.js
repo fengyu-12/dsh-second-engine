@@ -366,9 +366,13 @@ export function startPiTask({ res, id, outPath, workdir, prompt, model, provider
 }
 
 export async function handleTaskCancel(req, res) {
+  const body = await readBody(req)
+  return cancelTask(typeof body.id === 'string' ? body.id.trim() : '', res)
+}
+
+// Shared in-process cancellation; preserves the existing lifecycle and timers.
+export async function cancelTask(id, res) {
   try {
-    const body = await readBody(req)
-    const id = typeof body.id === 'string' ? body.id.trim() : ''
     if (id === '') return send(res, { ok: false, error: 'id 不能为空' }, 400)
     const task = tasks.get(id)
     if (task === undefined) return send(res, { ok: false, error: `未找到任务 '${id}'` }, 404)
