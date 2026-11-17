@@ -63,7 +63,7 @@ Android 的沙箱模型把环境切碎了：每个 App 各自下载依赖、各�
 
 ### 双向互审
 
-把产出交给 Codex 做多轮批判性复核：轮数上限 / 零新增提前收敛 / 分歧打包上交用户 / 任意时刻熔断，轮数在面板设置。**复核（`POST /api/review`）恒走 exec 多轮子进程**——appserver 化在路线图上（复用 `startAppServerTurn` 即可；卡点是 token 硬预算的数据源要从 exec 尾部 "tokens used" 换成 `thread/tokenUsage/updated` 事件，未验收前不切）。
+把产出交给 Codex 做多轮批判性复核：轮数上限 / 零新增提前收敛 / 分歧打包上交用户 / 任意时刻熔断，轮数在面板设置。**复核（`POST /api/review`）恒走 exec（非 appserver）**：首轮 exec、第 2 轮起 `exec resume` 续同一会话（2026-11-07 回合制）——appserver 化在路线图上（复用 `startAppServerTurn` 即可；卡点是 token 硬预算的数据源要从 exec 尾部 "tokens used" 换成 `thread/tokenUsage/updated` 事件，未验收前不切）。
 
 复核记录持久化到 `~/.codex/reviews/<id>.json`（0600，数量 200 封顶 + 按保留天数龄清），历史用 `GET /api/reviews?limit=20` 拉取（重启不丢）；末轮未决问题同时以 `[REVIEW_ISSUES]` 块追加进该复核任务的 `output`。带 `reviewDirty` 时通知也会提示（复核窗口内工作区新增改动＝**证据**：含任何写入者的改动，不归因、不阻断——起点已脏的路径不计入）。
 
