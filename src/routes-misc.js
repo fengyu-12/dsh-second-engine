@@ -1,4 +1,5 @@
 import { send, CONSULT_KEEP_LIMIT, MCP_NAME_PATTERN, MCP_ROUTE_PREFIX, TASK_LIST_LIMIT, WEB_SEARCH_MODES, compareVersions, errMsg } from './core.js'
+import { consults, consultsSince, loadRecentConsults } from './consult-journal.js'
 import { activeEngineId } from './engine/registry.js'
 import { readHintToggles, writeHintToggles } from './hint-toggles.js'
 import { addClaudeMcp, listClaudeMcp, removeClaudeMcp, toggleClaudeMcp } from './claude-mcp.js'
@@ -7,7 +8,7 @@ import { REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_ROUNDS_CHOICES } fro
 import { handlePiMcpAdd, handlePiMcpDelete, handlePiMcpList, handlePiMcpToggle } from './pi-panel.js'
 import { tasks } from './state.js'
 
-import { addMcpServer, collabStatus, consults, engineView, handleConfigSet, handleTaskCreate, latestPluginVersion, listMcpServers, loadKeyring, ownPluginVersion, readWebSearch, removeMcpServer, setMcpServerEnabled, taskSummary, taskView, writeTopLevelString } from './index.js'
+import { addMcpServer, collabStatus, engineView, handleConfigSet, handleTaskCreate, latestPluginVersion, listMcpServers, loadKeyring, ownPluginVersion, readWebSearch, removeMcpServer, setMcpServerEnabled, taskSummary, taskView, writeTopLevelString } from './index.js'
 
 export async function handleTaskGet(req, res) {
   try {
@@ -68,8 +69,18 @@ export async function handleHintToggles(req, res) {
   } catch (e) { return send(res, { ok: false, error: errMsg(e) }) }
 }
 
-export async function handleConsultsList(_req, res) {
+export async function handleConsultsList(req, res) {
   try {
+    const since = queryParam(req.url, 'since')
+    if (since !== '') {
+      const entries = await consultsSince(since)
+      if (entries === null) return send(res, { ok: false, error: 'since 无效或对应记录未落盘；可用 since=0 重新读取' }, 400)
+      return send(res, {
+        ok: true, count: entries.length, limit: CONSULT_KEEP_LIMIT, consults: entries,
+        nextSince: entries.at(-1)?.id ?? since,
+      })
+    }
+    await loadRecentConsults()
     send(res, { ok: true, count: consults.length, limit: CONSULT_KEEP_LIMIT, consults: consults.slice() })
   } catch (e) { send(res, { ok: false, error: errMsg(e) }) }
 }

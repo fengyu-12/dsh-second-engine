@@ -24,8 +24,8 @@ import { tokenTotal, recordTokens, budgetGate } from './token-ledger.js'
 //   GET    /second-engine/api/reviews?limit=    复核历史（~/.codex/reviews 持久化记录，倒序）
 //   GET    /second-engine/api/config            读插件配置（复核轮数 reviewRounds）
 //   POST   /second-engine/api/config            写插件配置 { reviewRounds: 1|3|5 }
-//   POST   /second-engine/api/consult           Codex 卡点求助入队 { from, task, taskId?, stuckContext }（内存 20 条 + 弹 App 通知）
-//   GET    /second-engine/api/consults          求助列表（不脱敏，给主 AI 收卷）
+//   POST   /second-engine/api/consult           卡点求助入队 { from, task, taskId?, stuckContext }（异步落盘 + App 通知）
+//   GET    /second-engine/api/consults          最近 20 条，或 ?since=<id|毫秒时间戳|ISO 时间> 拉取落盘增量
 //   GET    /second-engine/api/version           本机 codex 版本 vs GitHub 最新 release（updateAvailable）
 //   GET    /second-engine/api/plugin-version    插件自身版本 vs GitHub 最新 release（失败静默，无更新不提示）
 //   GET    /second-engine/api/websearch         读 config.toml 顶层 web_search（无则 disabled）
@@ -61,6 +61,8 @@ import { randomBytes } from 'node:crypto'
 import { WIRE_API, CODEX_DIR, CONFIG_PATH } from './constants.js'
 import { normalizeProvider, normalizeReviewRounds, normalizeReviewWallMs, normalizeReviewTokenLimit, normalizeIssue, REVIEW_DEFAULT_ROUNDS, REVIEW_ROUNDS_CHOICES, REVIEW_DEFAULT_WALL_MS, REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, asText, ISSUE_REF_RE } from './normalize.js'
 import { noteErr, atomicWriteFileSync, send, readConfigRaw } from './core.js'
+import { consults, consultsForTask, loadRecentConsults, recordConsult } from './consult-journal.js'
+export { consults } from './consult-journal.js'
 import { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PATTERN, TASK_LIST_LIMIT, CONSULT_KEEP_LIMIT, ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MIN_ROUNDS, REVIEW_MAX_ROUNDS, errMsg, sessionsBytesCached, invalidIdError, wireApiError, countPiJsonl, PI_CHANNEL_APIS, CODEX_WIRE_OPTIONS, PI_WIRE_OPTIONS, PI_SETTINGS_PATH, readPiModelMemory, rememberPiModel, readPiJson, PI_WRITE_QUEUES, readPiJsonStrict, PI_API_SET, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, piProvidersBag, piHasProvider, sendPiWriteError, PROTECTED_IDS, modelsUrl, bigmodelAuxModelsUrl, readPiMcp, MCP_ROUTE_PREFIX, compareVersions, resolvePiProvider, PRESET_PROVIDERS, SUPPORTED_WIRE_APIS, ID_PATTERN, PI_MCP_PATH, sessionsBytes } from './core.js'
 export { SESSIONS_DIR, PRESET_IDS, DEFAULT_ACTIVE, WEB_SEARCH_MODES, MCP_NAME_PATTERN, TASK_LIST_LIMIT, CONSULT_KEEP_LIMIT, ENGINE_EVENTS_LIMIT, ENGINE_EVENTS_META_BYTES, PROGRESS_LIMIT, INDEPENDENT_SOURCES, QUORUM_NOTE, REVIEW_ID_PATTERN, REVIEW_MIN_ROUNDS, REVIEW_MAX_ROUNDS, errMsg, sessionsBytesCached, invalidIdError, wireApiError, countPiJsonl, PI_CHANNEL_APIS, CODEX_WIRE_OPTIONS, PI_WIRE_OPTIONS, PI_SETTINGS_PATH, readPiModelMemory, rememberPiModel, readPiJson, PI_WRITE_QUEUES, readPiJsonStrict, PI_API_SET, PI_PROVIDER_ID_RE, PI_PROVIDER_ID_BLOCKED, piProvidersBag, piHasProvider, sendPiWriteError, PROTECTED_IDS, modelsUrl, bigmodelAuxModelsUrl, readPiMcp, MCP_ROUTE_PREFIX, compareVersions, resolvePiProvider } from './core.js'
 export { writePiMcp } from './pi-providers.js'
@@ -164,11 +166,6 @@ export function taskWorkdirForEngine(engine) {
 }
 // 过程流轮转阈值：live 文件超限即重开（从头写），长任务不把诊断流膨胀到 GB 级。
 const LIVE_ROTATE_BYTES = 10 * 1024 * 1024
-
-// ── Codex 卡点求助（consult）──
-// 进程内队列：{ id, from, task, stuckContext, at }。只留最近 20 条，主 AI 定期收卷。
-// 不落盘、不脱敏：这里是两个引擎之间的内部信道，不是给用户的展示面。
-export const consults = []
 
 // ── 吞错留痕（D，2026-10-25）──
 // 原先大量 best-effort 分支裸 catch 静默吞错（「配置没写进去」无从排查）。统一去处：
@@ -331,8 +328,20 @@ export const AGENTS_BASE_URL = (() => {
   } catch { /* 非 Linux / 无权限：落 3080 */ }
   return 'http://127.0.0.1:3080'
 })()
-// P4.26：Pi 的通知段用 Pi 的身份（标题与 from 字段），其余文案两引擎通用。
-// 只替换这两处 —— 段里其它「Codex」字样出现在历史/对照语境，不影响 Pi 照做。
+function consultInstruction(from, taskId) {
+  return `卡住就 POST /api/consult 并回传 taskId：
+  curl -fsS -X POST ${AGENTS_BASE_URL}/second-engine/api/consult -H 'Content-Type: application/json' \\
+    -d '{"from":"${from}","task":"<当前任务一句话>","taskId":"${taskId}","stuckContext":"<试过什么、错在哪、需要什么>"}'`
+}
+
+export function withConsultPrompt(prompt, taskId, from = 'codex') {
+  return `【卡点求助】同一路径连续失败 2 次、绕圈或缺少必要信息/权限时，${consultInstruction(from, taskId)}
+只填任务摘要和卡点，勿提交凭证。提交后带已有成果正常结束，如 HTTP 不通则在输出末尾写 [CONSULT-NEEDED] <卡点描述>。
+
+${prompt}`
+}
+
+// 各引擎复用同一协议，替换标题和 from 字段。
 function agentsSectionFor(targetPath) {
   const p = String(targetPath)
   // 三值化：原来只有 Pi 分支，Claude 的 ~/.claude/CLAUDE.md 会落进 Codex 默认分支，
@@ -349,9 +358,7 @@ const AGENTS_SECTION = `${AGENTS_MARK}
 - 你是 DeepSeek Harness（DSH）里的「第二引擎」执行体，由插件 dsh-second-engine 唤起；与主 AI（DSH）互为伙伴；派单、复核、验收都来自 DSH 主 AI，最终决策在用户。
 
 卡点自救协议：
-- 同一路径/命令连续失败 2 次、或在绕圈、或缺信息/权限无法自行获取时，必须主动求助而非硬试：
-  curl -s -X POST ${AGENTS_BASE_URL}/second-engine/api/consult -H 'Content-Type: application/json' \\
-    -d '{"from":"codex","task":"<当前任务一句话>","stuckContext":"<试过什么、错在哪、需要什么>"}'
+- 同一路径/命令连续失败 2 次、或在绕圈、或缺信息/权限无法自行获取时，${consultInstruction('codex', '<工单给出的 taskId>')}
   提交后正常结束会话（输出已有成果），主 AI 会带建议回来。
 - 若 HTTP 不通，在最终输出末尾追加一行：[CONSULT-NEEDED] <卡点描述>。
 - 只在指定工作副本内写文件；最终决策权在主 AI 与用户。
@@ -956,7 +963,7 @@ async function reconcileOnce() {
 
   // ② 作业探活：仅对内存中 running 的作业判失联（健康作业一律不碰）
   for (const task of tasks.values()) {
-    if (task.status !== 'running') continue
+    if (task.status !== 'running' || isFinalizingJob(task)) continue
     // P2：取消中的任务内部 status 仍是 running（终态待 finalize），别让探活抢先判失联。
     if (rtOf(task).isCancelled()) continue
     const why = probeTaskLost(task)
@@ -972,7 +979,7 @@ async function reconcileOnce() {
     if (typeof rt.finalize === 'function') {
       try { await rt.finalize({ exitCode: -1, lost: why }) } catch { /* best effort */ }
     }
-    if (finalizeTask(task, -1, 'error') && !rtOf(task).isCancelled()) void notifyTask(task)
+    if (await finalizeTask(task, -1, 'error') && !rtOf(task).isCancelled()) void notifyTask(task)
     actions.push(`task:${task.id}:${why}`)
   }
 
@@ -1593,24 +1600,24 @@ export function startWatchdog(task) { rtOf(task).startWatchdog() }
 // 读 output / 置状态 / 删 outPath(+.live) / 追加 consult 块，只落定一次。
 // 首次落定即返回 true（后续重复调用是 no-op），保证通知只发一次。
 
-// consult 关联（A，2026-10-25）：优先按 consult.taskId === task.id 精确绑定；
-// 旧数据（无 taskId）才回退「at >= 任务开始」时间窗。
-function consultsForTask(task) {
-  const started = typeof task.startedAt === 'number' ? task.startedAt : 0
-  return consults.filter((c) =>
-    (typeof c.taskId === 'string' && c.taskId !== '' && c.taskId === task.id)
-    || ((c.taskId === undefined || c.taskId === null || c.taskId === '') && typeof c.at === 'number' && c.at >= started))
-}
-
 // P2.3（2026-10-28）：finalizeJob 的 extra 是历史旁路 —— 若允许任意字段，等于给
 // 「终态唯一落定」开一个后门（任何调用方都能绕过 status/exitCode 直接改 task）。
 // 当前唯一调用方 finalizeReview 只传这两个复核专属字段，故按白名单收口。
 const FINALIZE_EXTRA_ALLOWED = new Set(['verdict', 'error'])
+const finalizingJobs = new WeakSet()
 
-export function finalizeJob(task, exitCode, status, extra) {
-  if (task.endedAt !== null && task.endedAt !== undefined) return false
+export function isFinalizingJob(task) { return finalizingJobs.has(task) }
+
+export async function finalizeJob(task, exitCode, status, extra) {
+  if (task.endedAt != null || isFinalizingJob(task)) return false
+  finalizingJobs.add(task)
   clearCancelTimers(task)
   stopWatchdog(task)
+  const endedAt = Date.now()
+  // Keep the job running in the API until output includes the persisted consults.
+  let fresh = []
+  try { fresh = await consultsForTask(task.id) } catch (e) { noteErr('consult-read', e) }
+  finally { finalizingJobs.delete(task) }
   // exitCode 省略 = 保留调用方已记的值：复核每轮在 runReview 里自记 exitCode，不能覆盖。
   if (exitCode !== undefined) rtOf(task).setExitCode(exitCode)
   task.status = status
@@ -1630,23 +1637,19 @@ export function finalizeJob(task, exitCode, status, extra) {
   try { unlinkSync(jobOutPath) } catch { /* 文件可能本就没生成/已被逐轮清理，忽略 */ }
   try { unlinkSync(`${jobOutPath}.live`) } catch { /* 未生成或已被清，忽略 */ }
   try { unlinkSync(`${jobOutPath}.live.1`) } catch { /* 轮转备份同一收尾时机删除 */ }
-  // 本次任务期间收到过 Codex 卡点求助？追加进 output —— 主 AI 收单必读 output，这是它唯一必经的通道。
-  // 互审是最容易绕圈求助的场景，统一路径后两条收尾天然都不漏。
-  try { appendConsultBlock(task, consultsForTask) } catch (e) { noteErr('consult', e) }
-  task.endedAt = Date.now()
+  try { appendConsultBlock(task, () => fresh) } catch (e) { noteErr('consult', e) }
+  task.endedAt = endedAt
   finishSpawnAudit(rtOf(task).child(), exitCode, rtOf(task).child()?.signalCode, new Date(task.endedAt).toISOString())
   accountJob(task)
-  // Defer until finalizeTask/finalizeReview finish their synchronous adjustments.
-  queueMicrotask(() => completeNativeJob(task))
   return true
 }
 
 // 工单收尾：统一走 finalizeJob。
-export function finalizeTask(task, exitCode, status) {
+export async function finalizeTask(task, exitCode, status) {
   // 顺序很重要：finalizeJob 会用工单的 -o 文件**覆盖** task.output，
   // 所以外部事实验收必须放在它之后 —— 否则追加的失败原因会被冲掉
   //（2026-11-06 实测：假成功单 status=error 但 output 里只有模型回答、没有原因）。
-  const first = finalizeJob(task, exitCode, status)
+  const first = await finalizeJob(task, exitCode, status)
   if (first && task.engine === 'claude' && status === 'done') {
     const verification = verifyClaudeEffect({ ...task, exitCode })
     if (!verification.ok) {
@@ -1654,7 +1657,10 @@ export function finalizeTask(task, exitCode, status) {
       task.output = `${typeof task.output === 'string' ? task.output : ''}${task.output ? '\n' : ''}${verification.reason}`
     }
   }
-  if (first) publishTaskReport(task, buildReport(task))
+  if (first) {
+    publishTaskReport(task, buildReport(task))
+    queueMicrotask(() => completeNativeJob(task))
+  }
   return first
 }
 
@@ -1844,7 +1850,7 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
         boardId,
         outPath: join(CODEX_DIR, `task-${piId}.out`),
         workdir,
-        prompt,
+        prompt: withConsultPrompt(prompt, piId, 'pi'),
         model: typeof body.model === 'string' ? body.model : undefined,
         provider: typeof body.provider === 'string' ? body.provider : undefined,
       })
@@ -1861,7 +1867,7 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
         boardId,
         outPath: join(CODEX_DIR, `task-${claudeId}.out`),
         workdir,
-        prompt,
+        prompt: withConsultPrompt(prompt, claudeId, 'claude'),
         model: typeof body.model === 'string' ? body.model : undefined,
         // 2026-11-10：按单次工单临时授权的工具（如 WebSearch）。不传 = undefined，
         // claude-args 的 normalizeTools 回退默认四件套，全局白名单不变。
@@ -1882,7 +1888,7 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
         id,
         outPath,
         workdir,
-        prompt,
+        prompt: withConsultPrompt(prompt, id),
         envKey: `${active.id.toUpperCase()}_API_KEY`,
         apiKey: active.apiKey,
         boardId,
@@ -1914,7 +1920,7 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
     // stdin EPIPE 兜底：codex 启动失败/早退时写 stdin 触发的是异步 error 事件，
     // 不挂监听器即 uncaughtException，整个 Web 宿主跟着崩。
     child.stdin?.on('error', () => { /* codex 已退出：exit/error 回调收尾 */ })
-    child.stdin?.write(prompt)
+    child.stdin?.write(withConsultPrompt(prompt, id))
     child.stdin?.end()
     // stdout/stderr 必须持续排空：长任务过程流写满管道缓冲（~64KB）后 codex 被写阻塞、永不退出
     // → 看门狗 300s 误杀（2026-09-24 三单复现实证）。
@@ -1982,7 +1988,7 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
     void persistBoardChild(task)
     startWatchdog(task)
 
-    child.on('exit', (code, signal) => {
+    child.on('exit', async (code, signal) => {
       // 被取消的任务固定 cancelled/-1；其余按真实退出码判定。
       // 2026-10-28（P1.2）：取消是独立终态，不再与失败混用 'error' —— 客户端
       // lib/client.js:1349/:1509 已把 'cancelled' 当合法值（显示「已取消」）。
@@ -1992,15 +1998,16 @@ export async function createTask(body, res, budgetChecked = false, onTaskId) {
       // 记录终止信号：exitCode=-1 时只有它能区分「外部 SIGTERM/SIGKILL」与「spawn 失败」。
       rtOf(task).setLastSignal(signal)
       // 取消是用户主动动作，收尾读 output，但不再打扰一次通知。
-      if (finalizeTask(task, exitCode, status) && !cancelled) void notifyTask(task)
+      const finalized = finalizeTask(task, exitCode, status)
       try { liveStream.end() } catch { /* best effort */ }
+      if (await finalized && !cancelled) void notifyTask(task)
     })
     // spawn 失败（如二进制缺失）不触发 exit，这里兜底收尾；错误原因记进 task.error，
     // 外部才能诊断（原先 err 被丢弃，只剩 status:'error' 与空 output）。
-    child.on('error', (e) => {
+    child.on('error', async (e) => {
       task.error = errMsg(e)
       try { liveStream.end() } catch { /* best effort */ }
-      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+      if (await finalizeTask(task, -1, 'error')) void notifyTask(task)
     })
 
     send(res, { ok: true, id })
@@ -2225,19 +2232,19 @@ export async function handleConfigSet(req, res) {
 }
 
 // ── /consult、/consults：Codex 卡点求助信道 ──
-// 供第二引擎（Codex）在卡住时把上下文交给主 AI；内存队列，不落盘。
+// 供第二引擎在卡住时把上下文交给主 AI；历史落盘，最近的记录留内存。
 async function handleConsultCreate(req, res) {
   try {
     const body = await readBody(req)
     const from = typeof body.from === 'string' && body.from.trim() !== '' ? body.from.trim() : 'codex'
     const task = typeof body.task === 'string' ? body.task.trim() : ''
     const stuckContext = typeof body.stuckContext === 'string' ? body.stuckContext.trim() : ''
-    // A（2026-10-25）：可选 taskId —— 工单 prompt 里带上任务 id 时 Codex 原样回传，
-    // consultsForTask 按它精确归属到对应工单；空/缺省走旧时间窗兜底。
+    // 兼容旧调用方省略 taskId。无归属的求助仍可在 /consults 查询。
     const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : ''
     if (task === '') return send(res, { ok: false, error: 'task 不能为空' }, 400)
     if (stuckContext === '') return send(res, { ok: false, error: 'stuckContext 不能为空' }, 400)
 
+    await loadRecentConsults()
     const entry = {
       id: newId(),
       from,
@@ -2246,9 +2253,7 @@ async function handleConsultCreate(req, res) {
       taskId,
       at: Date.now(),
     }
-    consults.push(entry)
-    // 上限 20：超了从最旧一条开始丢（求助是短时效信号，留新不留旧）。
-    while (consults.length > CONSULT_KEEP_LIMIT) consults.shift()
+    recordConsult(entry)
 
     // 通知按现有 NOTIFY_URL 方式发：text 用 task 摘要，正文走 /consults 取。
     notify(clipText(task.replace(/\s+/g, ' '), 120), 'Codex 求助')
@@ -2658,8 +2663,8 @@ export function apply(ctx) {
       { kind: 'exact', method: 'GET', path: '/second-engine/api/reviews', desc: '复核历史（~/.codex/reviews 持久化记录，倒序；?limit=）', handler: handleReviewsList },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/config', desc: '读/写插件配置 { reviewRounds: 1|3|5 }', handler: handleConfigRoot },
       { kind: 'exact', method: 'GET|POST', path: '/second-engine/api/hint-toggles', desc: '读/写提示开关 { vocabulary, interruption, mechanical }', handler: handleHintToggles },
-      { kind: 'exact', method: 'POST', path: '/second-engine/api/consult', desc: 'Codex 卡点求助入队（内存 20 条 + 弹 App 通知）', handler: handleConsultCreate },
-      { kind: 'exact', method: 'GET', path: '/second-engine/api/consults', desc: '求助列表（不脱敏，给主 AI 收卷）', handler: handleConsultsList },
+      { kind: 'exact', method: 'POST', path: '/second-engine/api/consult', desc: '卡点求助入队（异步落盘 + App 通知）', handler: handleConsultCreate },
+      { kind: 'exact', method: 'GET', path: '/second-engine/api/consults', desc: '最近 20 条求助，或 ?since=<id|毫秒时间戳|ISO 时间> 拉取落盘增量（返回 nextSince）', handler: handleConsultsList },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/version', desc: '本机 codex 版本 vs GitHub 最新 release（updateAvailable）', handler: handleVersion },
       { kind: 'exact', method: 'GET', path: '/second-engine/api/plugin-version', desc: '插件自身版本 vs GitHub 最新 release（失败静默，无更新不提示）', handler: handlePluginVersion },
       { kind: 'exact', method: 'POST', path: '/second-engine/api/_exp/wake', desc: '实验：唤醒休眠 DSH 会话并投递用户消息 { sessionId, text }（暂不传 setup）', handler: (req, res) => handleExperimentalWake(wctx, req, res) },

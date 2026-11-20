@@ -82,12 +82,13 @@ DSH 侧**两条路都能叫到 Codex**，别混：
 
 ## 0.4 工具优先：本插件服务层（HTTP 兜底见 `references/ref-http-api.md`）
 
-**优先用原生工具（九个，P0→P2 已真机验收）**——会话工具列表有 `second_engine_*` 时别手拼 curl：
-- `second_engine_task {prompt, workdir?, engine?(codex|claude|pi), ephemeral?}` → `{id,status}`（秒回，不阻塞）
+**优先用原生工具（十个，P0→P2 已真机验收；`bridge_send` 2026-11-21 补）**——会话工具列表有 `second_engine_*` 时别手拼 curl：
+- `second_engine_task {prompt, workdir?, engine?(codex|claude|pi), ephemeral?}` → `{id,status,warnings?}`（秒回，不阻塞；2026-11-21 起工具内部做**派单预检**（engine 与 active 不符/不可用/无 key）与**派后自检**（3 秒内无 pid 判「可能未真正挂上」），只往 `warnings[]` 报、不拦单；面板接口 `/api/tasks` 不含此字段）
 - `second_engine_job_get {kind:'task'|'review', id}` → 状态 + output（≤4000 字，超出看 `outputTruncated`；review 的 output 是 `{verdict,rounds,issues}` JSON，issues=最后一轮）
 - `second_engine_job_cancel {kind, id}`
 - `second_engine_review_start {content, workdir?, files?, rounds?}` → 句柄+状态（异步，不承诺立即给 verdict）；`second_engine_review_reply {prev, reply:[{issueId,decision,reason}]}` → 新句柄
 - `second_engine_bridge_start / bridge_stop / bridge_status {engine}`（明确引擎；stop 同步期望态防自动恢复拉起）
+- `second_engine_bridge_send {engine, text}` → `{ok, text, tokens, engine}`（桥对话：发一条收流式回复。**不自动起桥**，桥没跑返回 `BRIDGE_UNAVAILABLE`，先 `bridge_start`；codex 桥以 `kind:done` 收尾、claude/pi 以 `kind:end` 收尾，两种都算完成；token 按引擎分（codex 读状态目录、pi 读 `PI_BRIDGE_TOKEN`、claude loopback 免）；超时/断流返回 `status:unknown` 不重试）
 - `second_engine_status {}` → 全引擎本机运行态（active/available/keyConfigured/model/bridge），不联网、不启动引擎、已脱敏
 判据：**派单 / 收卷 / 复核 / 起停桥 / 查状态一律先看工具**；只有**改引擎全局配置（config / providers / model / key）/ 查全量路由 / 面板操作**才走 HTTP。超时 ≠ 未创建，不自动重试。
 
@@ -304,7 +305,9 @@ bash tools/dual-board/accept.sh T1 --test "python3 -m unittest discover -s tests
 
 **只跨引擎多开**（Codex + Pi + Claude；同引擎两桥边际收益低）。**桥没有 `task.output` ⇒ 必须各自 `board.sh new` 记账**；`BRIDGE_STATE_DIR` **一桥一目录**（`.pid`/`.as.pid`/`.token` 会互相覆盖）；收尾 `ctl.sh stop` + Pi 桥按精确 PID 结束。三条启动命令、端口组合与进程数实测 → `references/ref-dual-board.md` §8。
 
-## 3.1 派单前：先跑机械校验（2026-11-10 起）
+## 3.1 派单前：先跑机械校验（2026-11-10 起 · 2026-11-21 补：工具层已内置）
+
+> **2026-11-21 起**：`second_engine_task` 工具内部已内置「预检（engine/active/可用/key）+ 派后自检（pid/startedAt）」，结果只进 `warnings[]`。脚本仍是**纪律层**且更细（prompt 缺句、空产出风险、通道选择），两者不互替：脚本管「单子该怎么写」，工具管「这单真挂上了吗」。
 
 **责任在主 AI 不在 Codex**：主 AI 没有推送通道，档位只能自己查。**先跑这条**（只读、不派单、不切档）：
 
@@ -389,12 +392,12 @@ CHECKPOINTS:
 
 ## 3.6 标准流程（下发 → 等待 → 验收 → 互审 → 求助）
 
-1. **下发**：优先调原生工具 `second_engine_task {prompt, workdir?, engine?, ephemeral?}`（返回 `{id,status}`）；会话没有该工具时走 HTTP 兜底（等价路径）。工单自包含、小粒度（Codex 零记忆）；workdir 默认 `~/proj`（**绝不进主工作区**）；默认 `--ephemeral` 不落盘（审计靠 git diff）。返回 `{id}` 即异步开跑。
+1. **下发**：优先调原生工具 `second_engine_task {prompt, workdir?, engine?, ephemeral?}`（返回 `{id,status}`）；会话没有该工具时走 HTTP 兜底（等价路径）。工单自包含、小粒度（Codex 零记忆）；workdir 默认 `~/proj`（**绝不进主工作区**）；默认 `--ephemeral` 不落盘（审计靠 git diff）。返回 `{id,status,warnings?}` 即异步开跑——**先读 warnings**，有「未真正挂上」再查证，别当成功。
 2. **等待**：`bash <插件目录>/tools/wait-task.sh <id> [间隔=5] [超时=600]` 放**后台 job**，job 结束时运行时通知我（0=done / 2=失败 / 3=不存在 / 4=接口不可用 / 124=超时）——**禁止自写 `sleep`+`curl` 轮询**。中途想看进度用 `second_engine_job_get`（只查询、不唤醒），别拿 `liveBytes` 判完成。
    ⚠️ **"放后台 job"的具体做法**（2026-11-03 补，因主 AI 连续两次没照做）：调 `bash` 时就带 `run_in_background:true`，**不要前台跑着等**——前台跑满超时会被动转后台，白占一个等待周期且期间什么都收不到。job 结束时运行时会通知主 AI，**这是唯一非轮询的获知途径**：插件完成只弹 App 通知给用户，主 AI 没有被动通道；`GET /api/task?id=` 的 `liveBytes/tokens` 是判进度、不是判完成的依据。
 3. **验收**：`second_engine_job_get {kind,id}` 读 output（review 看 verdict/rounds/issues）+ 工作目录 `git diff` 审查 → apply / 打回（新工单指出问题）/ 升级用户裁决。**接口类**（API / CLI / 鉴权 / 网关 / 桥接）另加一条「应当被拒绝」的失败路径实测与落地状态；只贴成功响应壳不算验收（2026-11-18 蒸馏，精简记）。
 4. **互审**：把主 AI 产出（结论/方案/diff）用 `second_engine_review_start {content, files?, rounds?}` 发起，Codex 批判复核（上限内自动多轮，零新增即收敛，**最终结论一次上交用户裁决**）；回辩用 `second_engine_review_reply`；单轮需求改走工单，判据见「三条道并行」。
-5. **求助响应**：`GET /api/consults` 看 Codex 卡点（手机通知会提示）→ 针对性下工单解围。HTTP 不通时它在输出末尾写 `[CONSULT-NEEDED] <卡点描述>`；**触发阈值＝同一路径/命令失败 2 次**（插件 `AGENTS_SECTION` / `~/.codex/AGENTS.md` / `~/proj/AGENTS.md` 三处对齐）。
+5. **求助响应**：`GET /api/consults` 看 Codex 卡点（手机通知会提示；2026-11-21 起记录落 `~/.dsh/second-engine/consults.jsonl`，可用 `?since=<求助id|毫秒|ISO>` 拉增量，返回带 `nextSince`）→ 针对性下工单解围。HTTP 不通时它在输出末尾写 `[CONSULT-NEEDED] <卡点描述>`；**触发阈值＝同一路径/命令失败 2 次**（插件 `AGENTS_SECTION` / `~/.codex/AGENTS.md` / `~/proj/AGENTS.md` 三处对齐）。
 
 ### 3.6.1 长任务补充
 
@@ -412,7 +415,7 @@ CHECKPOINTS:
 
 ## 3.9 它喊我，我不查就看不到（consult 归属判据，2026-10-14 实测）
 
-consult 走 `POST /api/consult`、记录进 `GET /api/consults`，但**主 AI 侧没有被动通道** ⇒ **派单前记基线 → 收单后比增量 → 收尾前再查一次**。2026-10-25 起 consult 记录支持 `taskId`（派单 prompt 写明「你的工单 id 是 X，consult 时回传」即精确归属）；不带时增量法仍是唯一可靠判据：
+consult 走 `POST /api/consult`、记录进 `GET /api/consults`（2026-11-21 起**落盘** `~/.dsh/second-engine/consults.jsonl`，`?since=` 拉增量、跨重启可查；内存最近 20 条仍在），但**主 AI 侧仍没有被动通道**（没有 push，只能主动查） ⇒ **派单前记基线 → 收单后比增量 → 收尾前再查一次**。2026-10-25 起 consult 记录支持 `taskId`（派单 prompt 写明「你的工单 id 是 X，consult 时回传」即精确归属）；不带时增量法仍是唯一可靠判据：
 
 
 ✅ 收尾时**本任务期间**的求助会自动以 `[SECOND_ENGINE_CONSULT]` 块追加进 `task.output`（2026-10-14 起，收单读 output 即见）。仍会漏的两场景：① 任务永不结束（`finalizeTask` 不跑）→ 看 `GET /api/task` 的 **`stuckSuspect:true`**（看门狗 300s 无输出置位）就转去查 consults；② review 内部循环 → 2026-10-25 起 `finalizeReview` 已统一走 `finalizeJob`，不再单独漏。

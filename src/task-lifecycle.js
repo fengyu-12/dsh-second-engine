@@ -12,7 +12,7 @@ import { tasks } from './state.js'
 import { tokenTotal } from './token-ledger.js'
 import { claudeCredentialsFromConfig } from './claude-providers.js'
 
-import { finalizeTask, loadKeyring, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, viewStatus } from './index.js'
+import { finalizeTask, isFinalizingJob, loadKeyring, notifyTask, persistBoardChild, progressEntry, pruneTasks, rtOf, startWatchdog, viewStatus } from './index.js'
 
 export async function handleModels(req, res) {
   if (activeEngineId() === 'pi') return piModels(req, res)
@@ -178,23 +178,23 @@ export function startAppServerTask({ res, id, outPath, workdir, prompt, envKey, 
   pruneTasks()
   startWatchdog(task)
 
-  handle.run.catch((e) => {
+  handle.run.catch(async (e) => {
     rtOf(task).setAppError(errMsg(e))
     // P1.2（2026-10-28 补漏）：取消在 appserver 分支走的是 handle.done 的 reject，
     // 不经过 exec 的 child.on('exit')。三处收尾都要认 task.cancelled，否则取消仍落 'error'。
     const cancelled = rtOf(task).isCancelled()
-    if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
+    if (await finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
   })
   handle.done
-    .then((r) => {
+    .then(async (r) => {
       const cancelled = rtOf(task).isCancelled()
       const ok = r.status === 'completed' && !cancelled
-      if (finalizeTask(task, cancelled ? -1 : (ok ? 0 : 1), cancelled ? 'cancelled' : (ok ? 'done' : 'error')) && !cancelled) void notifyTask(task)
+      if (await finalizeTask(task, cancelled ? -1 : (ok ? 0 : 1), cancelled ? 'cancelled' : (ok ? 'done' : 'error')) && !cancelled) void notifyTask(task)
     })
-    .catch((e) => {
+    .catch(async (e) => {
       rtOf(task).setAppError(errMsg(e))
       const cancelled = rtOf(task).isCancelled()
-      if (finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
+      if (await finalizeTask(task, -1, cancelled ? 'cancelled' : 'error') && !cancelled) void notifyTask(task)
     })
 
   send(res, { ok: true, id, mode: 'appserver' })
@@ -296,7 +296,7 @@ export function startClaudeTask({ res, id, outPath, workdir, prompt, model, allo
       await persistBoardChild(task)
     } catch (e) {
       rt.setAppError(errMsg(e))
-      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+      if (await finalizeTask(task, -1, 'error')) void notifyTask(task)
       send(res, { ok: false, error: errMsg(e) })
       return
     }
@@ -305,7 +305,7 @@ export function startClaudeTask({ res, id, outPath, workdir, prompt, model, allo
     try {
       const ev = await rt.done()
       const status = ev.aborted || task.cancelled === true ? 'cancelled' : (ev.exitCode === 0 ? 'done' : 'error')
-      if (finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
+      if (await finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
     } catch { /* 上面 catch 已收尾 */ }
   })()
 }
@@ -345,7 +345,7 @@ export function startPiTask({ res, id, outPath, workdir, prompt, model, provider
       await persistBoardChild(task)
     } catch (e) {
       rt.setAppError(errMsg(e))
-      if (finalizeTask(task, -1, 'error')) void notifyTask(task)
+      if (await finalizeTask(task, -1, 'error')) void notifyTask(task)
       send(res, { ok: false, error: errMsg(e) })
       return
     }
@@ -360,7 +360,7 @@ export function startPiTask({ res, id, outPath, workdir, prompt, model, provider
     try {
       const ev = await rt.done
       const status = ev.aborted || task.cancelled === true ? 'cancelled' : (ev.exitCode === 0 ? 'done' : 'error')
-      if (finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
+      if (await finalizeTask(task, ev.exitCode, status) && status !== 'cancelled') void notifyTask(task)
     } catch { /* 已在上面 catch 收尾 */ }
   })()
 }
@@ -379,6 +379,7 @@ export async function cancelTask(id, res) {
     if (task.status !== 'running') {
       return send(res, { ok: false, error: `任务已结束（${task.status}），无需取消` }, 400)
     }
+    if (isFinalizingJob(task)) return send(res, { ok: false, error: '任务正在收尾，无需取消' }, 400)
     // P2（2026-10-28）：这里只写「取消意图」，不预置终态 —— 终态唯一由 finalizeJob 写。
     // 用户反馈靠 viewStatus() 立刻可见（cancelled 信号 + 仍是 running → 对外显示 cancelled）；
     // output 留给 exit 回调收尾，那样能拿到进程退出前的完整输出。
@@ -397,9 +398,9 @@ export async function cancelTask(id, res) {
           rtOf(task).setForcedKill()
         }
       } catch { /* best effort */ }
-      timers.forceFinalize = setTimeout(() => {
+      timers.forceFinalize = setTimeout(async () => {
         if (task.endedAt !== null && task.endedAt !== undefined) return
-        if (finalizeTask(task, -1, 'error')) {
+        if (await finalizeTask(task, -1, 'error')) {
           task.output = `${task.output === '' ? '' : `${task.output}\n`}${CANCEL_FORCE_FINALIZE_MESSAGE}`
           void notifyTask(task)
         }

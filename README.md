@@ -471,10 +471,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.3.0）
+## 支持能力一览（v4.4.0）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
+| **4.4.0 桥对话 + 派单预检 + consult 落盘** | ✅ 4.4.0 | ① **十个 DSH 原生工具**：新增 `bridge_send {engine,text}`——往已跑的桥发一条收流式回复（**不自动起桥**；codex 用 `kind:done`、claude/pi 用 `kind:end` 收尾；token 按引擎分：codex 读状态目录 / pi 读 `PI_BRIDGE_TOKEN` / claude loopback 免）② **派单预检 + 派后自检**：`second_engine_task` 返回 `warnings[]`（engine 与 active 不符、引擎不可用、未配 key；3 秒内无 pid 判「可能未真正挂上」），**只报不拦单**，面板接口不含该字段③ **consult 落盘**：`~/.dsh/second-engine/consults.jsonl`，`GET /api/consults?since=<求助id\|毫秒\|ISO>` 增量并返回 `nextSince`，跨重启可查；收尾按 taskId 从 jsonl 收齐再追加 `[SECOND_ENGINE_CONSULT]`④ **引擎升级适配**：Codex 0.171.0 / Pi 1.6.0 / Claude Code 2.1.329（三关检验全过） |
 | **4.3.0 原生工具 + 通知修复 + 回执闭环** | ✅ 4.3.0 | ① **九个 DSH 原生工具**：`task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status`（裸定义 + `inject=['settings','tools']`）；修 createTask 误报 `EXECUTION_FAILED`（detached async 与 capture 抢跑）与 `job_get` review 空 output（按 kind 拼 `{verdict,rounds,issues}`）② **完成通知修复**：写死 3090 改为 `DSH_BRIDGE_PORT`（默认 3091）、token 从 query 改 `X-Token` 头、回执首段精确匹配 ③ **mood-watch 回执闭环**：监听 `session/event` 的 `assistant/message` 缓存最终回复（每会话 1 条、总 50、消费一次）；`quote` 退出判定（只认 `[MW_ACK]` 框架 + event/verdict/action）；恢复缺回执第 2 次提醒（同事件 ID）④ **bridge Web**：DOM/数据分离、围栏代码块、流式节流、回车发送/移动端焦点/元数据分离；后端 transcript 补 `ts`（UTC ISO，协议核对单位、缺时间不伪造）⑤ **skill 拆卷**：HTTP 兜底收进 `references/ref-http-api.md`、机械量收进 `ref-fallback-measures.md`；派单纪律补「具名风险 / 报告只当待查声明 / 接口类失败路径验收」 |
 
 
@@ -488,6 +489,7 @@ Codex 升到 **0.166.0**，命令面新增 `review` / `mcp` / `plugin` / `update
 
 ## 有哪些坑要提前知道（已知限制）
 
+- **Pi 1.6.0 扩展 API breaking**：extension 的 `render()` 返回 `readonly string[]`（原地改元素会失效），`find` 的路径模式改为相对搜索目录（`src/*.ts` 不再匹配 `pkg/src/a.ts`）。本机未装 Pi 扩展故当前零影响；日后装了扩展又见面板不刷新，先查这条；
 - **沙箱**：proot 环境无 Landlock / bubblewrap，Codex 需 `danger-full-access` 运行——安全防线在流程层（工作副本隔离 + diff 审查 + git 仲裁），**不要把主工作区直接交给 Codex**；
 - **翻译桥**：实验性；内部以非流式请求上游、以流式事件回放，长任务首包延迟等于整段生成时间；
 - **工单记录**：任务视图仍是内存态，重启 Web 即清空；**但派单的 `child_pid/child_start` 已落看板**，重启后 60s 清扫可识别「持有进程已死」并 `block`；token 用量落 `~/.codex/second-engine-token-ledger.jsonl`；

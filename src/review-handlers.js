@@ -7,10 +7,11 @@ import { send, noteErr, atomicWriteFileSync, errMsg, INDEPENDENT_SOURCES, QUORUM
 import { gitPorcelain } from './git.js'
 import { newId, queryParam, readBody } from './io.js'
 import { pruneReviewFiles } from './cleanup.js'
+import { completeNativeJob } from './native-completion.js'
 import { appendReviewIssuesBlock, issuesHash, ledgerConverged, ledgerEntryOf, ledgerIndex, parseReviewJson } from './parse.js'
 import { REVIEW_DEFAULT_TOKEN_LIMIT, REVIEW_DEFAULT_WALL_MS, REVIEW_MIN_TOKEN_LIMIT, REVIEW_MIN_WALL_MS, normalizeIssue, normalizeLedgerEntries, normalizeReply, normalizeResponses } from './normalize.js'
 import { buildReviewContext, buildReviewPrompt, clipText, mergeRoundIntoLedger, readReviewOut, spawnReviewRound } from './review-core.js'
-import { taskWorkdirForEngine, checkTokenBudget, ensureGitBaseline, ensureIssueIds, finalizeJob, isBlockedVerdict, loadKeyring, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, viewStatus } from './index.js'
+import { taskWorkdirForEngine, checkTokenBudget, ensureGitBaseline, ensureIssueIds, finalizeJob, isBlockedVerdict, isFinalizingJob, loadKeyring, notifyTask, pruneTasks, readProcStartTime, resolveResponseIds, rtOf, startWatchdog, viewStatus, withConsultPrompt } from './index.js'
 
 // ── 判据冻结（2026-11-06）──
 // 只冻结：被审 content 的 sha256 + body.files 显式列举的文件。没传 files = 只冻结 content，
@@ -79,8 +80,8 @@ function appendStaleBlock(task) {
     + `${reasons.map((r) => `- ${r}`).join('\n')}\n`
 }
 
-export function finalizeReview(task, status, verdict, error) {
-  const first = finalizeJob(task, undefined, status, {
+export async function finalizeReview(task, status, verdict, error) {
+  const first = await finalizeJob(task, undefined, status, {
     verdict,
     error: typeof error === 'string' ? error : '',
   })
@@ -92,6 +93,7 @@ export function finalizeReview(task, status, verdict, error) {
       try { appendReviewIssuesBlock(task, { clipText }) } catch (e) { noteErr('review-issues-block', e) }
     }
     try { persistReviewRecord(task) } catch (e) { noteErr('review-persist', e) }
+    queueMicrotask(() => completeNativeJob(task))
   }
   return first
 }
@@ -111,7 +113,7 @@ export async function captureReviewDirty(task) {
 export async function finishReview(task, status, verdict, error, notifyDone = true) {
   await captureReviewDirty(task)
   const effectiveVerdict = applyStaleCheck(task, status, verdict)
-  if (finalizeReview(task, status, effectiveVerdict, error) && notifyDone) void notifyTask(task)
+  if (await finalizeReview(task, status, effectiveVerdict, error) && notifyDone) void notifyTask(task)
 }
 
 export function reviewRecord(task) {
@@ -257,7 +259,7 @@ export async function runReview(task, active) {
       rtOf(task).setOutPath(outPath)
       // 新一轮：重置活动时间，看门狗从本轮 spawn 起算 300s。
       rtOf(task).heartbeat()
-      const { child, wait, getUsage, getThreadId } = spawnReviewRound({ prompt, workdir: task.workdir, envKey, apiKey: active.apiKey, outPath, threadId: resuming ? threadId : null })
+      const { child, wait, getUsage, getThreadId } = spawnReviewRound({ prompt: withConsultPrompt(prompt, task.id), workdir: task.workdir, envKey, apiKey: active.apiKey, outPath, threadId: resuming ? threadId : null })
       rtOf(task).setChild(child)
       // 互审的探活身份：startWatchdog 在首轮 spawn 前就启动（那时 child 还是 null）记不到
       // pid —— 每轮 spawn 后补记；轮间空窗（child 已退、下一轮未起）清掉，
@@ -660,6 +662,7 @@ export async function cancelReview(id, res) {
     if (task.status !== 'running') {
       return send(res, { ok: false, error: `复核已结束（${task.status}），无需取消` }, 400)
     }
+    if (isFinalizingJob(task)) return send(res, { ok: false, error: '复核正在收尾，无需取消' }, 400)
     // 先置熔断标记：循环每轮结束（及下一轮 spawn 前）都会检查，确保不再推进。
     rtOf(task).setCancelled()
     // P2：不预置 status（终态归 finalizeJob）；verdict 是复核裁决标记，与任务状态无关，保留。
