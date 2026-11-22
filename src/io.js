@@ -69,9 +69,19 @@ export function saveKeyring(doc) {
 // 每次重写 config 前按时间戳另存一份：config.toml.bak-<YYYYMMDD-HHMMSS>，保留最近
 // CONFIG_BACKUP_KEEP 份，旧的清掉。A4（2026-10-26）：此前只在首次写前备份一次 .bak-se，
 // 恢复点永远停在史前版本，之后任何一次重写出问题都只能回滚到最初状态。
-// 只按本方案的文件名模式轮转（config.toml.bak-YYYYMMDD-HHMMSS），不碰史前 .bak-se 和其它文件。
+// 只轮转带后缀的 config.toml.bak-*，显式保留史前回滚点 .bak-se。
 export const CONFIG_BACKUP_KEEP = 5
-export const CONFIG_BACKUP_NAME_RE = /^config\.toml\.bak-\d{8}-\d{6}$/
+export const CONFIG_BACKUP_NAME_RE = /^config\.toml\.bak-.+/
+export function pruneConfigBackups(dir = CODEX_DIR) {
+  const rolling = readdirSync(dir).filter((n) => CONFIG_BACKUP_NAME_RE.test(n)).sort()
+  let removeCount = Math.max(0, rolling.length - CONFIG_BACKUP_KEEP)
+  for (const name of rolling) {
+    if (removeCount === 0) break
+    if (name === 'config.toml.bak-se') continue
+    removeCount -= 1
+    try { unlinkSync(join(dir, name)) } catch { /* best effort */ }
+  }
+}
 export function backupConfig() {
   try {
     if (!existsSync(CONFIG_PATH)) return
@@ -80,10 +90,7 @@ export function backupConfig() {
     const target = join(CODEX_DIR, `config.toml.bak-${t.getFullYear()}${p2(t.getMonth() + 1)}${p2(t.getDate())}-${p2(t.getHours())}${p2(t.getMinutes())}${p2(t.getSeconds())}`)
     copyFileSync(CONFIG_PATH, target)
     chmodSync(target, 0o600)
-    const rolling = readdirSync(CODEX_DIR).filter((n) => CONFIG_BACKUP_NAME_RE.test(n)).sort()
-    for (const name of rolling.slice(0, Math.max(0, rolling.length - CONFIG_BACKUP_KEEP))) {
-      try { unlinkSync(join(CODEX_DIR, name)) } catch { /* best effort */ }
-    }
+    pruneConfigBackups()
   } catch { /* 备份失败不阻断切换（best effort） */ }
 }
 

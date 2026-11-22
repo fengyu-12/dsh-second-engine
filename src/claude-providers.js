@@ -8,12 +8,14 @@
 // 存储：~/.dsh/second-engine/claude-providers.json（0600）
 // 预设：DeepSeek 官方 Anthropic 端点（2026-11-05 实测跑通，模型 deepseek-flash）
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, chmodSync, readdirSync, unlinkSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { randomBytes } from 'node:crypto'
 
 export const CLAUDE_PROVIDERS_PATH = join(homedir(), '.dsh', 'second-engine', 'claude-providers.json')
 export const CLAUDE_MODEL_PATH = join(homedir(), '.dsh', 'second-engine', 'claude-model.txt')
+export const CLAUDE_PROVIDER_BACKUP_KEEP = 5
 
 /** 预设：DeepSeek 官方 Anthropic 端点。apiKey 留空，由用户填或从 keyring 借。 */
 const PRESET = {
@@ -42,9 +44,24 @@ export function loadClaudeProviders() {
   return JSON.parse(JSON.stringify(PRESET))
 }
 
+/** 保存写入前的配置副本，并只轮转本配置自己的备份。 */
+export function backupClaudeProviders(path = CLAUDE_PROVIDERS_PATH) {
+  if (!existsSync(path)) return
+  const backupPath = `${path}.bak-${Date.now()}-${process.pid}-${randomBytes(4).toString('hex')}`
+  copyFileSync(path, backupPath)
+  chmodSync(backupPath, 0o600)
+  const base = path.split('/').pop()
+  const prefix = `${base}.bak-`
+  const backups = readdirSync(dirname(path)).filter((name) => name.startsWith(prefix)).sort()
+  for (const name of backups.slice(0, Math.max(0, backups.length - CLAUDE_PROVIDER_BACKUP_KEEP))) {
+    try { unlinkSync(join(dirname(path), name)) } catch { /* best effort */ }
+  }
+}
+
 /** 写配置（0600；目录不存在则建）。 */
 export function saveClaudeProviders(doc) {
   mkdirSync(dirname(CLAUDE_PROVIDERS_PATH), { recursive: true })
+  backupClaudeProviders()
   writeFileSync(CLAUDE_PROVIDERS_PATH, JSON.stringify(doc, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
 }
 
