@@ -15,7 +15,7 @@
 #   SECOND_ENGINE_WORKDIR  默认工作目录（默认 $HOME/proj）
 #   BRIDGE_AS_PORT / BRIDGE_PORT / CODEX_BIN  同 ctl.sh
 set -e
-SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
 BRIDGE_DIR=${BRIDGE_DIR:-$SELF_DIR}
 KEYRING=${CODEX_KEYRING:-$HOME/.codex/keyring.json}
 DEFAULT_WORKDIR=${SECOND_ENGINE_WORKDIR:-$HOME/proj}
