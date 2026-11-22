@@ -16,6 +16,16 @@
 #   BRIDGE_AS_PORT / BRIDGE_PORT / CODEX_BIN  同 ctl.sh
 set -e
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
+
+# 自愈：/usr/local/bin 入口缺失或指向过期时自动重建（环境层 App 重置/升级会清空）
+SELF_REAL=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
+SELF_NAME=$(basename -- "$SELF_REAL")
+if [ -d /usr/local/bin ] && [ -n "$SELF_NAME" ]; then
+  LINK=/usr/local/bin/$SELF_NAME
+  if [ ! -e "$LINK" ] || [ "$(readlink -f -- "$LINK" 2>/dev/null)" != "$SELF_REAL" ]; then
+    ln -sf -- "$SELF_REAL" "$LINK" 2>/dev/null || true
+  fi
+fi
 BRIDGE_DIR=${BRIDGE_DIR:-$SELF_DIR}
 KEYRING=${CODEX_KEYRING:-$HOME/.codex/keyring.json}
 DEFAULT_WORKDIR=${SECOND_ENGINE_WORKDIR:-$HOME/proj}

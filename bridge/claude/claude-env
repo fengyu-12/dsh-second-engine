@@ -2,6 +2,16 @@
 # Claude Code terminal launcher for the second-engine bridge.
 set -euo pipefail
 
+# 自愈：/usr/local/bin 入口缺失或指向过期时自动重建（环境层 App 重置/升级会清空）
+SELF_REAL=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
+SELF_NAME=$(basename -- "$SELF_REAL")
+if [ -d /usr/local/bin ] && [ -n "$SELF_NAME" ]; then
+  LINK=/usr/local/bin/$SELF_NAME
+  if [ ! -e "$LINK" ] || [ "$(readlink -f -- "$LINK" 2>/dev/null)" != "$SELF_REAL" ]; then
+    ln -sf -- "$SELF_REAL" "$LINK" 2>/dev/null || true
+  fi
+fi
+
 usage() {
   cat <<'TXT'
 用法：claude-env [-h|--help] [-c] [-r] [-u|--url] [Claude 参数...]
