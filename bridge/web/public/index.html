@@ -312,6 +312,10 @@ try {
   }
   .msg.ai { align-items: stretch; }
   .msg.ai .bubble { padding: 0; max-width: none; font-size: var(--fs-body); line-height: 1.75; }
+  /* 围栏代码块（2026-11-18）：复用上面预留的 .codeblock/.cb-*；气泡是 pre-wrap，代码块内部要还原成 pre */
+  .msg.ai .bubble .seg-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.ai .bubble .codeblock { white-space: normal; }
+  .msg.ai .bubble .codeblock code { white-space: pre; }
   .act {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12px; color: var(--muted); line-height: 1.7;
@@ -963,7 +967,7 @@ function replay() {
   seenNotes.clear();
   lastBubble = null;
   for (const entry of entries) {
-    if (entry.t === 'me' || entry.t === 'ai') addMessage(entry.t, entry.text, true);
+    if (entry.t === 'me' || entry.t === 'ai') addMessage(entry.t, entry.text, true, entry);
     else if (entry.t === 'act') addActivity(entry.name, entry.detail, true, entry.full);
     else if (entry.t === 'note') addNote(entry.text, entry.level, true);
   }
@@ -1228,26 +1232,144 @@ function el(tag, cls, text) {
 function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 120; }
 function scroll(force) { if (force || nearBottom()) log.scrollTop = log.scrollHeight; }
 
-function addMessage(who, text, restore) {
-  const box = el('div', 'msg ' + who);
-  // 署名跟引擎走（P5.1）：原来写死 'Codex'，Pi 桥（8788）复用同一页面时会把 Pi 答成 Codex。
-  box.appendChild(el('div', 'who', who === 'me' ? '你' : engineName));
-  const bubble = el('div', 'bubble', text);
+// ── 消息数据与显示分离（2026-11-18）─────────────────────────────
+// AI 消息的原始文本只放在 bubble._raw 和对应 entry.text；DOM 只是渲染结果。
+// 保存、回读一律走 raw，不再从 DOM 的 textContent 读（DOM 里有标签和按钮文字，读回来会污染）。
+// 围栏识别：整行以 ``` 开头才算（缩进 ≤3 空格），```lang 取第一个词作语言；未闭合的围栏当作"仍在流式中的代码块"。
+const FENCE_OPEN = /^ {0,3}```\s*([^`\s]*)[^`]*$/;
+const FENCE_CLOSE = /^ {0,3}```\s*$/;
+function parseSegments(raw) {
+  const segs = [];
+  let buf = [], inCode = false, lang = '';
+  const pushText = () => { if (buf.length) segs.push({ type: 'text', text: buf.join('\n') }); buf = []; };
+  for (const line of raw.split('\n')) {
+    if (!inCode) {
+      const m = FENCE_OPEN.exec(line);
+      if (m) { pushText(); inCode = true; lang = m[1]; continue; }
+      buf.push(line);
+    } else if (FENCE_CLOSE.test(line)) {
+      segs.push({ type: 'code', lang, text: buf.join('\n') });
+      buf = []; inCode = false;
+    } else buf.push(line);
+  }
+  if (inCode) segs.push({ type: 'code', lang, text: buf.join('\n') });
+  else pushText();
+  return segs.filter((s) => s.type === 'code' || s.text !== '');
+}
+
+function makeCodeView() {
+  const box = el('div', 'codeblock');
+  const head = el('div', 'cb-head');
+  const langEl = el('span', 'cb-lang');
+  const btn = el('button', 'cb-copy', '复制');
+  btn.type = 'button';
+  head.appendChild(langEl);
+  head.appendChild(btn);
+  const pre = el('pre');
+  const code = el('code');
+  pre.appendChild(code);
+  box.appendChild(head);
+  box.appendChild(pre);
+  const v = { type: 'code', node: box, langEl, code, text: null, lang: null, timer: 0 };
+  // 复制的是 v.text（解析出的纯代码），不是 DOM 回读，也不含语言标签 / 按钮文字
+  btn.addEventListener('click', () => copyText(v.text, () => {
+    btn.textContent = '已复制';
+    clearTimeout(v.timer);
+    v.timer = setTimeout(() => { btn.textContent = '复制'; }, 1200);
+  }));
+  return v;
+}
+
+// 按下标对账：类型和内容没变的片段不动，只改变化的那一段，避免每次整个气泡重建
+function renderAi(bubble) {
+  const segs = parseSegments(bubble._raw || '');
+  const prev = bubble._view || [];
+  const view = [];
+  segs.forEach((seg, i) => {
+    let v = prev[i];
+    if (!v || v.type !== seg.type) {
+      const fresh = seg.type === 'code' ? makeCodeView() : { type: 'text', node: el('div', 'seg-text'), text: null };
+      if (v) v.node.replaceWith(fresh.node); else bubble.appendChild(fresh.node);
+      v = fresh;
+    }
+    if (seg.type === 'code') {
+      if (v.lang !== seg.lang) { v.lang = seg.lang; v.langEl.textContent = seg.lang || 'code'; }
+      if (v.text !== seg.text) { v.text = seg.text; v.code.textContent = seg.text; }
+    } else if (v.text !== seg.text) {
+      v.text = seg.text;
+      v.node.textContent = seg.text;
+    }
+    view.push(v);
+  });
+  for (let i = segs.length; i < prev.length; i++) prev[i].node.remove();
+  bubble._view = view;
+}
+
+// 消息元数据（role / 时间）只存在 entry 里（t / ts），署名和时间由 renderMeta 从 entry 渲染；
+// 不从 DOM 文本或 class 反查。署名跟引擎走（P5.1）：Pi 桥（8788）复用同一页面时不能写死 Codex。
+// 服务端 transcript 的 entry 没有 ts，就不显示时间（不编造）。
+function renderMeta(box) {
+  const rec = box._entry;
+  if (!rec) return;
+  box._who.textContent = rec.t === 'me' ? '你' : engineName;
+  box._ts.textContent = rec.ts ? when(rec.ts) : '';
+}
+
+function addMessage(who, text, restore, entry) {
+  let rec = entry;
+  if (!restore) { rec = { t: who, text, ts: new Date().toISOString() }; pushEntry(rec); }
+  else if (!rec) rec = { t: who, text };
+  const box = el('div', 'msg ' + rec.t);
+  box._entry = rec;
+  const meta = el('div', 'meta');
+  box._who = el('div', 'who');
+  box._ts = el('span', 'ts');
+  meta.appendChild(box._who);
+  meta.appendChild(box._ts);
+  box.appendChild(meta);
+  renderMeta(box);
+  const bubble = el('div', 'bubble', who === 'ai' ? undefined : text);
   box.appendChild(bubble);
   log.appendChild(box);
   lastBubble = who === 'ai' ? bubble : null;
-  if (!restore) pushEntry({ t: who, text });
+  if (who === 'ai') {
+    bubble._raw = text || '';       // 原始文本：保存 / 回读 / 复制都以它为准
+    bubble._entry = rec || null;    // 流式时直接写这条 entry，不再靠"最后一条"猜
+    bubble._view = [];
+    renderAi(bubble);
+  }
   scroll(true);
   return bubble;
 }
 
+// 流式节流（2026-11-18）：每个 chunk 只累积原始文本（O(1)），DOM 渲染 + 落盘合并到每 AI_FLUSH_MS 一次。
+// end / 结束收尾 / 页面隐藏时强制 flushAgent，保证最终内容完整。
+const AI_FLUSH_MS = 60;
+const aiStats = { chunks: 0, flushes: 0 };   // 自测与排查用：chunks 是收到的块数，flushes 是实际 DOM 更新次数
+let aiDirty = null, aiTimer = 0;
+function flushAgent() {
+  clearTimeout(aiTimer);
+  aiTimer = 0;
+  const b = aiDirty;
+  aiDirty = null;
+  if (!b) return;
+  const stick = nearBottom();        // 要在 DOM 变长之前量，否则大块内容会让"贴底"误判为否
+  renderAi(b);
+  saveEntries();
+  aiStats.flushes++;
+  if (stick) scroll(true);
+}
 function addAgentChunk(text) {
   if (!lastBubble) lastBubble = addMessage('ai', '');
-  lastBubble.textContent += text;
-  const last = entries[entries.length - 1];
-  if (last && last.t === 'ai') { last.text = lastBubble.textContent; saveEntries(); }
-  scroll(false);
+  const b = lastBubble;
+  if (aiDirty && aiDirty !== b) flushAgent();
+  b._raw += text;
+  if (b._entry) b._entry.text = b._raw;
+  aiStats.chunks++;
+  aiDirty = b;
+  if (!aiTimer) aiTimer = setTimeout(flushAgent, AI_FLUSH_MS);
 }
+window.addEventListener('pagehide', flushAgent);
 
 function addActivity(name, detail, restore, full) {
   const preview = detail || '';
@@ -1390,6 +1512,7 @@ async function send() {
           addNote(ev.text, known ? 'warn' : ev.level);
         } else if (ev.kind === 'end') {
           ended = true;
+          flushAgent();
           lastUsage = ev.usage || null;
         } else if (ev.kind === 'done') {
           const tokens = lastUsage && lastUsage.output_tokens ? ` · 输出 ${lastUsage.output_tokens} tok` : '';
@@ -1403,6 +1526,7 @@ async function send() {
     if (err.name === 'AbortError') addNote('已中断', 'warn');
     else addNote(String(err.message || err), 'error');
   } finally {
+    flushAgent();           // 中断 / 报错 / 正常结束都会走到这里，保证缓冲里的文本落到 DOM 和存储
     clearInterval(tick);
     controller = null;
     $('#send').disabled = false;
@@ -1508,12 +1632,35 @@ setInterval(() => {
 }, 5000);
 
 const input = $('#input');
+// 触屏设备（pointer: coarse）保持原行为：Enter 换行，点按钮发送；桌面 Enter 发送、Shift+Enter 换行
+const coarsePointer = window.matchMedia ? window.matchMedia('(pointer: coarse)') : { matches: false };
+if (coarsePointer.matches) { const h = document.querySelector('.hint'); if (h) h.textContent = '点右侧按钮发送'; }
 input.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && !coarsePointer.matches) {
     ev.preventDefault();
     send();
   }
 });
+
+// 移动端键盘：focus / visualViewport 变化时让输入框可见，并在原本贴底时保持贴底
+function keepInputVisible() {
+  const stick = nearBottom();
+  if (input.scrollIntoView) input.scrollIntoView({ block: 'nearest' });
+  if (stick) scroll(true);
+}
+input.addEventListener('focus', () => { setTimeout(keepInputVisible, 300); });   // 等键盘动画
+if (window.visualViewport) {
+  const app = document.querySelector('.app');
+  const fitViewport = () => {
+    const vv = window.visualViewport;
+    const stick = nearBottom();
+    // 键盘遮住的高度；缩放（scale≠1）不算键盘
+    const covered = vv.scale > 1.01 ? 0 : Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    if (app) app.style.height = covered > 80 ? vv.height + 'px' : '';
+    if (stick) scroll(true);
+  };
+  window.visualViewport.addEventListener('resize', fitViewport);
+}
 input.addEventListener('input', () => {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + 'px';
@@ -1527,7 +1674,7 @@ loadRuntimeSettings();
 // 引擎身份取到后：重画静态署名，并把已经渲染出来的气泡署名一并纠正
 // （replay() 在身份回来前就跑完了，不补这一步，历史消息会停在兜底的 Codex 上）。
 loadEngineIdentity().then(() => {
-  log.querySelectorAll('.msg.ai > .who').forEach((node) => { node.textContent = engineName; });
+  log.querySelectorAll('.msg.ai').forEach(renderMeta);
 });
 
 if (!TOKEN) addNote('没有 token：请用启动时打印的完整网址打开本页', 'error');
