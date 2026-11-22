@@ -12,7 +12,7 @@
 //   ④ 持久化     → loadState / saveState（唯一有 IO 的部分，路径由调用方传入）
 //
 // 零第三方依赖；Node >= 18。回执字段是**机器可读标记**，不是自由散文：
-// 「已核对」这类无证据结论一律判失败（quote 必须是用户上一条原话的短引文）。
+// 「已核对」这类无证据结论一律判失败（quote 可选记录，不参与判定）。
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -290,8 +290,8 @@ export function parseAcknowledgement(reply) {
 }
 
 /**
- * 校验回执是否**有证据**。required 默认 quote + verdict + action
- * （conflict 允许显式写「无」，所以不强制非空）。
+ * 校验回执是否**有证据**。required 默认 verdict + action
+ * （quote 可选记录，不参与判定；conflict 允许显式写「无」，所以不强制非空）。
  */
 export function verifyAcknowledgement(ack, { required = ['verdict', 'action'] } = {}) {
   const missing = []

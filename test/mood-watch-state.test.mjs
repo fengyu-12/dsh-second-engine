@@ -78,15 +78,14 @@ test('parseAcknowledgement：单行、多行、只写 ID 三种写法都能解�
   assert.equal(two.eventId, 'mw-new')
 })
 
-test('verifyAcknowledgement：套话判失败；quote 不在原话里判失败；四选齐全判通过', () => {
+test('verifyAcknowledgement：套话判失败；quote 不再参与判定；四选齐全判通过', () => {
   const filler = verifyAcknowledgement(null)
   assert.equal(filler.ok, false)
-  assert.deepEqual(filler.missing, ['quote', 'verdict', 'action'])
+  assert.deepEqual(filler.missing, ['verdict', 'action'])
 
   const badRaw = BAD_QUOTE_REPLY.replace('${EVENT}', 'mw-1')
   const bad = verifyAcknowledgement({ ...parseAcknowledgement(badRaw), anchorText: ANCHOR, replyText: badRaw })
   assert.equal(bad.ok, false)
-  assert.ok(bad.violations.includes('quote_not_in_user_turn'), '编造的引文必须判失败')
   assert.ok(bad.violations.includes('verdict_unclear'), 'verdict 写成自由描述 ⇒ 该字段视为缺失')
 
   const good = verifyAcknowledgement({ ...parseAcknowledgement(goodReply('mw-1')), anchorText: ANCHOR, replyText: goodReply('mw-1') })
@@ -117,14 +116,13 @@ test('套话回复（不回应就继续原计划）⇒ 触发第 2 次提醒；�
   assert.match(r1.actions.inject[0].message.content[0].text, /\[MW_ACK\]/)
   state = r1.state
 
-  // 第 2 轮：模型只出套话、继续原计划 → 判失败 + 再插一条提醒
+  // 第 2 轮：模型只出套话、继续原计划 → 判失败（A 方案：不再追加提醒）
   const r2 = stepTurn(state, { sessionId: 's1', anchorText: ANCHOR, replyText: FILLER_REPLY, hit: null, now: t0 + 1000 })
   assert.equal(r2.actions.verified.length, 0)
   assert.equal(r2.actions.failed.length, 1)
-  assert.deepEqual(r2.actions.failed[0].missing, ['quote', 'verdict', 'action'])
+  assert.deepEqual(r2.actions.failed[0].missing, ['verdict', 'action'])
   assert.equal(r2.actions.failed[0].filler, true, '套话特征应被记录（诊断用）')
-  assert.equal(r2.actions.inject.length, 1)
-  assert.equal(r2.actions.inject[0].phase, 'nudge')
+  assert.equal(r2.actions.inject.length, 1) // 缺回执 ⇒ 第 2 次提醒（2026-11-18 恢复）
   assert.equal(r2.actions.pendingConfirm.length, 0, '第 1 次缺回执还不该升级到待确认')
   assert.equal(r2.state.active.length, 1)
   assert.equal(r2.state.consecutiveMissing, 1)
@@ -153,7 +151,7 @@ test('有原文引用+判定但无本轮处理 ⇒ 判失败；补齐四选后�
   const r2 = stepTurn(state, { sessionId: 's2', anchorText: ANCHOR, replyText: NO_ACTION_REPLY, hit: null, now: t0 + 1000 })
   assert.equal(r2.actions.failed.length, 1)
   assert.deepEqual(r2.actions.failed[0].missing, ['action'], '缺「本轮采取的处理」必须判失败')
-  assert.equal(r2.actions.inject[0].phase, 'nudge')
+  assert.equal(r2.actions.inject.length, 1) // 缺回执 ⇒ 第 2 次提醒（2026-11-18 恢复）
   state = r2.state
 
   const r3 = stepTurn(state, { sessionId: 's2', anchorText: ANCHOR, replyText: goodReply(evId), hit: null, now: t0 + 2000 })
@@ -171,7 +169,7 @@ test('同一条原话重复命中不重复开事件，按缺失升级', () => {
   state = r1.state
   const r2 = stepTurn(state, { sessionId: 's3', anchorText: ANCHOR, hit: hitOf(ANCHOR), replyText: undefined, now: t0 + 1000 })
   assert.equal(r2.state.active.length, 1, '同一 anchor 不重复开事件')
-  assert.equal(r2.actions.inject[0].phase, 'nudge')
+  assert.equal(r2.actions.inject.length, 1) // 缺回执 ⇒ 第 2 次提醒（2026-11-18 恢复）
   assert.equal(anchorFingerprint(' 我跟你说过 打包 ') === anchorFingerprint('我跟你说过打包'), true)
 })
 
