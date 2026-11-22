@@ -1069,6 +1069,10 @@ export async function writeCodexConfig(provider) {
     // 审批策略固定 never：exec 模式非交互，默认值下工作副本外写入会请求人工审批 → 无限挂起假死（2026-09-21 实证）
     `approval_policy = "never"`,
   ]
+  // 推理档位：只有 GPT 系确认支持 medium（用户 2026-11-23 定）；其它厂商不预设，交给上游默认（自动脱落）。
+  if (/^gpt-/i.test(String(provider.model || ''))) {
+    lines.push('model_reasoning_effort = "medium"')
+  }
   // 模型元数据（预设提供方实证值）：Codex 顶层 model_context_window / model_max_output_tokens。
   if (Number.isFinite(provider.contextWindow)) {
     lines.push(`model_context_window = ${Math.floor(provider.contextWindow)}`)
