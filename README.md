@@ -471,12 +471,11 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.4.0）
+## 支持能力一览（v4.4.1）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| **4.4.0 桥对话 + 派单预检 + consult 落盘** | ✅ 4.4.0 | ① **十个 DSH 原生工具**：新增 `bridge_send {engine,text}`——往已跑的桥发一条收流式回复（**不自动起桥**；codex 用 `kind:done`、claude/pi 用 `kind:end` 收尾；token 按引擎分：codex 读状态目录 / pi 读 `PI_BRIDGE_TOKEN` / claude loopback 免）② **派单预检 + 派后自检**：`second_engine_task` 返回 `warnings[]`（engine 与 active 不符、引擎不可用、未配 key；3 秒内无 pid 判「可能未真正挂上」），**只报不拦单**，面板接口不含该字段③ **consult 落盘**：`~/.dsh/second-engine/consults.jsonl`，`GET /api/consults?since=<求助id\|毫秒\|ISO>` 增量并返回 `nextSince`，跨重启可查；收尾按 taskId 从 jsonl 收齐再追加 `[SECOND_ENGINE_CONSULT]`④ **引擎升级适配**：Codex 0.171.0 / Pi 1.6.0 / Claude Code 2.1.329（三关检验全过） |
-| **4.3.0 原生工具 + 通知修复 + 回执闭环** | ✅ 4.3.0 | ① **九个 DSH 原生工具**：`task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status`（裸定义 + `inject=['settings','tools']`）；修 createTask 误报 `EXECUTION_FAILED`（detached async 与 capture 抢跑）与 `job_get` review 空 output（按 kind 拼 `{verdict,rounds,issues}`）② **完成通知修复**：写死 3090 改为 `DSH_BRIDGE_PORT`（默认 3091）、token 从 query 改 `X-Token` 头、回执首段精确匹配 ③ **mood-watch 回执闭环**：监听 `session/event` 的 `assistant/message` 缓存最终回复（每会话 1 条、总 50、消费一次）；`quote` 退出判定（只认 `[MW_ACK]` 框架 + event/verdict/action）；恢复缺回执第 2 次提醒（同事件 ID）④ **bridge Web**：DOM/数据分离、围栏代码块、流式节流、回车发送/移动端焦点/元数据分离；后端 transcript 补 `ts`（UTC ISO，协议核对单位、缺时间不伪造）⑤ **skill 拆卷**：HTTP 兜底收进 `references/ref-http-api.md`、机械量收进 `ref-fallback-measures.md`；派单纪律补「具名风险 / 报告只当待查声明 / 接口类失败路径验收」 |
+| **4.4.1 启动器自愈 + 备份轮转 + 档位** | ✅ 4.4.1 | ① **启动器自愈**：`codex-env`/`claude-env` 检测 `/usr/local/bin` 入口，缺失或指向过期自动重建软链；`SELF_DIR` 用 `readlink -f` 解析真实路径（软链调用不再找错 `ctl.sh`）② **备份轮转**：`config.toml.bak-*` 纳入轮转且显式保留 `.bak-se`；Claude 提供方配置补写前备份 + 保留 5 份 ③ **推理档位**：Codex 生成器对 GPT 系写 `model_reasoning_effort="medium"`，其它厂商不预设（自动脱落）④ mood-watch 回执测试同步 + 过时注释清理 |
 
 
 > 4.4.0 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。

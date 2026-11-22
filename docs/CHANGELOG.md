@@ -6,6 +6,8 @@
 
 | 版本 | 关键点 |
 |---|---|
+| **4.4.1** | 启动器自愈入口 + `SELF_DIR` readlink、备份轮转补盲区（`.bak-se` 保留 / Claude 补备份）、Codex 默认档位 medium（GPT 系，其它不预设）|
+| **4.4.0** | bridge_send 工具 + 派单预检/自检 + consult 落盘 + 引擎升级适配（Codex 0.171 / Pi 1.6.0 / Claude 2.1.329）|
 | **4.3.0** | 九个 DSH 原生工具（task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status）+ 通知修复（`DSH_BRIDGE_PORT` 3091 / `X-Token` / 精确匹配）+ mood-watch 回执闭环（`assistant/message` 缓存、第 2 次提醒、quote 退出判定）+ bridge Web ①②③④ 与后端 `ts` + skill 拆卷（`ref-http-api.md` / `ref-fallback-measures.md`）|
 | **4.2.3** | attempt 租约/心跳 + 独立回收（不增 attempts）+ `/api/board` 派生 `stale` + dispatch 传 boardId + wait-task 活动续租 |
 | **4.2.2** | 兼容声明对齐（`engines.dsh` 放宽到 0.2.2 预发布）+ mood-watch 回执校验改取本轮全部 assistant 段（含 Codex 复核发现的 role 过滤缺口）+ README 加「DSH 版本要求」+ 新增 `tools/release-check.sh` |
