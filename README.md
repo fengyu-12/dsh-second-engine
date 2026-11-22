@@ -479,7 +479,7 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 | **4.3.0 原生工具 + 通知修复 + 回执闭环** | ✅ 4.3.0 | ① **九个 DSH 原生工具**：`task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status`（裸定义 + `inject=['settings','tools']`）；修 createTask 误报 `EXECUTION_FAILED`（detached async 与 capture 抢跑）与 `job_get` review 空 output（按 kind 拼 `{verdict,rounds,issues}`）② **完成通知修复**：写死 3090 改为 `DSH_BRIDGE_PORT`（默认 3091）、token 从 query 改 `X-Token` 头、回执首段精确匹配 ③ **mood-watch 回执闭环**：监听 `session/event` 的 `assistant/message` 缓存最终回复（每会话 1 条、总 50、消费一次）；`quote` 退出判定（只认 `[MW_ACK]` 框架 + event/verdict/action）；恢复缺回执第 2 次提醒（同事件 ID）④ **bridge Web**：DOM/数据分离、围栏代码块、流式节流、回车发送/移动端焦点/元数据分离；后端 transcript 补 `ts`（UTC ISO，协议核对单位、缺时间不伪造）⑤ **skill 拆卷**：HTTP 兜底收进 `references/ref-http-api.md`、机械量收进 `ref-fallback-measures.md`；派单纪律补「具名风险 / 报告只当待查声明 / 接口类失败路径验收」 |
 
 
-> 4.3.0 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+> 4.4.0 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## Codex 升到 0.166.0 之后
 
