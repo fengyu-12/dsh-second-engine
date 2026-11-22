@@ -36,9 +36,6 @@ export function buildArgs(spec = {}) {
   if (maxTurns !== null) args.push('--max-turns', String(maxTurns))
   const maxBudget = numOf(spec.maxBudgetUsd)
   if (maxBudget !== null) args.push('--max-budget-usd', String(maxBudget))
-  // 推理档位：Claude 系默认 medium；spec.effort 可覆盖，传 'off' 则不传（未知模型自动脱落）。
-  const effort = str(spec.effort) || 'medium'
-  if (effort !== 'off') args.push('--effort', effort)
   const extra = Array.isArray(spec.extraArgs) ? spec.extraArgs : []
   for (const a of extra) if (typeof a === 'string' && a !== '') args.push(a)
   return args
