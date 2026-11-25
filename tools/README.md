@@ -26,6 +26,16 @@ wait-task.sh <工单id> [轮询间隔秒=5] [总超时秒=600]
 
 退出码语义：0=done 2=失败终态 3=任务不存在 4=接口不可用 124=超时。配后台 job 使用：工单完成时 harness 的完成通知会自动唤醒等待者，本脚本同时是超时与故障的兜底。
 
+## engine-upgrade.sh — 三引擎一键查版本/升级
+
+```bash
+engine-upgrade.sh --check              # 只看 pi/claude/codex 当前版本 vs 最新
+engine-upgrade.sh                      # 按 pi → claude → codex 升级三个
+engine-upgrade.sh claude codex         # 只升指定引擎
+```
+
+npm 走 `registry.npmmirror.com`；Codex 拉平台包后先验活、备份旧版（`/root/codex/*.bak-<旧版>`）再原子替换，并跑 se-tool-probe / se-appserver-verify / dsh-dep-check 三关。每个引擎装完立即 `--version` 复核，防升级中断留空窗（2026-11-25 实测：claude 升级中断导致二进制丢失，镜像重装恢复）。
+
 ## policy-watch.py — 算「该派单了」的机械信号
 
 ```bash

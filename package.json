@@ -28,7 +28,8 @@
     "tools/web-base.sh",
     "tools/policy-watch.py",
     "tools/dispatch-check.py",
-    "tools/README.md"
+    "tools/README.md",
+    "tools/engine-upgrade.sh"
   ],
   "engines": {
     "node": ">=22",
