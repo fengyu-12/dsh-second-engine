@@ -2,7 +2,7 @@
 
 > **用途**：不用每次去翻 GitHub release notes，需要什么能力直接查这张表。
 > **维护**：每次升级 Codex 后跑 §4 的检查清单，把新增/移除补进 §3，把开关变化补进 §1。
-> **当前版本**：`0.169.0`（2026-11-14 升级；**有回滚物** —— `<Codex 安装目录>/codex.bak-0.167.1` 与 `codex-code-mode-host.bak-0.167.1`）。三关检验：工具面 **9 条**（exec_command / write_stdin / request_user_input / view_image / multi_agent_v1 / get_goal / create_goal / update_goal / web_search）· 执行链 **5/5**（appserver+流式进度 / cancel 真打断无残留 / exec 回归）· `dsh-dep-check` 全 OK。⚠️ **升级窗口**（2026-11-14 实测）：替换二进制期间在跑或新派的任务会 **exit 127**（当时 active 被切到 claude，撞上 npm 换件窗口）；升级前查 `active` 与在跑任务、升级后把 active 切回 codex。⚠️ 0.167 的 **sidecar 路径回归**（§6.1）在 0.169 **未复验**；本周实测 sidecar 两处硬链仍在用（`<Codex 安装目录>/codex-code-mode-host` + `/.l2s/`）。
+> **当前版本**：`0.172.0`（2026-11-25 升级，npmmirror 平台包；**有回滚物** —— `<Codex 安装目录>/codex.bak-0.171.0` 与 `codex-code-mode-host.bak-0.171.0`）。三关检验（0.172.0 实测，2026-11-25）：工具面 **9 条**（exec_command / write_stdin / request_user_input / view_image / multi_agent_v1 / get_goal / create_goal / update_goal / web_search）· 执行链 **5/5**（appserver+流式进度 / cancel 真打断无残留 / exec 回归）· `dsh-dep-check` 全 OK。⚠️ 0.172.0 官方 release body 未拉取，只做了本机三关检验。⚠️ **升级窗口**（2026-11-14 实测）：替换二进制期间在跑或新派的任务会 **exit 127**（当时 active 被切到 claude，撞上 npm 换件窗口）；升级前查 `active` 与在跑任务、升级后把 active 切回 codex。⚠️ 0.167 的 **sidecar 路径回归**（§6.1）在 0.169 **未复验**；本周实测 sidecar 两处硬链仍在用（`<Codex 安装目录>/codex-code-mode-host` + `/.l2s/`）。
 > **二进制**：`<Codex 安装目录>/codex`（musl 静态单文件，`/usr/local/bin/codex` 软链过去）；sidecar 两处硬链缺一即废 —— `<Codex 安装目录>/codex-code-mode-host` + **`/.l2s/codex-code-mode-host`**（0.167 实际读后者）。
 > **升级方式（2026-11-07 实测修订 —— GitHub release 直连又通了）**：`curl -fL -o pkg.tgz https://github.com/openai/codex/releases/download/rust-v<版本>/codex-package-aarch64-unknown-linux-musl.tar.gz`（0.167.0 = 187,844,332 B / 4 分 4 秒 ≈ 749 KB/s），**同时下 `codex-package_SHA256SUMS` 逐字节校验**（该 SUMS 只覆盖 `codex-package-*`，不覆盖单件 `codex-*`）。备选：npmmirror 平台包（0.166.0 = 164,402,913 B ≈ 3 分钟）。⚠️ 源可达性会变：10-31 记「release 走不动」、11-07 实测 749 KB/s ⇒ 每次先探再信。
 > **包内结构与取用**：整包 `codex-package` = `bin/codex`(~267 MB) + `bin/codex-code-mode-host`(~69 MB) + `bin/codex-exec-server`(67 MB) + `codex-path/rg`(4.4 MB) + `codex-resources/{bwrap,voice}`(53 MB)。**2026-11-07 实测只留前两个二进制**：删掉 exec-server / rg / bwrap / voice 后 `exec` 与 `app-server` 均正常（second-engine 源码对它们 0 引用、系统已有 `/usr/bin/rg`、proot 无 bwrap 沙箱）⇒ 最终占用 335 MB。替换姿势：旧件留档 → `ln` 硬链落位 → `codex --version` **外加一次工具调用**复核（仅验版本会漏掉 sidecar 断链，2026-11-07 就这么假绿过一次）。
@@ -79,25 +79,23 @@ codex remote-control | exec-server | cloud | sandbox | debug   # 0.163 面里已
 
 ---
 
-## 3. Codex 现版本功能（`0.169.0` · 2026-11-14 本机实测拉取）
+## 3. Codex 现版本功能（`0.172.0`；功能明细为 0.171.0 实测，0.172.0 未复验）
 
 > **维护方式：主 AI 自己拉 · 不留存历史版本** —— 不逐版累积（没完没了、永远追着上游跑）。每次升级后重新拉一遍**整节覆盖**，只留**当下版本的具体变更与修复**。
 >
 > **变更来源（2026-11-07 打通）**：`api.github.com/repos/openai/codex/releases/tags/rust-v<版本>` 的 `body` 就是完整 changelog（0.167.0 = 11,566 字，含 New Features / Bug Fixes / Changelog 三段）。10-31 那条「无从取得」是因为当时 release 直连不通，不是上游没有。
 
-**0.168.0 / 0.169.0 变更（官方 release body 归纳，只列与本机相关的；0.167 明细已随整节覆盖移除）**
 
-- **0.169 与本机相关**：`codex exec` 在**不可信目录**默认禁用项目配置与 MCP servers（即使 `--sandbox workspace-write`），需 `--trust` 显式保存项目信任（行为边界变化，我们的 workdir 固定 `/root/proj` 与插件实体，升级后执行链 5/5 通过说明本机未触发，但记一笔）；**中断的 turn 现在干净关闭**，延迟 abort / 文件审批取消不再打断后续 turn（与我们 cancel 判据直接相关）；app-server 支持 `model/list` 选择已配置 provider、gateway 授权不改默认 provider。TUI 侧（多 side-chat 标签、折叠 turn、终端内编辑自定义 provider、诊断 ZIP）非交互用不上。
-- **安全含义（2026-11-14 用户指出，补记）：这是收益不是缺陷** —— 不可信目录默认禁用项目配置与 MCP，等于给"新建/外来目录"加了一道默认收窄，配合我们固定的 `approval_policy=never` + `danger-full-access` 组合（本身风险高），这层收窄有价值；派单默认 `/root/proj` 是 trusted，不受影响。⚠️ **未验证**：项目级 `AGENTS.md` 是否随 "project configuration" 一并被禁用（changelog 只写 config 与 MCP；用户级 `~/.codex/AGENTS.md` 始终读）。要定死需在 untrusted 目录放一份 AGENTS.md 派单实测；未验前按"可能被禁"处理，别依赖外来目录的项目级指令。
-- **0.168 与本机相关**：app-server 新增 **model provider discovery + 配置写入**；`features.multi_agent` 被显式配置时警告并指向 `agents.enabled`（与工具面 `multi_agent_v1` 对应）；TUI 侧会话列表/模型 provider 浏览、图片生成动画、音频录制等（用不上）。
-- ⚠️ 0.167 的 sidecar 路径回归在 0.169 **未复验**（见 §6.1），下次升级后必须查 `/.l2s/`。
 
-**0.167.0 变更（历史，已随整节覆盖移除前留档一句）**
 
-- **TUI 侧新增（非交互 `exec` 用不上）**：`codex agents --no-daemon` 命令中心与未读标记；会话选择器跨后端切换且保留草稿；终端本地图片预览；`/experimental` 系统代理；审批时内联展开 patch。API key / 云 provider 收进 "Sign in another way"，`gcp_setup_wizard` 可配 Vertex AI。
-- **修复**：换 model provider 后已保存会话仍可见（不能 resume 时也能读 transcript 转新会话）；`Ctrl+L` 清屏保留历史；网络审批提示随请求结束关闭、同端点串行。
-- **与本机相关**：`#58399` Linux musl 构建减少 jemalloc arena ⇒ 降低对话卸载后的空闲内存；`#58343` keyring 不可读时保留 fallback token 刷新；`#58404` 修「无可用 usage 时的上下文 token 估算」。
-- ⚠️ 官方 changelog 里**没有任何一条**提到 sidecar 查找路径变化 —— §6.1 那条回归由 proot 触发，不要指望上游修。
+**0.172.0 变更（2026-11-24 发布 · 本机 2026-11-25 升级实测）**
+
+- **新功能（与本机相关）**：TUI 里从搜索结果 / transcript 打开 thread 链接（含嵌套 agent）；`Tab` 补全 slash 命令参数（`/mcp lo` → `/mcp login`）；agent command center 用 `Shift+Up/Down` 跳任务组；**可选 stdio MCP server 默认懒启动**（首次工具调用才起）；`config.toml` 可给单个 connected app tool 设 approval reviewer；app-server 客户端 setup / login 可选 Amazon Bedrock Runtime。
+- **修复（与本机相关）**：`codex exec resume` 恢复 saved sandbox 权限、工作目录、workspace roots（#62194）；跨 OS remote session 保留工作目录 / 可写路径 / workspace roots；provider 错误在流里一到就上报，并标明是哪个 **API spend limit** 触顶（#62329/#62356）；中断父 turn 保留子 agent 排队回复（#62348）；`PageUp/PageDown` 提交长选项；Cloud 回复晚到原位更新。
+- **变更 / chores**：Code Mode 所有宿主连接改走 **gRPC**，`code_mode_host_grpc` 设置弃用（#62476）；Python 工具依赖按 lockfile 校验哈希。文档：内置 `openai-docs` skill 覆盖 GPT-6.2 Astra/Sol 迁移。
+- 三关检验（2026-11-25 本机）：工具面 9 条不变 · 执行链 5/5 · `dsh-dep-check` 全 OK。
+
+> 旧版本（0.171 及更早）明细已按上面的维护规则整节移除，不再留档。
 
 **命令面（`codex --help` 实测，供速查）**
 
@@ -122,7 +120,8 @@ codex sandbox | debug | apply | completion
 
 **⚠️ 本机实测约束（2026-10-17，别照抄通用文档）**
 
-- **推理档位**：codex 元数据里的枚举是 **6 档**（`low`/`medium`/`high`/`xhigh`/`max`/`ultra`，来自 `codex debug models` 的 `supported_reasoning_levels`）；而**上游智谱 `glm-5.3-flash` 只接受 `low`/`high`/`max`** —— 其余档位（含显式 `none`）都会撞 `该模型始终思考，不支持关闭思考；请使用 low、high 或 max`，表现为 `Reconnecting 1/5…5/5` 后 `stream disconnected`。**⚠️ codex 不校验档位值**（`bogus` 也照收），写错了只会在上游炸。
+- **推理档位**：codex 元数据里的枚举是 **6 档**（`low`/`medium`/`high`/`xhigh`/`max`/`ultra`，来自 `codex debug models` 的 `supported_reasoning_levels`）；而**上游智谱 `glm-5.3-flash` 只接受 `low`/`high`/`max`** —— 其余档位（含显式 `none`）都会撞 `该模型始终思考，不支持关闭思考；请使用 low、high 或 max`，表现为 `Reconnecting 1/5…5/5` 后 `stream disconnected`。**⚠️ codex 不校验档位值**（`bogus` 也照收），写错了只会在上游炸。**默认档实测（2026-11-21）**：Codex 默认 **low**（TUI `/model` → Select Reasoning Level 显示 `Low (default)`）；config 不写 `model_reasoning_effort` 时即此。
+- **直接 `codex` 报 `no complete local package`（2026-11-21 实测）**：本机是 **standalone 单二进制**（`<Codex 安装目录>/codex`，aarch64 静态 ELF，**没有 npm 包结构**）；新版 CLI 默认要连 background server，所以裸 `codex` 起不来，加 `--no-daemon` 即正常（`codex --no-daemon exec ...`、`codex-env` 都走它）。只有需要 daemon 模式才要补装完整包。
 - **沙箱**：`sandbox_mode = "workspace-write"` 在本机**直接不可用**（`error building bubblewrap command: cannot establish app-server socket mount isolation`，连 consult 求助通道都会被拦）⇒ **必须 `danger-full-access`**（proot 无 Landlock/bwrap）。
 - **`strict_config` 不是配置键**：`-c strict_config=true` 会被判 `unrecognized`（它只是命令行 flag `--strict-config`）。
 - **能力增量只有三条**（配置项基本只调"安全与观测"，不给新本事）：① **给 codex 写 skill**（`~/.codex/skills/<名>/SKILL.md`，frontmatter `name`+`description`，可带 `scripts/`、`references/`；它自带 `skill-installer` 能从 GitHub 装）② 打开 `[mcp_servers]`（本机 `exa`/`parallel-search` 均 `enabled=false`）③ `model_catalog_json`（喂自定义模型元数据，比 `model_context_window` 更根本）。
@@ -152,7 +151,7 @@ codex exec --skip-git-repo-check --json 'Use your shell tool to run: cat /tmp/pr
 
 ### ★ 第 5 条是 2026-10-02 事故换来的
 
-第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`/root/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
+第二引擎插件的 `writeCodexConfig()` 原先只保留 `mcp_servers.*` 一种段。**切一次提供方**就会把 `[features]`、`[tui]`、`[projects.*]` 全部静默丢弃 —— 结果 4 个 feature 开关回到默认 `false`（`multi_agent_v2`、`memories`、`network_proxy`、`recommended_plugins`），`~/proj` 的项目信任级别也没了，**全程没有任何报错**，只有发现功能失效才会察觉。
 
 修复：`src/index.js` 新增 `extractPreservedSections()`，用的是**黑名单**——只排除模板自有的
 `[model_providers.*]` 与 `[memories]`，**其余段一律原样保留**（2026-10-02；最初写成白名单，当天改成黑名单）。
@@ -271,6 +270,63 @@ ln -f <Codex 安装目录>/codex-code-mode-host /.l2s/codex-code-mode-host
 
 > 以下四节原载 `skill/SKILL.md`（547 行版），2026-10-26 技能瘦身外移至此（SKILL.md 原处只留可直接跑的命令）。外移前经只读核查子代理复核（codex 0.164.0、插件工作副本 se-slim-20261026），过期项就地标「2026-10-26 复核」。
 
+## 8. 已知故障：第三方插件 marketplace 的 GitHub 探测（2026-11-24 实测）
+
+**现象**：`codex exec` 启动后 30–38 秒才退、exit 1、**零正常输出**；短 prompt 正常、长 prompt 必挂。极易被误判成"模型/上游坏了"。
+
+**根因**：`~/.codex/config.toml` 里配了 Git marketplace（本机是 `context7-marketplace`，source 指向 `github.com/upstash/context7.git`）。codex 每次启动都 `git ls-remote` 刷新快照；**容器到 github.com 不通** → 卡 30 秒超时 → 连锁出 `Upstream access forbidden`。
+
+**判据**：启动日志出现 `git ls-remote marketplace source timed out after 30s` + `Reconnecting 1/5…5/5`。`codex plugin marketplace list` 看 ROOT 是否在 `~/.codex/.tmp/marketplaces/`（在 = 每次重拉）。
+
+**修法（已验证）**：marketplace source 改本地仓库，**不删插件本体**：
+1. `cp -a ~/.codex/.tmp/marketplaces/<name> ~/.codex/marketplaces/<name>-local`
+2. **重建干净 git**（`cp -a` 后有 hardlink 冲突，报 `hardlink different from source`）：`cd <dir> && rm -rf .git && git init -q && git add -A && git -c user.email=l@l -c user.name=l commit -qm snapshot`
+3. `config.toml` 里 `source = "~/.codex/marketplaces/<name>-local"`
+4. `codex plugin marketplace upgrade <name>` → 秒过
+
+**镜像源不可靠**：`gh-proxy.com` 的 `git ls-remote` 能通，但 `git clone` 30s 超时 + `early EOF`；`ghproxy.com`、`gitclone.com` 均不通。
+
+**副作用**：本地源 = 放弃自动升级（github 不通本来也升不了）。
+
+**排除项**：`[memories]` 节无责——对照实验（移除 memories 跑长 prompt 成功 80s；恢复 memories 再跑仍成功 108s），长 prompt 失败与它无关。真正修复因素是 marketplace 改本地源。
+
+**为什么插件自己的 GitHub 探测不阻塞**（用户提问）：插件探测 `api.github.com`（openai/codex 与 fengyu-12/dsh-second-engine 两个地址）但**按需触发**（设置页刷新时）+ **有缓存**（`VERSION_CACHE_TTL_MS`，命中不请求）+ **短超时**（`AbortSignal.timeout`）+ 失败只抛错被上层吞。codex marketplace 则相反：在 `exec` 启动路径上同步等 30 秒、无缓存、失败后连锁 5 次重连。⇒ 问题不是"探测 GitHub"，而是"在启动关键路径上同步等 30 秒"。
+
+## 9. CLI 升级与插件适配：为什么可能不适配、怎么查（2026-11-24 快照）
+
+> 本节是**快照 + 方法**，版本号会腐化：用前先按「怎么查」重测一遍，别直接引表中的数字。
+
+### 为什么升级会撞插件
+三处契约随版本漂移：① 插件清单格式（Claude 的 `.claude-plugin/plugin.json` / Codex 的 `.codex-marketplace-install.json`）② marketplace 布局（Codex 把市场放 `~/.codex/.tmp/marketplaces/<name>`，每次启动重拉）③ 工具/事件名（MCP tool 名、hook 名、CLI 参数）。CLI 升了、插件本体没跟上 ⇒ 表现为"加载报错"或"工具存在但调不到"。
+
+### 怎么查（GitHub 直连不通，走 gh-proxy）
+`gh-proxy.com` 能 `git ls-remote` 和读 raw 文件；**`git clone` 会 30s 超时 + `early EOF`，别用**。`ghproxy.com`、`gitclone.com` 实测不通。
+
+| 要查什么 | 命令 |
+|---|---|
+| Claude 市场远端 HEAD | `git ls-remote https://gh-proxy.com/https://github.com/anthropics/claude-plugins-official.git HEAD` |
+| Claude 某插件最新版本 | `curl -sL "https://gh-proxy.com/https://raw.githubusercontent.com/anthropics/claude-plugins-official/main/plugins/<name>/.claude-plugin/plugin.json"` → 读 `version` |
+| Claude 市场全量清单 | 同 URL 换 `.claude-plugin/marketplace.json`（条目**不含版本号**，版本在各自 plugin.json） |
+| Codex 市场远端 HEAD | `git ls-remote https://gh-proxy.com/https://github.com/<org>/<repo>.git HEAD` |
+| 本地已装版本 | Claude：`cat ~/.claude/plugins/installed_plugins.json`（含 version + gitCommitSha）；Codex：`ls ~/.codex/plugins/cache/<market>/<plugin>/`（目录名即版本） |
+
+### 2026-11-24 快照
+| 侧 | 插件 | 本地 | 远端 | 状态 |
+|---|---|---|---|---|
+| Claude | `frontend-design@claude-plugins-official` | 1.1.1 | 1.1.1 | 已最新 |
+| Codex | `context7@context7-marketplace` | 11cb18d | 11cb18d | 已最新；**已改本地源，不再自动跟新** |
+| Codex | `superpowers@openai-api-curated` | 缓存有 | — | 内置市场（`.tmp/plugins`），无远端地址可查 |
+| Codex | `codex-security@openai-api-curated` | `981b02c0` | — | 同上 |
+
+### 升级前后的动作
+1. **升级前**：把上表重测一遍当基线（本地版本 + 远端 HEAD）
+2. **升级后**：`codex --version` / `claude --version`；再看插件加载日志有无报错
+3. **插件加载失败 ≠ CLI 坏**：先看是不是 marketplace 解析不到（`codex plugin marketplace list` 的 ROOT 在不在），见 §8
+4. **回滚点**：`~/.codex/config.toml.bak-*`；Claude 侧旧版缓存在 `~/.claude/plugins/cache/`
+
+### 推断边界
+「CLI 升级会导致插件不适配」是**合理推断**（三处契约确实会漂），本机**尚未实测过一次真正的版本不匹配**。别把这条当已发生的事故写进结论。
+
 ## 附A. `~/.codex/`（CODEX_HOME）目录地图（2026-10-15 实测，当时共 185 M）
 
 Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `keyring.json` 与 `config.toml`**；其余在明确知道用途后可处理。
@@ -280,14 +336,14 @@ Codex 的一切状态都在这儿。**红线 11 的「不手改」只点名 `key
 | 配置 | `config.toml` | 1.2 K | `model_provider` / `model` / `sandbox_mode` / `web_search` / `[mcp_servers.*]`。**不手改** —— 插件切 active 时重写它 |
 | | `config.toml.bak-*` ×7 | 各 ~450 B | 历史备份（`-20261001` `-pre-memories` `-pre-switch` `-ma2` `-recplug` `-before-ma2-recplug` `-se`） |
 | | `keyring.json` | 1.4 K | 多提供方与 key。**不手改** |
-| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `/root/proj/AGENTS.md` 同源的那份） |
+| | `AGENTS.md` | 2.5 K | **Codex 自己的全局指令**（与 `~/proj/AGENTS.md` 同源的那份） |
 | 状态库 | **`logs_2.sqlite`** | **41 M** | 运行日志 —— **整个目录最大的一块**（能否清**未验证**） |
 | | `thread_history_1.sqlite` (+`-wal` 248 K) | 15 M | 线程历史 |
 | | `state_5.sqlite` (+`-shm`) | 573 K | 主状态；`state_5.sqlite.bak-20261003-pre-hue` ×3 ≈ 800 K 是升级前备份 |
 | | `queue_1` / `goals_1` / `memories_1.sqlite` | 41 K / 32 K / 44 K | 队列 / 目标 / 记忆 |
 | 内容 | **`sessions/`** | 16 M | 会话 rollout —— 落盘路径与读法见附A.1 |
 | | **`task-*.out.live` ×~100** | **~10 M** | **second-engine 每个工单的原始输出**；清理走 `POST /second-engine/api/cleanup`（按 mtime）。**2026-10-26 复核：现 14 个 / ~595 KB**（2026-10-25 起 `finalizeJob` 统一删 `.out`/`.live`，积压已消化） |
-| | `skills/` | 630 K | Codex 侧技能（`relay-probe` 在此） |
+| | `skills/` | 630 K | Codex 侧技能（本机私有技能在此） |
 | | `memories/` / `archived_sessions/` | 189 K / 空 | 记忆 / 已归档会话 |
 | 运行时 | `.tmp/` | **102 M** | `plugins/` 缓存 + `git-XXXXXX/`（**裸仓库**，只有 `HEAD`/`objects`/`refs`，各 15 K） |
 | | `shell_snapshots/` | 3.5 K | **exec 模式**工单会建 |
@@ -400,16 +456,16 @@ codex -c sandbox_mode=workspace_write "..."                 # 覆盖沙箱
 
 ## 附D. 2026-09-25 新增能力（第二引擎侧，已实测）
 
-> **2026-10-26 复核**：① **relay-forge 管线已退役**——`/root/proj/relay-forge/` 不存在，原件在 `/root/.dsh/refs/retired-proj-20261015/relay-forge`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `/root/proj/共同工作区/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
+> **2026-10-26 复核**：① **私有并发管线已退役**——`~/proj/私有管线/` 不存在，原件在 `<本机归档目录>/私有管线`；② bridge/CHANGELOG.md **顶部现为 2026-09-29 两条**，2026-09-25 共 **4 条**（行 117/164/250/361），非下文所说"顶部三条"；③「会话 ID 36 位」小节引用的 `~/proj/<共享工作区>/会话ID与挂载坑-20260925.md` **全盘查不到**（坑本身仍成立，已内联进 SKILL.md）。
 
 ### 中转站算力：探测与并发咨询
 
-- **技能 `relay-probe`**（Codex 侧 `~/.codex/skills/relay-probe/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与本机案例已归 skill `relay-forensics`（`/root/.dsh/skills/relay-forensics`），此处不重复。
-- **管线 `/root/proj/relay-forge/`**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
+- **本机私有技能**（Codex 侧 `~/.codex/skills/<私有技能>/`）：5 个子命令 `fingerprint` / `inject-size` / `extract` / `footer` / `consult`（并发问 N 个模型收第二意见）。方法与案例已归本机私有 skill，此处不重复。
+- **私有并发管线**（⚠️ 2026-10-26 已退役，见上）：并发让它写代码补丁。模型**没有联网能力**，"自己查资料"实际是
   模型发 `tool_calls` → `forge.py` 本地 `fetch_url` → 回灌。铁律：产出只落 `out/<时间戳>/`，
   **绝不自动改目标文件**；要"整文件重写"会得 0 字符，只喂"定位锚点 → 替换为"的补丁。
 
-### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `/root/proj/backup/`）
+### 网页桥新增（插件内 `bridge/web/`；原件已退役到 `~/proj/backup/`）
 
 - 会话列表**搜索框**（`Ctrl+K` 唤起）、**会话 ID 芯片**（点一下复制完整 36 位 ID，显示只给前 8 位）、
   **深浅主题切换**（浅色为默认，选择存 localStorage）、被占用时**显示写锁持有者**

@@ -36,6 +36,8 @@ ARCHIVE_DIR = os.path.join(BOARD_DIR, "archive")
 AUDIT_DIR = os.path.join(BOARD_DIR, "audit")   # 完成审计（人确认/自签留痕）；与 archive 语义分开，见 PROTOCOL §12.2
 # --reviewed-by 的两个合法值：human = 用户确认过；auto = 低风险自签（审计按原值记录，不归一）
 REVIEWED_BY_VALUES = ("human", "auto")
+# Keep aligned with the protocol's two-round rework limit.
+MAX_REWORK_ROUNDS = 2
 # 证据行（$ <命令> / exit=N）不是授权原话，判「用户授权原话」时先剔掉
 EVIDENCE_LINE_RE = re.compile(r"^(?:\$[^\S\n]+\S[^\n]*|exit=[0-9]+[ \t]*)$")
 DISPATCH_DIR = os.path.join(BOARD_DIR, ".dispatch")
@@ -244,7 +246,8 @@ def abandoned_ids(data: dict) -> set:
     return {t["id"] for t in data["tasks"] if t.get("status") == "abandoned"}
 
 
-def dependency_state(data: dict, task: dict) -> tuple[list, list]:
+def dependency_state(data: dict, task: dict, done_ids: set | None = None,
+                     abandoned_task_ids: set | None = None) -> tuple[list, list]:
     """把 blocked_by 的不满足项拆成两类。
 
     2026-11-10 定（方案 B）：abandon 是「放弃」不是「完成」，但它解锁依赖方。
@@ -253,9 +256,11 @@ def dependency_state(data: dict, task: dict) -> tuple[list, list]:
       - missing   仍然阻塞（退出码 4）
       - abandoned 放行，但调用方必须显式提示——这一环是断的，下游开工可能缺前置产出
     """
-    done = completed_ids(data)
-    gone = abandoned_ids(data)
     deps = task.get("blocked_by") or []
+    if not deps:
+        return [], []
+    done = completed_ids(data) if done_ids is None else done_ids
+    gone = abandoned_ids(data) if abandoned_task_ids is None else abandoned_task_ids
     missing = [b for b in deps if b not in done and b not in gone]
     abandoned = [b for b in deps if b in gone and b not in done]
     return missing, abandoned
@@ -514,8 +519,8 @@ def cmd_complete(a) -> None:
         data = load_board()
         check_cas(data, a.expect)
         t = find_task(data, a.id)
-        if int(t.get("attempts", 0)) >= 2:
-            die(3, "返工已达 2 轮，请拆小任务或改由主 AI 处理")
+        if int(t.get("attempts", 0)) >= MAX_REWORK_ROUNDS:
+            die(3, f"返工已达 {MAX_REWORK_ROUNDS} 轮，请拆小任务或改由主 AI 处理")
         pending_review = bool((t.get("review") or {}).get("pending"))
         review_finalization = (t.get("status") == "completed" and pending_review
                                and reviewed == "human" and not keep)  # auto 不得替人签字
@@ -530,13 +535,13 @@ def cmd_complete(a) -> None:
         t["owner"] = t.get("owner") or a.owner
         t["result"] = a.result
         t["updated_at"] = reviewed_at
-        if reviewed in REVIEWED_BY_VALUES and not keep:
+        if reviewed in REVIEWED_BY_VALUES:
             t["reviewed_by"] = reviewed        # 照实写 human/auto，便于统计自动签比例
             t["reviewed_at"] = reviewed_at
             if "review" in t:
-                t["review"]["pending"] = False
-        else:
-            t["review"] = {"pending": True, "at": reviewed_at}
+                t["review"]["pending"] = bool(keep and reviewed == "auto")
+        if keep:
+            t.setdefault("review", {"pending": True, "at": reviewed_at})
         summary = a.result.strip().splitlines()[0][:120]
         if getattr(a, "keep", False):
             commit(data, f"{a.id} 完成（--keep 保留在板）")
@@ -567,7 +572,6 @@ def cmd_block(a) -> None:
         t = find_task(data, a.id)
         if t.get("status") in TERMINAL:
             die(5, f"{a.id} 已终结，不可置 blocked")
-        t["attempts"] = int(t.get("attempts", 0)) + 1
         t["status"] = "blocked"
         t["result"] = (t.get("result") or "") + f"\n[blocked {now_utc()}] {a.reason}"
         t["updated_at"] = now_utc()
@@ -685,10 +689,13 @@ def cmd_ready(a) -> None:
     """
     data = load_board()
     ready, blocked = [], []
-    for t in data["tasks"]:
-        if t.get("status") not in ("pending", "blocked"):
-            continue
-        missing, abandoned = dependency_state(data, t)
+    candidates = [t for t in data["tasks"]
+                  if t.get("status") in ("pending", "blocked")]
+    has_dependencies = any(t.get("blocked_by") for t in candidates)
+    done_ids = completed_ids(data) if has_dependencies else set()
+    abandoned_task_ids = abandoned_ids(data) if has_dependencies else set()
+    for t in candidates:
+        missing, abandoned = dependency_state(data, t, done_ids, abandoned_task_ids)
         (blocked if missing else ready).append((t, missing, abandoned))
 
     if getattr(a, "json", False):
@@ -873,6 +880,13 @@ def cmd_archive(a) -> None:
     """把 before 之前终结的任务转档为 archive/tasks-YYYY-MM.jsonl。"""
     if not a.before:
         die(2, "archive 必须给 --before <ISO时间>（只归档该时间之前终结的任务）")
+    try:
+        before = _dt.datetime.fromisoformat(a.before.replace("Z", "+00:00"))
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=_dt.timezone.utc)
+        before = before.astimezone(_dt.timezone.utc)
+    except (ValueError, AttributeError):
+        die(2, "archive --before 必须是有效 ISO-8601 时间")
     month = a.month or month_bj()
     base = os.path.basename(BOARD)
     with _Lock():
@@ -880,7 +894,15 @@ def cmd_archive(a) -> None:
         check_cas(data, a.expect)
         keep, moved = [], []
         for t in data["tasks"]:
-            if t.get("status") in TERMINAL and (t.get("updated_at") or "") < a.before:
+            updated_at = t.get("updated_at")
+            try:
+                updated = _dt.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=_dt.timezone.utc)
+                updated = updated.astimezone(_dt.timezone.utc)
+            except (ValueError, AttributeError):
+                updated = None
+            if t.get("status") in TERMINAL and updated is not None and updated < before:
                 moved.append(t)
             else:
                 keep.append(t)
@@ -1038,9 +1060,9 @@ def cmd_scope_check(a) -> None:
     board_rel = os.path.relpath(os.path.dirname(os.path.abspath(__file__)),
                                 os.path.abspath(workdir)).replace(os.sep, "/")
     managed_prefixes = (f"{board_rel}/.dispatch/", f"{board_rel}/archive/")
-    managed_files = {f"{board_rel}/{n}" for n in
+    managed_files = {f"{board_rel}/{name}" for name in
                      ("board.json", "board.json.lock", "channel.md",
-                      "inbox-codex.md", "inbox-lead.md")}
+                      *(role["inbox"] for role in load_roles(data).values()))}
     # #4：派单时的 sha256 快照 —— 捞回「派单前就脏、派单后又被改」的真实改动。
     # 这类文件会被 dirty_before 整批排除，正是协议 §十一 记录的漏报来源。
     hash_changed = set()
