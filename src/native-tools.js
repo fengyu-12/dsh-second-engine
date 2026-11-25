@@ -97,18 +97,30 @@ export function registerNativeTools(ctx, { service = nativeJobService, timeoutMs
           // Streaming sends own their timeout and preserve their unknown-outcome details.
           if (method === 'bridgeSend') return await service[method]({ ...args })
           // One invocation only. Timeout does not abort or retry the underlying creation.
+          const operationPromise = Promise.resolve().then(() => service[method]({ ...args })).then(result => {
+            if (['createTask', 'createReview', 'replyReview'].includes(method) && result?.ok !== false && !result?.error) {
+              watchNativeJob(result?.id, exec?.agent, result?.status)
+            }
+            return result
+          })
           const result = await Promise.race([
-            Promise.resolve().then(() => service[method]({ ...args })).then(result => {
-              if (['createTask', 'createReview', 'replyReview'].includes(method) && result?.ok !== false && !result?.error) {
-                watchNativeJob(result?.id, exec?.agent, result?.status)
-              }
-              return result
-            }),
+            operationPromise,
             new Promise(resolve => {
               timer = setTimeout(() => { timedOut = true; resolve(errorResult('TIMEOUT', 'Result unknown; operation may have succeeded. Do not automatically retry.', 'unknown')) }, timeoutMs)
             }),
           ])
-          if (timedOut) return isTask ? { ...result, warnings } : result
+          if (timedOut) {
+            if (isTask) {
+              let observationTimer
+              const observed = await Promise.race([
+                operationPromise.catch(() => null),
+                new Promise(resolve => { observationTimer = setTimeout(() => resolve(null), 1000) }),
+              ])
+              clearTimeout(observationTimer)
+              if (observed?.id) return { ...errorResult('TIMEOUT', 'Result unknown; operation may have succeeded. Do not automatically retry.', 'unknown'), id: observed.id, status: 'running', warnings }
+            }
+            return isTask ? { ...result, warnings } : result
+          }
           if (result?.code === 'bridge-timeout') return errorResult('TIMEOUT', 'Result unknown; operation may have succeeded. Do not automatically retry.', 'unknown')
           if (result?.ok === false) {
             // Do not surface raw backend diagnostics: they can contain sensitive data.
