@@ -100,6 +100,7 @@ export const inject = ['settings', 'tools']
 // mood-watch 冷却：每会话上次提醒时间，防刷屏（2026-11-02）
 const moodWatchLastAt = new Map()
 const moodWatchAborts = new Map() // 每会话最近的用户打断时间戳数组（单次无害，只统计频次）
+const moodWatchAbortNotified = new Map() // 每会话最近一次已提醒的 abort 窗口指纹
 const MOOD_KEEP_LIMIT = 50 // 照抄 policy-watch 的 FIFO 淘汰：只留最近 50 个活跃会话，防 Map 无限增长
 const MOOD_ABORT_WINDOW_MS = 10 * 60 * 1000 // 频次窗口：10 分钟
 const MOOD_ABORT_TRIGGER = 2 // 窗口内被打断 ≥2 次才提示（单次多为无害的口头打断）
@@ -2497,6 +2498,7 @@ export function apply(ctx) {
         // 淘汰最早的 key（Map 迭代顺序 = 插入顺序），与 policy-watch.trimPolicyWatchMaps 同款
         while (moodWatchAborts.size > MOOD_KEEP_LIMIT) moodWatchAborts.delete(moodWatchAborts.keys().next().value)
         while (moodWatchLastAt.size > MOOD_KEEP_LIMIT) moodWatchLastAt.delete(moodWatchLastAt.keys().next().value)
+        while (moodWatchAbortNotified.size > MOOD_KEEP_LIMIT) moodWatchAbortNotified.delete(moodWatchAbortNotified.keys().next().value)
       }
     } catch (e) { noteErr('mood-watch-abort', e) }
   }, { global: true })
@@ -2518,10 +2520,12 @@ export function apply(ctx) {
       try {
         const nowAb2 = Date.now()
         const recentAborts = (moodWatchAborts.get(sessionId) || []).filter((t) => nowAb2 - t < MOOD_ABORT_WINDOW_MS)
+        const abortFingerprint = recentAborts.join(',')
         // 顺序：词表命中优先（更具体），abort 频次只在词表无命中时兜底。
         // 否则「停一下」会被 abort 分支吃掉，换成"连续被打断"的文案（Codex 评估指出）。
         const textHit = hintToggles.vocabulary ? diagnoseMood(lastUserText(decision.messages)) : null
         const abortHit = hintToggles.interruption && recentAborts.length >= MOOD_ABORT_TRIGGER
+          && abortFingerprint !== moodWatchAbortNotified.get(sessionId)
           ? { kind: 'interrupt', reason: `最近 ${Math.round(MOOD_ABORT_WINDOW_MS / 60000)} 分钟内被你打断 ${recentAborts.length} 次（单次不算，连续才算方向偏）` }
           : null
         const rawHit = textHit !== null ? textHit : abortHit
@@ -2547,6 +2551,9 @@ export function apply(ctx) {
         saveState(statePath, stepped.state)
         for (const inj of stepped.actions.inject) {
           decision = { ...decision, messages: [...decision.messages, inj.message] }
+        }
+        if (stepped.actions.inject.length > 0 && abortHit !== null && hit === abortHit) {
+          moodWatchAbortNotified.set(sessionId, abortFingerprint)
         }
         if (stepped.actions.inject.length > 0) moodWatchLastAt.set(sessionId, nowMs)
         // 待确认清单：节流提醒（默认 90s），只在有内容且未刚提醒过时插一条
