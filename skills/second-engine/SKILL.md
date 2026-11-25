@@ -11,7 +11,7 @@ description: 操作第二引擎（Codex/Pi/Claude Code，设置页切换）：�
 
 - **0 入口**：0.1 读取闸门 · 0.2 走哪条通道 · 0.3 三条道并行 · 0.4 API 入口
 - **1 判据**（该不该派）：1.1 什么时候该派它（A/B 两分法）
-- **2 规划**（整条路值不值得走 / 派给谁 / 怎么分工）：2.1 三方评估漏斗 · 2.2 被用户否定时 · 2.3 选引擎 · 2.4 各方边界 · 2.5 多 agent 分工 · 2.6 编排决策：先判是否编排，再建表（开编排时才用） · **2.7 编排硬规则 16 条** · 2.7.1 谁签字 · 2.8 提醒偏好 · 2.9 桥+工单+board 三件套**
+- **2 规划**（整条路值不值得走 / 派给谁 / 怎么分工）：2.1 三方评估漏斗 · 2.2 被用户否定时 · 2.3 选引擎 · 2.4 各方边界 · 2.5 多 agent 分工 · 2.6 编排决策：先判是否编排，再建表（开编排时才用） · **2.7 编排硬规则 16 条** · 2.7.1 谁签字 · 2.8 提醒偏好 · 2.9 桥+工单+board 三件套 —— 2.5/2.6/2.7/2.9 细则见 `references/ref-orchestration.md`**
 - **3 操作**：3.1 查档位 → 3.2 交接单 → 3.3 核对纪律 → 3.4 工单怎么写 → 3.5 复核 → 3.6 标准流程 → 3.7 执行模式 → 3.8 唤醒层 → 3.9 求助归属 → 3.10 看痕迹 → 3.11 异常速查 → 3.12 降级路径
 - **4 档案**：4.1 已迁至 skill `second-engine-dev`（真身 / 加载层 / 发布树落点）· 4.2 dual-board · 4.3 引擎与本机现场（references 索引）
 
@@ -49,7 +49,7 @@ DSH 侧**两条路都能叫到 Codex**，别混：
 
 **判据一句话**：一件自包含的活、只要它把答案带回来给我 ⇒ `subagent_codex`（最短路径，默认等结果）；要人看得见 / 要留痕 / 要换模型 / 要多轮互审 / 要它主动来找我 ⇒ 走本插件 API。
 
-**共同点**：这两条短工单通道都是「**一 run 一进程一 thread，无 resume**」（官方原话，本机实测；CLI 可 resume，见 §2.7 第 3 条与 §3.1）⇒ **要连续性只能靠 dual-board 文本看板**，别指望引擎。
+**共同点**：这两条短工单通道都是「**一 run 一进程一 thread，无 resume**」（官方原话，本机实测；CLI 可 resume，见 `references/ref-orchestration.md` §2.7 第 3 条与 §3.1）⇒ **要连续性只能靠 dual-board 文本看板**，别指望引擎。
 
 ⚠️ **`subagent_codex` 的工具描述里完全没提 Codex**（与通用 `subagent` 的描述前半段逐字相同），新会话的 AI 不会自动知道该用它干 Codex 的活，也读不出它没有连续性、`permissionMode` 默认 `never`。**这条判据正是本 skill 存在的意义之一。**（它的凭据喂法见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`）
 
@@ -162,13 +162,13 @@ DSH 侧**两条路都能叫到 Codex**，别混：
 
 ## 2.3 选哪个引擎：Pi / Codex / Claude Code（按能力，不按偏好）
 
-**一句话：Claude 建、Codex 审。** 前端/UI/设计/需要「读意图」的活 ⇒ Claude（社区实测：同一前端任务只有 Claude 懂设计细节；本机 2026-11-17 已装 `frontend-design` 插件）；后端/并发/进程/资源生命周期，以及**审查/判真伪** ⇒ Codex（行号准）；可编程 loop / 异步 SDK / 多 provider 横比 ⇒ Pi（不当主力；**能力面不止横比**，见 §2.5，2026-11-17 修正）——**别把角色写死**——边界只用来选人，不用来限死：复杂任务允许交叉（Claude 写前端、Codex 复核同一份产物）。
+**一句话：Claude 建、Codex 审。** 前端/UI/设计/需要「读意图」的活 ⇒ Claude（社区实测：同一前端任务只有 Claude 懂设计细节；本机 2026-11-17 已装 `frontend-design` 插件）；后端/并发/进程/资源生命周期，以及**审查/判真伪** ⇒ Codex（行号准）；可编程 loop / 异步 SDK / 多 provider 横比 ⇒ Pi（不当主力；**能力面不止横比**，见 `references/ref-orchestration.md` §2.5，2026-11-17 修正）——**别把角色写死**——边界只用来选人，不用来限死：复杂任务允许交叉（Claude 写前端、Codex 复核同一份产物）。
 
-能力契约（`review` / `resume` / `webSearch` / `mcp` / `worktree` / `Agent SDK` / `子代理` / `流式` / `打断`）**单源化，本节不再复述**：分工理由见 §2.5 的表，引擎细节见 `references/ref-engine-pick.md`（2026-11-07 去重，原三条 bullet 与 §2.5 判据列重复）。
+能力契约（`review` / `resume` / `webSearch` / `mcp` / `worktree` / `Agent SDK` / `子代理` / `流式` / `打断`）**单源化，本节不再复述**：分工理由见 `references/ref-orchestration.md` §2.5 的表，引擎细节见 `references/ref-engine-pick.md`（2026-11-07 去重，原三条 bullet 与 §2.5 判据列重复）。
 
 关于「同模型换引擎差多少」：2026 年受控研究给出约 8–13 个百分点的 scaffold 效应，差异在失败指纹、token 成本与并行方式上（`The Scaffold Effect in Coding Agents` / `Harness or Model?`）。⇒ 选引擎先看能力契约，模型强弱让用户按档位决定。
 
-**编排时**：跨引擎可并行（Codex + Claude 同时各跑一单），但**写域必须不重叠**；同一引擎不叠加（判据与例外见 §2.7 第 2 条）。别把「能换模型」当 Pi 的卖点。切换后会话不迁移、Pi 下卡片隐藏不是故障 → `references/ref-engine-pick.md`
+**编排时**：跨引擎可并行（Codex + Claude 同时各跑一单），但**写域必须不重叠**；同一引擎不叠加（判据与例外见 `references/ref-orchestration.md` §2.7 第 2 条）。别把「能换模型」当 Pi 的卖点。切换后会话不迁移、Pi 下卡片隐藏不是故障 → `references/ref-engine-pick.md`
 
 ## 2.4 各方边界
 
@@ -177,7 +177,7 @@ DSH 侧**两条路都能叫到 Codex**，别混：
 - **外部通道**：批量读 / 粗筛；行号常不可信 ⇒ 只出候选，不定稿。
 - **用户**：最终裁决。
 
-共同点：都不是最终决策者；角色与能力判据**以 §2.5 表为唯一来源**。
+共同点：都不是最终决策者；角色与能力判据**以 `references/ref-orchestration.md` §2.5 表为唯一来源**。
 
 ## 2.5 多 agent 怎么分工（2026-10-30 立 · 目标＝多 agent 互审，不押注单一引擎）
 分工按能力：Codex 后端/复核、Claude 设计/前端、Pi 多 provider；详细分工与判据见 references/ref-orchestration.md。
@@ -321,7 +321,7 @@ consult 走 `POST /api/consult`、记录进 `GET /api/consults`（2026-11-21 起
 
 ## 3.10 判断它到底动手没：看痕迹，不看结论
 
-> 状态信号口径见 §2.7 第 8–9 条；异常处置见 §3.11。
+> 状态信号口径见 `references/ref-orchestration.md` §2.7 第 8–9 条；异常处置见 §3.11。
 
 - **看痕迹三处**：文件 mtime / 字节数变化（派单前后 `ls -la` 对比）｜过程流 `.live` 出现补丁回显（`Success. Updated the following files: M xxx`）｜工作副本 `git status`。
 - exec 看 `second_engine_job_get` 的 `liveBytes`（过程流字节数，持续增长即在动）；appserver 另有 `progress` 数组（reasoning / 文本增量 / 工具调用 / 用量）。⚠️ **`liveBytes` 增长 ≠ 在干活**，必须看 `.live` 内容。
@@ -331,7 +331,7 @@ consult 走 `POST /api/consult`、记录进 `GET /api/consults`（2026-11-21 起
 
 | 症状 | 处置 |
 |---|---|
-| 派单后零输出（>10 分钟） | 先查 `stuckSuspect` / 进程 / `liveBytes` 是否在涨：在生成 → 继续等；**`stuckSuspect` 置位才取消重发**。同一执行通道不许叠跑（不同通道可并行，见 §2.9） |
+| 派单后零输出（>10 分钟） | 先查 `stuckSuspect` / 进程 / `liveBytes` 是否在涨：在生成 → 继续等；**`stuckSuspect` 置位才取消重发**。同一执行通道不许叠跑（不同通道可并行，见 `references/ref-orchestration.md` §2.9） |
 | 任务**秒退**且报 429 | **先分清「本地限速」还是「上游拒绝」**。⚠️ 别用小请求探活当判据（小探针通 ≠ 大上下文能过）；判据看面板；确属限速才冷却重派，否则换通道 |
 | 工单 exit 0 但工作目录没有新文件 | **假完成**，第一件事查它是不是走了翻译桥（wireApi 判据见 `<DSH 技能目录>/second-engine/references/ref-codex-facts.md`） |
 | `wire_api` 报错 / bwrap、sandbox 报错 | config 被手改（应 responses / danger-full-access）→ 面板重新「启用」即由生成器重写 |
