@@ -6,7 +6,7 @@
 
 | 版本 | 关键点 |
 |---|---|
-| **4.4.2** | mood-watch 同一 abort 窗口只提醒一次（窗口指纹去重）；`second_engine_task` TIMEOUT 回传已建任务 id（防误判重派）；notify-router 统一通知模块（未接入）；`engine-upgrade.sh` 三引擎一键查版本/升级；dual-board 运维 README；SKILL 超时补救 |
+| **4.4.2** | mood-watch 同一 abort 窗口只提醒一次（窗口指纹去重）；`second_engine_task` TIMEOUT 回传已建任务 id（防误判重派）；notify-router 统一通知模块（未接入）；`engine-upgrade.sh` 三引擎一键查版本/升级；dual-board 运维 README；SKILL 超时补救；SKILL 编排线（2.5/2.6/2.7/2.9）下沉 `references/ref-orchestration.md`（471→367 行）|
 | **4.4.1** | 启动器自愈入口 + `SELF_DIR` readlink、备份轮转补盲区（`.bak-se` 保留 / Claude 补备份）、Codex 默认档位 medium（GPT 系，其它不预设）|
 | **4.4.0** | bridge_send 工具 + 派单预检/自检 + consult 落盘 + 引擎升级适配（Codex 0.171 / Pi 1.6.0 / Claude 2.1.329）|
 | **4.3.0** | 九个 DSH 原生工具（task/job_get/job_cancel/review_start/review_reply/bridge_start/bridge_stop/bridge_status/status）+ 通知修复（`DSH_BRIDGE_PORT` 3091 / `X-Token` / 精确匹配）+ mood-watch 回执闭环（`assistant/message` 缓存、第 2 次提醒、quote 退出判定）+ bridge Web ①②③④ 与后端 `ts` + skill 拆卷（`ref-http-api.md` / `ref-fallback-measures.md`）|
