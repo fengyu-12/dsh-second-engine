@@ -471,14 +471,14 @@ echo exec      > ~/.dsh/second-engine-mode.txt   # 切回 exec
 
 协议依据：`/root/proj/appserver-spike/MAPPING.md`（事件 → 归一化字段映射，源自 app-server 生成的 JSON Schema）。
 
-## 支持能力一览（v4.4.1）
+## 支持能力一览（v4.4.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | **4.4.1 启动器自愈 + 备份轮转 + 档位** | ✅ 4.4.1 | ① **启动器自愈**：`codex-env`/`claude-env` 检测 `/usr/local/bin` 入口，缺失或指向过期自动重建软链；`SELF_DIR` 用 `readlink -f` 解析真实路径（软链调用不再找错 `ctl.sh`）② **备份轮转**：`config.toml.bak-*` 纳入轮转且显式保留 `.bak-se`；Claude 提供方配置补写前备份 + 保留 5 份 ③ **推理档位**：Codex 生成器对 GPT 系写 `model_reasoning_effort="medium"`，其它厂商不预设（自动脱落）④ mood-watch 回执测试同步 + 过时注释清理 |
 
 
-> 4.4.0 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
+> 4.4.1 及更早版本的逐条能力明细，见 [docs/CHANGELOG.md](https://github.com/fengyu-12/dsh-second-engine/blob/master/docs/CHANGELOG.md)。
 
 ## Codex 升到 0.166.0 之后
 
