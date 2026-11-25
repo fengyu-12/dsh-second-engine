@@ -18,6 +18,7 @@
     "tools/dual-board/dispatch.sh",
     "tools/dual-board/trace_search.py",
     "tools/dual-board/PROTOCOL.md",
+    "tools/dual-board/README.md",
     "bridge",
     "src",
     "skills",

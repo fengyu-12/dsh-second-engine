@@ -114,7 +114,7 @@ if [ -d "$PUB_DIR" ] && [ -d "$LOAD_DIR" ]; then
   # 发布树剔私版：只比存在、不比内容（本机路径被换成「不随包分发」说明）
   # 发布树剔私版：只比存在、不比内容（本机路径被换成占位符）
   PRIVATE_STRIPPED=" src/app-server-client.js tools/dual-board/PROTOCOL.md bridge/README.md bridge/env.example bridge/CHANGELOG.md tools/README.md "
-  EXPLICIT="tools/web-base.sh tools/wait-task.sh tools/engine-upgrade.sh tools/dual-board/dispatch.sh bridge/web/toml-comment.mjs bridge/web/server.mjs bridge/pi/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js src/engine/pi-runtime.js src/engine/pi-rpc-runtime.js src/engine/registry.js src/engine/pi-probe.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py"
+  EXPLICIT="tools/web-base.sh tools/wait-task.sh tools/engine-upgrade.sh tools/dual-board/dispatch.sh tools/dual-board/README.md bridge/web/toml-comment.mjs bridge/web/server.mjs bridge/pi/server.mjs package.json src/index.js src/app-server-client.js src/bridge.js src/bridge-routes.js src/collab.js src/engine/runtime.js src/engine/pi-runtime.js src/engine/pi-rpc-runtime.js src/engine/registry.js src/engine/pi-probe.js lib/client.js tools/dual-board/board_tool.py tools/dual-board/board.sh tools/dual-board/trace_search.py"
   # 2026-10-29：清单 = 精选 + 全量 JS 动态。手写清单曾漏 as-client.mjs / pi-bridge.js 等 6 个文件，
   # 那天只改了实体没同步另两处，smoke 照样全绿 → 新增文件必须自动纳入，不靠人记得改清单。
   # 2026-10-31：发布包按 package.json.files 打包，不含开发件（selftest / smoke 自身 /
